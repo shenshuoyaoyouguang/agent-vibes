@@ -507,6 +507,10 @@ export interface SubAgentContext {
   toolCallCount: number
   /** Modified file paths (for SubagentStopRequestQuery) */
   modifiedFiles: string[]
+  /** Whether the parent task tool has been settled while the sub-agent continues in background */
+  isBackground?: boolean
+  /** Timestamp when the sub-agent was backgrounded */
+  backgroundedAt?: number
 
   // ── Event-driven state machine fields ──
 
@@ -586,6 +590,8 @@ interface PersistedSubAgentContext {
   turnCount: number
   toolCallCount: number
   modifiedFiles: string[]
+  isBackground?: boolean
+  backgroundedAt?: number
   currentTurnToolCalls: Array<{
     id: string
     name: string
@@ -1327,6 +1333,8 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
             turnCount: session.subAgentContext.turnCount,
             toolCallCount: session.subAgentContext.toolCallCount,
             modifiedFiles: [...session.subAgentContext.modifiedFiles],
+            isBackground: session.subAgentContext.isBackground,
+            backgroundedAt: session.subAgentContext.backgroundedAt,
             currentTurnToolCalls:
               session.subAgentContext.currentTurnToolCalls.map((toolCall) => ({
                 id: toolCall.id,
@@ -2913,6 +2921,50 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     return undefined
   }
 
+  markPendingShellToolBackgrounded(
+    conversationId: string,
+    toolCallId: string,
+    commandId: string
+  ): SessionBackgroundCommand | undefined {
+    const session = this.getSession(conversationId)
+    if (!session) return undefined
+
+    const normalizedToolCallId = toolCallId.trim()
+    const normalizedCommandId = commandId.trim() || normalizedToolCallId
+    if (!normalizedToolCallId || !normalizedCommandId) return undefined
+
+    const existing = this.findBackgroundCommandByToolCallId(
+      conversationId,
+      normalizedToolCallId
+    )
+    if (existing) return existing
+
+    const pendingToolCall = session.pendingToolCalls.get(normalizedToolCallId)
+    if (!pendingToolCall) return undefined
+
+    const output = pendingToolCall.shellStreamOutput
+    return this.registerBackgroundCommand(conversationId, {
+      commandId: normalizedCommandId,
+      originToolCallId: normalizedToolCallId,
+      execIds: pendingToolCall.execIds,
+      command:
+        typeof pendingToolCall.toolInput.command === "string"
+          ? pendingToolCall.toolInput.command
+          : typeof pendingToolCall.toolInput.cmd === "string"
+            ? pendingToolCall.toolInput.cmd
+            : "",
+      cwd:
+        typeof pendingToolCall.toolInput.cwd === "string"
+          ? pendingToolCall.toolInput.cwd
+          : typeof pendingToolCall.toolInput.workingDirectory === "string"
+            ? pendingToolCall.toolInput.workingDirectory
+            : "",
+      terminalsFolder: session.requestContextEnv?.terminalsFolder,
+      stdout: output?.stdout.join("") || "",
+      stderr: output?.stderr.join("") || "",
+    })
+  }
+
   findBackgroundCommandByExecId(
     conversationId: string,
     execIdNumber: number
@@ -3714,6 +3766,33 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
 
   getSubAgentContext(conversationId: string): SubAgentContext | undefined {
     return this.getSession(conversationId)?.subAgentContext
+  }
+
+  markSubAgentBackgrounded(
+    conversationId: string,
+    toolCallId?: string
+  ): SubAgentContext | undefined {
+    const session = this.getSession(conversationId)
+    const ctx = session?.subAgentContext
+    if (!session || !ctx) return undefined
+
+    const normalizedToolCallId = toolCallId?.trim()
+    if (
+      normalizedToolCallId &&
+      normalizedToolCallId !== ctx.parentToolCallId &&
+      normalizedToolCallId !== ctx.subagentId
+    ) {
+      return undefined
+    }
+
+    ctx.isBackground = true
+    ctx.backgroundedAt = Date.now()
+    session.lastActivityAt = new Date()
+    this.logger.log(
+      `Marked SubAgentContext backgrounded for ${conversationId}: subagentId=${ctx.subagentId}, parentToolCallId=${ctx.parentToolCallId}`
+    )
+    this.schedulePersist(conversationId)
+    return ctx
   }
 
   clearSubAgentContext(conversationId: string): void {

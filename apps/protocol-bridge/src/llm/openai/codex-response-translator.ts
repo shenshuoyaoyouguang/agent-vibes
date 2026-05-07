@@ -30,6 +30,12 @@ export interface CodexStreamState {
   hasToolCall: boolean
   blockIndex: number
   hasReceivedArgumentsDelta: boolean
+  hasTextDelta: boolean
+  textBlockOpen: boolean
+  thinkingBlockOpen: boolean
+  thinkingStopPending: boolean
+  thinkingSignature: string
+  thinkingSummarySeen: boolean
   responseId: string
   model: string
 }
@@ -39,6 +45,12 @@ export function createStreamState(): CodexStreamState {
     hasToolCall: false,
     blockIndex: 0,
     hasReceivedArgumentsDelta: false,
+    hasTextDelta: false,
+    textBlockOpen: false,
+    thinkingBlockOpen: false,
+    thinkingStopPending: false,
+    thinkingSignature: "",
+    thinkingSummarySeen: false,
     responseId: "",
     model: "",
   }
@@ -87,6 +99,86 @@ function formatSseEvent(event: string, data: Record<string, unknown>): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
 }
 
+function startThinkingBlock(state: CodexStreamState): string[] {
+  if (state.thinkingBlockOpen) return []
+
+  state.thinkingBlockOpen = true
+  state.thinkingStopPending = false
+  return [
+    formatSseEvent("content_block_start", {
+      type: "content_block_start",
+      index: state.blockIndex,
+      content_block: { type: "thinking", thinking: "" },
+    }),
+  ]
+}
+
+function finalizeThinkingBlock(state: CodexStreamState): string[] {
+  if (!state.thinkingBlockOpen) return []
+
+  const results: string[] = []
+  if (state.thinkingSignature) {
+    results.push(
+      formatSseEvent("content_block_delta", {
+        type: "content_block_delta",
+        index: state.blockIndex,
+        delta: {
+          type: "signature_delta",
+          signature: state.thinkingSignature,
+        },
+      })
+    )
+  }
+
+  results.push(
+    formatSseEvent("content_block_stop", {
+      type: "content_block_stop",
+      index: state.blockIndex,
+    })
+  )
+
+  state.blockIndex++
+  state.thinkingBlockOpen = false
+  state.thinkingStopPending = false
+  state.thinkingSignature = ""
+  return results
+}
+
+function finalizeSignatureOnlyThinkingBlock(state: CodexStreamState): string[] {
+  if (!state.thinkingSignature) return []
+
+  return [...startThinkingBlock(state), ...finalizeThinkingBlock(state)]
+}
+
+function extractReasoningText(item: Record<string, unknown>): string {
+  let thinkingText = ""
+  const summary = item.summary as Array<Record<string, unknown>> | string
+  if (Array.isArray(summary)) {
+    for (const part of summary) {
+      const text = (part.text as string) || ""
+      thinkingText += text || JSON.stringify(part ?? "")
+    }
+  } else if (typeof summary === "string") {
+    thinkingText = summary
+  }
+
+  if (!thinkingText) {
+    const reasoningContent = item.content as
+      | Array<Record<string, unknown>>
+      | string
+    if (Array.isArray(reasoningContent)) {
+      for (const part of reasoningContent) {
+        const text = (part.text as string) || ""
+        thinkingText += text || JSON.stringify(part ?? "")
+      }
+    } else if (typeof reasoningContent === "string") {
+      thinkingText = reasoningContent
+    }
+  }
+
+  return thinkingText
+}
+
 // ── Streaming translator ───────────────────────────────────────────────
 
 /**
@@ -125,6 +217,16 @@ export function translateCodexSseEvent(
   }
 
   const results: string[] = []
+  if (state.thinkingBlockOpen && state.thinkingStopPending) {
+    switch (eventType) {
+      case "response.content_part.added":
+      case "response.output_item.added":
+      case "response.completed":
+      case "response.incomplete":
+        results.push(...finalizeThinkingBlock(state))
+        break
+    }
+  }
 
   switch (eventType) {
     // ── response.created → message_start ──────────────────────────
@@ -153,13 +255,11 @@ export function translateCodexSseEvent(
 
     // ── Reasoning (thinking) blocks ──────────────────────────────
     case "response.reasoning_summary_part.added": {
-      results.push(
-        formatSseEvent("content_block_start", {
-          type: "content_block_start",
-          index: state.blockIndex,
-          content_block: { type: "thinking", thinking: "" },
-        })
-      )
+      if (state.thinkingBlockOpen && state.thinkingStopPending) {
+        results.push(...finalizeThinkingBlock(state))
+      }
+      state.thinkingSummarySeen = true
+      results.push(...startThinkingBlock(state))
       break
     }
 
@@ -178,18 +278,14 @@ export function translateCodexSseEvent(
     }
 
     case "response.reasoning_summary_part.done": {
-      results.push(
-        formatSseEvent("content_block_stop", {
-          type: "content_block_stop",
-          index: state.blockIndex,
-        })
-      )
-      state.blockIndex++
+      state.thinkingStopPending = true
       break
     }
 
     // ── Text content blocks ──────────────────────────────────────
     case "response.content_part.added": {
+      results.push(...finalizeThinkingBlock(state))
+      state.textBlockOpen = true
       results.push(
         formatSseEvent("content_block_start", {
           type: "content_block_start",
@@ -201,6 +297,7 @@ export function translateCodexSseEvent(
     }
 
     case "response.output_text.delta": {
+      state.hasTextDelta = true
       const delta = event.delta as string
       if (delta != null) {
         results.push(
@@ -221,6 +318,7 @@ export function translateCodexSseEvent(
           index: state.blockIndex,
         })
       )
+      state.textBlockOpen = false
       state.blockIndex++
       break
     }
@@ -228,13 +326,24 @@ export function translateCodexSseEvent(
     // ── Function call (tool_use) blocks ──────────────────────────
     case "response.output_item.added": {
       const item = event.item as Record<string, unknown>
-      if (
-        !item ||
-        (item.type !== "function_call" && item.type !== "custom_tool_call")
-      ) {
+      if (!item) {
         break
       }
 
+      if (item.type === "reasoning") {
+        state.thinkingSummarySeen = false
+        state.thinkingSignature =
+          typeof item.encrypted_content === "string"
+            ? item.encrypted_content
+            : ""
+        break
+      }
+
+      if (item.type !== "function_call" && item.type !== "custom_tool_call") {
+        break
+      }
+
+      results.push(...finalizeThinkingBlock(state))
       state.hasToolCall = true
       state.hasReceivedArgumentsDelta = false
 
@@ -319,10 +428,119 @@ export function translateCodexSseEvent(
 
     case "response.output_item.done": {
       const item = event.item as Record<string, unknown>
-      if (
-        !item ||
-        (item.type !== "function_call" && item.type !== "custom_tool_call")
-      ) {
+      if (!item) {
+        break
+      }
+
+      if (item.type === "message") {
+        if (state.hasTextDelta) {
+          break
+        }
+        const content = item.content as Array<Record<string, unknown>> | string
+        let text = ""
+        if (Array.isArray(content)) {
+          for (const part of content) {
+            if (part.type === "output_text" && typeof part.text === "string") {
+              text += part.text
+            }
+          }
+        } else if (typeof content === "string") {
+          text = content
+        }
+        if (!text) {
+          break
+        }
+
+        results.push(...finalizeThinkingBlock(state))
+        if (!state.textBlockOpen) {
+          state.textBlockOpen = true
+          results.push(
+            formatSseEvent("content_block_start", {
+              type: "content_block_start",
+              index: state.blockIndex,
+              content_block: { type: "text", text: "" },
+            })
+          )
+        }
+        results.push(
+          formatSseEvent("content_block_delta", {
+            type: "content_block_delta",
+            index: state.blockIndex,
+            delta: { type: "text_delta", text },
+          })
+        )
+        results.push(
+          formatSseEvent("content_block_stop", {
+            type: "content_block_stop",
+            index: state.blockIndex,
+          })
+        )
+        state.textBlockOpen = false
+        state.blockIndex++
+        state.hasTextDelta = true
+        break
+      }
+
+      if (item.type === "reasoning") {
+        if (
+          typeof item.encrypted_content === "string" &&
+          item.encrypted_content
+        ) {
+          state.thinkingSignature = item.encrypted_content
+        }
+        if (state.thinkingSummarySeen) {
+          results.push(...finalizeThinkingBlock(state))
+        } else {
+          results.push(...finalizeSignatureOnlyThinkingBlock(state))
+        }
+        state.thinkingSummarySeen = false
+        break
+      }
+
+      if (item.type === "image_generation_call") {
+        const status = typeof item.status === "string" ? item.status : "unknown"
+        const revisedPrompt =
+          typeof item.revised_prompt === "string" ? item.revised_prompt : ""
+        const result = typeof item.result === "string" ? item.result : ""
+        const text = [
+          `[image_generation_call] status=${status}`,
+          revisedPrompt ? `revised_prompt: ${revisedPrompt}` : "",
+          result ? `image_data_base64_length: ${result.length}` : "",
+        ]
+          .filter(Boolean)
+          .join("\n")
+
+        results.push(...finalizeThinkingBlock(state))
+        if (!state.textBlockOpen) {
+          state.textBlockOpen = true
+          results.push(
+            formatSseEvent("content_block_start", {
+              type: "content_block_start",
+              index: state.blockIndex,
+              content_block: { type: "text", text: "" },
+            })
+          )
+        }
+        results.push(
+          formatSseEvent("content_block_delta", {
+            type: "content_block_delta",
+            index: state.blockIndex,
+            delta: { type: "text_delta", text },
+          })
+        )
+        results.push(
+          formatSseEvent("content_block_stop", {
+            type: "content_block_stop",
+            index: state.blockIndex,
+          })
+        )
+        state.textBlockOpen = false
+        state.blockIndex++
+        state.hasTextDelta = true
+        break
+      }
+
+      if (item.type !== "function_call" && item.type !== "custom_tool_call") {
         break
       }
 
@@ -452,6 +670,7 @@ export function translateCodexSseEvent(
     // ── reasoning 原始内容 — 对齐 Codex 官方 response.reasoning_text.delta ──
     // 当服务端不提供 summary 而是发送原始 reasoning content 时使用。
     case "response.reasoning_text.delta": {
+      results.push(...startThinkingBlock(state))
       const delta = event.delta as string
       if (delta != null) {
         results.push(
@@ -501,37 +720,18 @@ export function translateCodexToClaudeNonStream(
 
       switch (itemType) {
         case "reasoning": {
-          // Extract thinking content from summary
-          let thinkingText = ""
-          const summary = item.summary as
-            | Array<Record<string, unknown>>
-            | string
-          if (Array.isArray(summary)) {
-            for (const part of summary) {
-              const text = (part.text as string) || ""
-              if (text) thinkingText += text
-            }
-          } else if (typeof summary === "string") {
-            thinkingText = summary
-          }
+          const thinkingText = extractReasoningText(item)
+          const signature =
+            typeof item.encrypted_content === "string"
+              ? item.encrypted_content
+              : ""
 
-          // Fallback to content if summary is empty
-          if (!thinkingText) {
-            const reasoningContent = item.content as
-              | Array<Record<string, unknown>>
-              | string
-            if (Array.isArray(reasoningContent)) {
-              for (const part of reasoningContent) {
-                const text = (part.text as string) || ""
-                if (text) thinkingText += text
-              }
-            } else if (typeof reasoningContent === "string") {
-              thinkingText = reasoningContent
-            }
-          }
-
-          if (thinkingText) {
-            content.push({ type: "thinking", thinking: thinkingText })
+          if (thinkingText || signature) {
+            content.push({
+              type: "thinking",
+              thinking: thinkingText,
+              ...(signature ? { signature } : {}),
+            })
           }
           break
         }

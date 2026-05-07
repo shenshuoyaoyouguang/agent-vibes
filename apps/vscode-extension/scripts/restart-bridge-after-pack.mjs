@@ -102,9 +102,14 @@ function resolveConfig() {
       ? settings["agentVibes.port"]
       : 2026
 
+  const logsDir = path.join(dataDir, "logs")
   const env = {
     PORT: String(port),
     AGENT_VIBES_DATA_DIR: dataDir,
+    AGENT_VIBES_LOG_DIR: logsDir,
+    CURSOR_PROTOCOL_TRACE_FILE:
+      process.env.CURSOR_PROTOCOL_TRACE_FILE ||
+      path.join(logsDir, "cursor_protocol_trace.jsonl"),
     NO_COLOR: "1",
     FORCE_COLOR: "0",
   }
@@ -326,6 +331,7 @@ async function main() {
   }
 
   const { env, port, dataDir, caCertPath } = resolveConfig()
+  fs.mkdirSync(env.AGENT_VIBES_LOG_DIR, { recursive: true })
   await stopExistingBridge()
   rotateLogFile()
 
@@ -348,7 +354,8 @@ async function main() {
   const healthy = await waitForHealth(port, caCertPath)
   if (healthy) {
     console.log(
-      `[restart:bridge] Bridge restarted successfully on https://localhost:${port} (dataDir=${dataDir})`
+      `[restart:bridge] Bridge restarted successfully on https://localhost:${port} ` +
+        `(dataDir=${dataDir}, trace=${env.CURSOR_PROTOCOL_TRACE_FILE})`
     )
     return
   }

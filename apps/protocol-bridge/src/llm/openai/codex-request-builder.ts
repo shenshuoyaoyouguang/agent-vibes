@@ -13,13 +13,19 @@ export interface CodexConversationMessage {
 }
 
 export interface CodexConversationTool {
-  type?: "function" | "custom" | "web_search" | "web_search_20250305"
+  type?:
+    | "function"
+    | "custom"
+    | "web_search"
+    | "web_search_20250305"
+    | "image_generation"
   name: string
   description: string
   input_schema?: Record<string, unknown>
   format?: Record<string, unknown>
   external_web_access?: boolean
   search_content_types?: string[]
+  output_format?: string
 }
 
 export interface CodexSystemTextBlock {
@@ -41,41 +47,41 @@ export interface CodexExecutionRequest {
   cacheUserId?: string
   /**
    * @deprecated previous_response_id 现在由 CodexService.streamViaWebSocket() 在 transport 层自动注入，
-   * 与 WebSocket 连接生命周期绑定。不再从外部传入。
-   * 保留字段声明以避免现有调用方的编译错误，但实际值会被忽略。
+   * 与 WebSocket 连接生命周期绑定。不再从外部传入。该字段不参与请求构建。
+   * 保留字段声明以避免现有调用方的编译错误。
    */
   previousResponseId?: string
   clientMetadata?: Record<string, string>
   textVerbosity?: string
 }
 
-interface CodexInputMessage {
+export interface CodexInputMessage {
   type: "message"
   role: string
   content: Array<Record<string, unknown>>
 }
 
-interface CodexFunctionCall {
+export interface CodexFunctionCall {
   type: "function_call"
   call_id: string
   name: string
   arguments: string
 }
 
-interface CodexCustomToolCall {
+export interface CodexCustomToolCall {
   type: "custom_tool_call"
   call_id: string
   name: string
   input: string
 }
 
-interface CodexFunctionCallOutput {
+export interface CodexFunctionCallOutput {
   type: "function_call_output"
   call_id: string
   output: string | Array<Record<string, unknown>>
 }
 
-interface CodexCustomToolCallOutput {
+export interface CodexCustomToolCallOutput {
   type: "custom_tool_call_output"
   call_id: string
   output: string
@@ -89,7 +95,7 @@ export type CodexInputItem =
   | CodexCustomToolCallOutput
 
 export interface CodexTool {
-  type: "function" | "custom" | "web_search"
+  type: "function" | "custom" | "web_search" | "image_generation"
   name?: string
   description?: string
   parameters?: Record<string, unknown>
@@ -97,6 +103,7 @@ export interface CodexTool {
   format?: Record<string, unknown>
   external_web_access?: boolean
   search_content_types?: string[]
+  output_format?: string
 }
 
 export interface CodexRequest {
@@ -305,25 +312,15 @@ export function buildCodexRequest(
   const toolTypeByName = buildToolTypeLookup(request.tools)
   const toolCallTypeById = new Map<string, "function" | "custom">()
   let input: CodexInputItem[] = []
-  const isContinuation =
-    typeof request.previousResponseId === "string" &&
-    request.previousResponseId.trim().length > 0
   const instructions = serializeCodexInstructions(request.system)
 
-  const protocolNormalized = isContinuation
-    ? {
-        messages: request.messages as Array<{
-          role: "user" | "assistant"
-          content: unknown
-        }>,
-      }
-    : normalizeToolProtocolMessages(
-        request.messages as Array<{
-          role: "user" | "assistant"
-          content: unknown
-        }>,
-        { pendingToolUseIds: request.pendingToolUseIds }
-      )
+  const protocolNormalized = normalizeToolProtocolMessages(
+    request.messages as Array<{
+      role: "user" | "assistant"
+      content: unknown
+    }>,
+    { pendingToolUseIds: request.pendingToolUseIds }
+  )
 
   for (const msg of protocolNormalized.messages) {
     const role = msg.role
@@ -519,12 +516,10 @@ export function buildCodexRequest(
     flushMessage()
   }
 
-  if (!isContinuation) {
-    input = sanitizeResponsesToolCallIntegrity(
-      input,
-      request.pendingToolUseIds
-    ).items
-  }
+  input = sanitizeResponsesToolCallIntegrity(
+    input,
+    request.pendingToolUseIds
+  ).items
 
   let codexTools: CodexTool[] | undefined
   if (request.tools && request.tools.length > 0) {
@@ -549,6 +544,14 @@ export function buildCodexRequest(
           name: shortenName(tool.name || ""),
           description: tool.description,
           format: tool.format,
+        })
+        continue
+      }
+
+      if (tool.type === "image_generation") {
+        codexTools.push({
+          type: "image_generation",
+          output_format: tool.output_format || "png",
         })
         continue
       }

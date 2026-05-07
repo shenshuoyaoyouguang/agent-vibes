@@ -104,6 +104,10 @@ export class BridgeManager extends EventEmitter {
         ...process.env,
         PORT: String(this.config.port),
         AGENT_VIBES_DATA_DIR: this.config.dataDir,
+        AGENT_VIBES_LOG_DIR: this.config.logsDir,
+        CURSOR_PROTOCOL_TRACE_FILE:
+          process.env.CURSOR_PROTOCOL_TRACE_FILE ||
+          path.join(this.config.logsDir, "cursor_protocol_trace.jsonl"),
         ...this.config.accountPathEnvOverrides,
         NO_COLOR: "1",
         FORCE_COLOR: "0",

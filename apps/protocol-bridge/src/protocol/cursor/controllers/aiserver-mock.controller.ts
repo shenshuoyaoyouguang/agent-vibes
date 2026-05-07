@@ -29,12 +29,15 @@ import {
   AvailableModelsScope,
   BootstrapStatsigRequestSchema,
   BootstrapStatsigResponseSchema,
+  CheckUsageBasedPriceResponseSchema,
   CheckFeatureStatusRequestSchema,
   CheckFeatureStatusResponseSchema,
   CheckFeaturesStatusRequestSchema,
   CheckFeaturesStatusResponseSchema,
   CheckFeaturesStatusResponse_FeatureStatusSchema,
   CheckQueuePositionResponseSchema,
+  FindBugsResponseSchema,
+  GetCloudSetupBlockersResponseSchema,
   GetCurrentPeriodUsageResponseSchema,
   GetDefaultModelNudgeDataResponseSchema,
   GetDefaultModelResponseSchema,
@@ -60,7 +63,12 @@ import {
   KnowledgeBaseUpdateResponseSchema,
   NameTabRequestSchema,
   NameTabResponseSchema,
+  PrivacyCheckResponseSchema,
+  ReportAgentFeedbackResponseSchema,
   SubmitSpansResponseSchema,
+  TestBidiRequestSchema,
+  TestBidiResponseSchema,
+  TranscribeAudioResponseSchema,
 } from "../../../gen/aiserver/v1_pb"
 import { AnthropicApiService } from "../../../llm/anthropic/anthropic-api.service"
 import { GoogleModelCacheService } from "../../../llm/google/google-model-cache.service"
@@ -86,6 +94,7 @@ import {
   selectPreferredCursorModelName,
 } from "../cursor-model-protocol"
 import { KnowledgeBaseService } from "../knowledge-base.service"
+import { connectRPCHandler } from "../connect-rpc-handler"
 
 const ENABLED_CURSOR_FEATURES = new Set<string>([
   "react_shell_tool",
@@ -739,6 +748,86 @@ export class AiserverMockController {
   @Post("aiserver.v1.AiService/GetUserPrivacyMode")
   handleGetPrivacyMode(@Res() res: FastifyReply): void {
     this.sendEmpty(res)
+  }
+
+  @Post("aiserver.v1.AiService/PrivacyCheck")
+  handlePrivacyCheck(@Res() res: FastifyReply): void {
+    const response = create(PrivacyCheckResponseSchema, {
+      isOnPrivacyPod: false,
+      isGhostModeOn: false,
+    })
+    this.sendProto(res, PrivacyCheckResponseSchema, response)
+  }
+
+  @Post("aiserver.v1.AiService/CheckUsageBasedPrice")
+  handleCheckUsageBasedPrice(@Res() res: FastifyReply): void {
+    const response = create(CheckUsageBasedPriceResponseSchema, {
+      markdownResponse: "",
+      cents: 0,
+      priceId: "",
+    })
+    this.sendProto(res, CheckUsageBasedPriceResponseSchema, response)
+  }
+
+  @Post("aiserver.v1.AiService/FindBugs")
+  handleFindBugs(@Res() res: FastifyReply): void {
+    const response = create(FindBugsResponseSchema, {})
+    this.sendProto(res, FindBugsResponseSchema, response)
+  }
+
+  @Post("aiserver.v1.AiService/GetCloudSetupBlockers")
+  handleGetCloudSetupBlockers(@Res() res: FastifyReply): void {
+    const response = create(GetCloudSetupBlockersResponseSchema, {
+      pending: [],
+      completed: [],
+    })
+    this.sendProto(res, GetCloudSetupBlockersResponseSchema, response)
+  }
+
+  @Post("aiserver.v1.AiService/ReportAgentFeedback")
+  handleReportAgentFeedback(@Res() res: FastifyReply): void {
+    const response = create(ReportAgentFeedbackResponseSchema, {})
+    this.sendProto(res, ReportAgentFeedbackResponseSchema, response)
+  }
+
+  @Post("aiserver.v1.AiService/TranscribeAudio")
+  handleTranscribeAudio(@Res() res: FastifyReply): void {
+    const response = create(TranscribeAudioResponseSchema, {
+      text: "",
+      transcriptionTimeMs: 0n,
+    })
+    this.sendProto(res, TranscribeAudioResponseSchema, response)
+  }
+
+  @Post("aiserver.v1.AiService/StreamInterfaceAgentStatus")
+  handleStreamInterfaceAgentStatus(@Res() res: FastifyReply): void {
+    this.sendConnectEmptyStream(res)
+  }
+
+  @Post("aiserver.v1.AiService/TestBidi")
+  async handleTestBidi(
+    @Req() req: FastifyRequest,
+    @Res() res: FastifyReply
+  ): Promise<void> {
+    await connectRPCHandler.handleBidiStream(
+      req,
+      res,
+      async (input, output) => {
+        for await (const data of input) {
+          try {
+            const request = fromBinary(TestBidiRequestSchema, data)
+            const response = create(TestBidiResponseSchema, {
+              message: request.message,
+            })
+            output(this.encodeConnectProto(TestBidiResponseSchema, response))
+          } catch (error) {
+            this.logger.debug(
+              `TestBidi frame parse failed: ${error instanceof Error ? error.message : String(error)}`
+            )
+          }
+        }
+      }
+    )
   }
 
   @Post("aiserver.v1.AiService/ReportAiCodeChangeMetrics")
@@ -1574,6 +1663,20 @@ export class AiserverMockController {
     res.header("Content-Type", "application/proto")
     res.header("Connect-Protocol-Version", "1")
     res.status(200).send(Buffer.alloc(0))
+  }
+
+  private sendConnectEmptyStream(res: FastifyReply): void {
+    connectRPCHandler.setupStreamingResponse(res)
+    connectRPCHandler.endStream(res)
+  }
+
+  private encodeConnectProto<Desc extends DescMessage>(
+    schema: Desc,
+    message: MessageShape<Desc>
+  ): Buffer {
+    return connectRPCHandler.encodeMessage(
+      Buffer.from(toBinary(schema, message))
+    )
   }
 
   private sendProto<Desc extends DescMessage>(

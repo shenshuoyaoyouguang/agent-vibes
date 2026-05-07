@@ -335,9 +335,6 @@ type DeferredToolFamily =
   // 新增 proto 更新后的 Exec 工具
   | "force_background_shell"
   | "force_background_subagent"
-  | "canvas_get_url"
-  | "canvas_destroy"
-  | "canvas_register"
   | "mcp_state_exec"
   | "subagent_await"
   // 新增交互工具
@@ -613,6 +610,10 @@ interface ToolCompletedExtraData {
   writeShellStdinSuccess?: {
     shellId?: number
     terminalFileLengthBeforeInputWritten?: number
+  }
+  generateImageSuccess?: {
+    filePath?: string
+    imageData?: string
   }
   editFailureContext?: EditFailureContext & {
     currentRangeSnippet?: string
@@ -1287,6 +1288,144 @@ export class CursorConnectStreamService {
       `Cancel action finalized ${pendingIds.length} pending tool call(s) on current stream`
     )
     return true
+  }
+
+  private async *handleBackgroundShellAction(
+    conversationId: string,
+    parsed: ParsedCursorRequest
+  ): AsyncGenerator<Buffer, boolean> {
+    const session = this.sessionManager.getSession(conversationId)
+    const toolCallId = parsed.agentControlToolCallId?.trim() || ""
+    if (!session || !toolCallId) {
+      this.logger.warn(
+        `Background shell action ignored: conversation=${conversationId}, toolCallId=${toolCallId || "(none)"}`
+      )
+      return false
+    }
+
+    const pendingToolCall = session.pendingToolCalls.get(toolCallId)
+    const existingBackground =
+      this.sessionManager.findBackgroundCommandByToolCallId(
+        conversationId,
+        toolCallId
+      )
+    if (!pendingToolCall) {
+      if (existingBackground) {
+        this.logger.debug(
+          `Background shell action already applied: ${conversationId} toolCallId=${toolCallId}`
+        )
+      } else {
+        this.logger.warn(
+          `Background shell action referenced non-pending toolCallId=${toolCallId}`
+        )
+      }
+      return false
+    }
+
+    const firstExecId = Array.from(pendingToolCall.execIds)[0]
+    const commandId =
+      existingBackground?.commandId ||
+      (typeof firstExecId === "number" ? String(firstExecId) : toolCallId)
+    const backgroundCommand =
+      existingBackground ||
+      this.sessionManager.markPendingShellToolBackgrounded(
+        conversationId,
+        toolCallId,
+        commandId
+      )
+    if (!backgroundCommand) {
+      this.logger.warn(
+        `Failed to background shell tool call: ${conversationId} toolCallId=${toolCallId}`
+      )
+      return false
+    }
+
+    const shellOutput = this.sessionManager.getShellOutput(
+      conversationId,
+      toolCallId
+    )
+    const stdout = shellOutput?.stdout || backgroundCommand.stdout.join("")
+    const stderr = shellOutput?.stderr || backgroundCommand.stderr.join("")
+    const combinedOutput =
+      `${stdout}${stderr ? `\n[stderr]\n${stderr}` : ""}`.trim()
+    const numericShellId = Number(backgroundCommand.commandId)
+
+    yield* this.emitInlineToolResult(
+      conversationId,
+      toolCallId,
+      combinedOutput ||
+        `Command running in background (CommandId: ${backgroundCommand.commandId})`,
+      { status: "success" },
+      undefined,
+      undefined,
+      {
+        shellResult: {
+          stdout,
+          stderr,
+          shellId: Number.isFinite(numericShellId)
+            ? Math.floor(numericShellId)
+            : undefined,
+          pid: backgroundCommand.pid,
+          terminalsFolder: backgroundCommand.terminalsFolder,
+          isBackground: true,
+          msToWait: backgroundCommand.msToWait,
+          backgroundReason: backgroundCommand.backgroundReason,
+        },
+      }
+    )
+
+    this.logger.log(
+      `Background shell action settled parent tool: ${conversationId} toolCallId=${toolCallId} commandId=${backgroundCommand.commandId}`
+    )
+    return false
+  }
+
+  private async *handleBackgroundSubagentAction(
+    conversationId: string,
+    parsed: ParsedCursorRequest
+  ): AsyncGenerator<Buffer, boolean> {
+    const requestedToolCallId = parsed.agentControlToolCallId?.trim() || ""
+    const subAgentCtx = this.sessionManager.markSubAgentBackgrounded(
+      conversationId,
+      requestedToolCallId || undefined
+    )
+    if (!subAgentCtx) {
+      this.logger.warn(
+        `Background subagent action ignored: conversation=${conversationId}, toolCallId=${requestedToolCallId || "(none)"}`
+      )
+      return false
+    }
+
+    if (
+      !this.sessionManager
+        .getSession(conversationId)
+        ?.pendingToolCalls.has(subAgentCtx.parentToolCallId)
+    ) {
+      this.logger.debug(
+        `Background subagent action already settled parent tool: ${conversationId} parentToolCallId=${subAgentCtx.parentToolCallId}`
+      )
+      return false
+    }
+
+    const durationMs = Date.now() - subAgentCtx.startTime
+    yield* this.emitInlineToolResult(
+      conversationId,
+      subAgentCtx.parentToolCallId,
+      `Sub-agent running in background (agentId: ${subAgentCtx.subagentId})`,
+      { status: "success" },
+      {
+        taskSuccess: {
+          agentId: subAgentCtx.subagentId,
+          isBackground: true,
+          durationMs,
+        },
+      }
+    )
+
+    this.logger.log(
+      `Background subagent action settled parent tool: ${conversationId} subagentId=${subAgentCtx.subagentId}, parentToolCallId=${subAgentCtx.parentToolCallId}`
+    )
+    return false
   }
 
   private summarizeBackendError(error: unknown): string {
@@ -7275,18 +7414,6 @@ ${raw}
     ) {
       return "force_background_subagent"
     }
-    if (snake.includes("canvas_get_url") || compact.includes("canvasgeturl")) {
-      return "canvas_get_url"
-    }
-    if (snake.includes("canvas_destroy") || compact.includes("canvasdestroy")) {
-      return "canvas_destroy"
-    }
-    if (
-      snake.includes("canvas_register") ||
-      compact.includes("canvasregister")
-    ) {
-      return "canvas_register"
-    }
     if (snake.includes("mcp_state_exec") || compact.includes("mcpstateexec")) {
       return "mcp_state_exec"
     }
@@ -9708,19 +9835,25 @@ ${raw}
         `${subAgentCtx.turnCount} turns, ${subAgentCtx.toolCallCount} tool calls, ${durationMs}ms`
     )
 
-    yield* this.emitInlineToolResult(
-      conversationId,
-      subAgentCtx.parentToolCallId,
-      finalText || "[sub-agent completed with no output]",
-      { status: "success" },
-      {
-        taskSuccess: {
-          agentId: subAgentCtx.subagentId,
-          isBackground: false,
-          durationMs,
-        },
-      }
-    )
+    if (!subAgentCtx.isBackground) {
+      yield* this.emitInlineToolResult(
+        conversationId,
+        subAgentCtx.parentToolCallId,
+        finalText || "[sub-agent completed with no output]",
+        { status: "success" },
+        {
+          taskSuccess: {
+            agentId: subAgentCtx.subagentId,
+            isBackground: false,
+            durationMs,
+          },
+        }
+      )
+    } else {
+      this.logger.log(
+        `[SubAgent] Backgrounded ${subAgentCtx.subagentId} completed without re-settling parent tool call`
+      )
+    }
 
     this.sessionManager.clearSubAgentContext(conversationId)
   }
@@ -9759,10 +9892,14 @@ ${raw}
     }
   }
 
-  private executeInlineGenerateImage(input: Record<string, unknown>): {
+  private async executeInlineGenerateImage(
+    conversationId: string,
+    input: Record<string, unknown>
+  ): Promise<{
     content: string
     state: { status: ToolResultStatus; message?: string }
-  } {
+    extraData?: ParsedToolResult["inlineExtraData"]
+  }> {
     const prompt = this.pickFirstString(input, ["prompt", "description"]) || ""
     if (!prompt) {
       return {
@@ -9770,10 +9907,57 @@ ${raw}
         state: { status: "error", message: "missing prompt" },
       }
     }
-    return {
-      content:
-        "[generate_image error] image generation backend is not configured in this proxy runtime",
-      state: { status: "error", message: "generate_image unsupported" },
+
+    try {
+      const session = this.sessionManager.getSession(conversationId)
+      const filePath =
+        this.pickFirstString(input, ["filePath", "file_path", "path"]) || ""
+      const outputFormat =
+        this.pickFirstString(input, ["outputFormat", "output_format"]) || "png"
+      const result = await this.codexService.generateImage({
+        prompt,
+        model: session?.model,
+        conversationId,
+        outputFormat,
+      })
+
+      let savedPath = filePath
+      if (filePath) {
+        const projectRoot = session?.projectContext?.rootPath || process.cwd()
+        const absolutePath = path.isAbsolute(filePath)
+          ? filePath
+          : path.resolve(projectRoot, filePath)
+        const fsPromises = await import("fs/promises")
+        await fsPromises.mkdir(path.dirname(absolutePath), { recursive: true })
+        await fsPromises.writeFile(
+          absolutePath,
+          Buffer.from(result.imageData, "base64")
+        )
+        savedPath = absolutePath
+      }
+
+      input.filePath = savedPath || filePath
+      input.file_path = savedPath || filePath
+      const revisedPromptLine = result.revisedPrompt
+        ? `\nrevised_prompt: ${result.revisedPrompt}`
+        : ""
+      const pathLine = savedPath ? `\nfile_path: ${savedPath}` : ""
+      return {
+        content: `[generate_image success]${pathLine}${revisedPromptLine}`,
+        state: { status: "success" },
+        extraData: {
+          generateImageSuccess: {
+            filePath: savedPath || filePath,
+            imageData: result.imageData,
+          },
+        },
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return {
+        content: `[generate_image error] ${message}`,
+        state: { status: "error", message },
+      }
     }
   }
 
@@ -11458,6 +11642,7 @@ ${raw}
     state: { status: ToolResultStatus; message?: string }
     projection?: ParsedToolResult["inlineProjection"]
     historyContent?: ParsedToolResult["inlineHistoryContent"]
+    extraData?: ParsedToolResult["inlineExtraData"]
   }> {
     if (family === "command_status") {
       return this.executeInlineCommandStatus(conversationId, input)
@@ -11545,7 +11730,7 @@ ${raw}
       return this.executeInlineApplyAgentDiff(input)
     }
     if (family === "generate_image") {
-      return this.executeInlineGenerateImage(input)
+      return this.executeInlineGenerateImage(conversationId, input)
     }
     if (family === "report_bugfix_results") {
       return this.executeInlineReportBugfixResults(input)
@@ -11586,7 +11771,7 @@ ${raw}
     if (family === "go_to_definition") {
       return this.executeInlineGoToDefinition(conversationId, input)
     }
-    if (family === "await_task") {
+    if (family === "await_task" || family === "await") {
       return this.executeInlineAwaitTask(input)
     }
     if (family === "read_project") {
@@ -11860,9 +12045,7 @@ ${raw}
           `[create_plan success]${uriLine}`,
           { status: "success" },
           undefined,
-          "inline_tool_result",
-          undefined,
-          { continueGeneration: false }
+          "inline_tool_result"
         )
       } else {
         const message = this.extractInteractionErrorMessage(rawResponse)
@@ -11872,9 +12055,7 @@ ${raw}
           `[create_plan error] ${message}`,
           { status: "error", message },
           undefined,
-          "inline_tool_result",
-          undefined,
-          { continueGeneration: false }
+          "inline_tool_result"
         )
       }
       return true
@@ -11943,12 +12124,49 @@ ${raw}
       return true
     }
 
-    const result = await this.executeDeferredTool(
+    const resultPromise = this.executeDeferredTool(
       conversationId,
       family,
       toolName,
       toolInput
+    ).then(
+      (value) => ({ kind: "result" as const, value }),
+      (error: unknown) => ({ kind: "error" as const, error })
     )
+    let result:
+      | {
+          content: string
+          state: { status: ToolResultStatus; message?: string }
+          projection?: ParsedToolResult["inlineProjection"]
+          historyContent?: ParsedToolResult["inlineHistoryContent"]
+          extraData?: ParsedToolResult["inlineExtraData"]
+        }
+      | undefined
+    let heartbeatCount = 0
+    while (!result) {
+      const next = await Promise.race([
+        resultPromise,
+        new Promise<{ kind: "heartbeat" }>((resolve) => {
+          setTimeout(() => resolve({ kind: "heartbeat" }), 5_000)
+        }),
+      ])
+
+      if (next.kind === "heartbeat") {
+        heartbeatCount++
+        this.logger.debug(
+          `Sending server heartbeat while waiting for ${family} interaction tool ${toolCallId} (${heartbeatCount})`
+        )
+        yield this.grpcService.createServerHeartbeatResponse()
+        continue
+      }
+
+      if (next.kind === "error") {
+        throw next.error
+      }
+
+      result = next.value
+    }
+
     yield* this.emitInlineToolResult(
       conversationId,
       toolCallId,
@@ -11960,7 +12178,7 @@ ${raw}
         : family === "web_fetch"
           ? "web_fetch_inline_result"
           : "inline_tool_result",
-      undefined,
+      result.extraData,
       {},
       result.historyContent
     )
@@ -12161,13 +12379,24 @@ ${raw}
       )
     }
 
-    // 新增 proto 更新后的 InteractionQuery 构建
+    // generate_image is an InteractionQuery in the Cursor protocol, not an ExecServerMessage.
     if (family === "generate_image") {
+      const referenceImagePaths =
+        this.pickStringArray(input, ["referenceImagePaths"]).length > 0
+          ? this.pickStringArray(input, ["referenceImagePaths"])
+          : this.pickStringArray(input, ["reference_image_paths"])
       return this.grpcService.createInteractionQueryResponse(
         interactionQueryId,
         "generateImageRequestQuery",
         {
-          prompt: this.pickFirstString(input, ["prompt", "description"]) || "",
+          args: {
+            description:
+              this.pickFirstString(input, ["prompt", "description"]) || "",
+            filePath:
+              this.pickFirstString(input, ["filePath", "file_path"]) ||
+              undefined,
+            referenceImagePaths,
+          },
           toolCallId,
         }
       )
@@ -12533,6 +12762,11 @@ ${raw}
       }
     }
 
+    if (family === "task") {
+      yield* this.executeSubAgentTask(conversationId, toolCallId, input)
+      return true
+    }
+
     if (!this.shouldUseInteractionQueryForDeferredTool(family)) {
       const result = await this.executeDeferredTool(
         conversationId,
@@ -12547,7 +12781,7 @@ ${raw}
         result.state,
         result.projection,
         "inline_tool_result",
-        undefined,
+        result.extraData,
         {},
         result.historyContent
       )
@@ -14116,16 +14350,24 @@ ${raw}
             parsed.agentControlType === "backgroundShellAction" &&
             conversationId
           ) {
-            this.logger.log(
-              `ConversationAction.backgroundShell: ${conversationId} toolCallId=${parsed.agentControlToolCallId || "(none)"}`
+            const shouldEndStream = yield* this.handleBackgroundShellAction(
+              conversationId,
+              parsed
             )
+            if (shouldEndStream) {
+              return
+            }
           } else if (
             parsed.agentControlType === "backgroundSubagentAction" &&
             conversationId
           ) {
-            this.logger.log(
-              `ConversationAction.backgroundSubagent: ${conversationId} toolCallId=${parsed.agentControlToolCallId || "(none)"}`
+            const shouldEndStream = yield* this.handleBackgroundSubagentAction(
+              conversationId,
+              parsed
             )
+            if (shouldEndStream) {
+              return
+            }
           } else {
             this.logger.debug(
               `Agent control message: ${parsed.agentControlType}`

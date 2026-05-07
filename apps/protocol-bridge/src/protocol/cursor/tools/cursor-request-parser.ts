@@ -23,6 +23,7 @@ import {
   isCursorBuiltInToolAllowed,
 } from "./cursor-tool-mapper"
 import { KvStorageService } from "../kv-storage.service"
+import { CursorProtocolTraceService } from "../cursor-protocol-trace.service"
 
 // GZIP 魔数
 const GZIP_MAGIC = Buffer.from([0x1f, 0x8b])
@@ -103,6 +104,10 @@ export interface ParsedToolResult {
     writeShellStdinSuccess?: {
       shellId?: number
       terminalFileLengthBeforeInputWritten?: number
+    }
+    generateImageSuccess?: {
+      filePath?: string
+      imageData?: string
     }
   }
 }
@@ -237,6 +242,8 @@ export interface ParsedCursorRequest {
   agentControlSubagentId?: string
   agentControlToolCallId?: string
   agentControlShellCommand?: { command: string; execId: string }
+  agentControlTriggeringAuthId?: string
+  agentControlTriggeringUserId?: number
 
   // InteractionQuery 响应（客户端回复服务器查询）
   interactionResponse?: {
@@ -320,6 +327,8 @@ function makeControlMessage(
     subagentId?: string
     toolCallId?: string
     shellCommand?: { command: string; execId: string }
+    triggeringAuthId?: string
+    triggeringUserId?: number
   }
 ): ParsedCursorRequest {
   return {
@@ -340,6 +349,8 @@ function makeControlMessage(
     agentControlSubagentId: options?.subagentId,
     agentControlToolCallId: options?.toolCallId,
     agentControlShellCommand: options?.shellCommand,
+    agentControlTriggeringAuthId: options?.triggeringAuthId,
+    agentControlTriggeringUserId: options?.triggeringUserId,
   }
 }
 
@@ -777,6 +788,11 @@ export class CursorRequestParser {
     // 使用 fromBinary 解析 AgentClientMessage
     try {
       const msg = fromBinary(AgentClientMessageSchema, workingBuffer)
+      CursorProtocolTraceService.recordClientMessage(msg, {
+        bytes: workingBuffer.length,
+        compressedBytes: workingBuffer === buffer ? undefined : buffer.length,
+        context: "parseRequest",
+      })
       const result = this.parseAgentClientMessage(msg)
       if (result) {
         this.logger.log(
@@ -817,13 +833,36 @@ export class CursorRequestParser {
         this.logger.debug("收到 execClientControlMessage")
         return this.parseExecClientControlMessage(message.value)
 
-      case "conversationAction":
+      case "conversationAction": {
+        const triggeringUserInfo = message.value.triggeringUserInfo
+        const triggeringFields: {
+          triggeringAuthId?: string
+          triggeringUserId?: number
+        } = {}
+        const triggeringAuthId =
+          triggeringUserInfo?.authId || message.value.triggeringAuthId || ""
+        if (triggeringAuthId) {
+          triggeringFields.triggeringAuthId = triggeringAuthId
+        }
+        if (triggeringUserInfo?.userId !== undefined) {
+          triggeringFields.triggeringUserId = triggeringUserInfo.userId
+        }
+        if (
+          triggeringFields.triggeringAuthId ||
+          triggeringFields.triggeringUserId !== undefined
+        ) {
+          this.logger.debug(
+            `收到 conversationAction.triggeringUserInfo authId=${triggeringFields.triggeringAuthId || "(none)"} userId=${triggeringFields.triggeringUserId ?? "(none)"}`
+          )
+        }
+
         if (message.value.action.case === "cancelAction") {
           const reason = (message.value.action.value.reason || "").trim()
           this.logger.warn(
             `收到 conversationAction.cancelAction reason=${reason || "(empty)"}`
           )
           return makeControlMessage("cancelAction", {
+            ...triggeringFields,
             error: reason,
           })
         }
@@ -831,7 +870,7 @@ export class CursorRequestParser {
         // ConversationAction 补齐：逐一识别并路由
         if (message.value.action.case === "summarizeAction") {
           this.logger.log("收到 conversationAction.summarizeAction")
-          return makeControlMessage("summarizeAction")
+          return makeControlMessage("summarizeAction", triggeringFields)
         }
         if (message.value.action.case === "shellCommandAction") {
           const shellAction = message.value.action.value as {
@@ -844,16 +883,17 @@ export class CursorRequestParser {
             `收到 conversationAction.shellCommandAction command="${command.substring(0, 80)}" execId=${execId}`
           )
           return makeControlMessage("shellCommandAction", {
+            ...triggeringFields,
             shellCommand: { command, execId },
           })
         }
         if (message.value.action.case === "startPlanAction") {
           this.logger.log("收到 conversationAction.startPlanAction")
-          return makeControlMessage("startPlanAction")
+          return makeControlMessage("startPlanAction", triggeringFields)
         }
         if (message.value.action.case === "executePlanAction") {
           this.logger.log("收到 conversationAction.executePlanAction")
-          return makeControlMessage("executePlanAction")
+          return makeControlMessage("executePlanAction", triggeringFields)
         }
         if (message.value.action.case === "asyncAskQuestionCompletionAction") {
           const asyncAction = message.value.action.value as {
@@ -863,6 +903,7 @@ export class CursorRequestParser {
             `收到 conversationAction.asyncAskQuestionCompletionAction toolCallId=${asyncAction.originalToolCallId || "(none)"}`
           )
           return makeControlMessage("asyncAskQuestionCompletionAction", {
+            ...triggeringFields,
             toolCallId: asyncAction.originalToolCallId || "",
           })
         }
@@ -874,6 +915,7 @@ export class CursorRequestParser {
             `收到 conversationAction.cancelSubagentAction subagentId=${cancelSub.subagentId || "(none)"}`
           )
           return makeControlMessage("cancelSubagentAction", {
+            ...triggeringFields,
             subagentId: cancelSub.subagentId || "",
           })
         }
@@ -881,7 +923,10 @@ export class CursorRequestParser {
           this.logger.log(
             "收到 conversationAction.backgroundTaskCompletionAction"
           )
-          return makeControlMessage("backgroundTaskCompletionAction")
+          return makeControlMessage(
+            "backgroundTaskCompletionAction",
+            triggeringFields
+          )
         }
         if (message.value.action.case === "backgroundShellAction") {
           const bgShell = message.value.action.value as {
@@ -891,6 +936,7 @@ export class CursorRequestParser {
             `收到 conversationAction.backgroundShellAction toolCallId=${bgShell.toolCallId || "(none)"}`
           )
           return makeControlMessage("backgroundShellAction", {
+            ...triggeringFields,
             toolCallId: bgShell.toolCallId || "",
           })
         }
@@ -902,6 +948,7 @@ export class CursorRequestParser {
             `收到 conversationAction.backgroundSubagentAction toolCallId=${bgSub.toolCallId || "(none)"}`
           )
           return makeControlMessage("backgroundSubagentAction", {
+            ...triggeringFields,
             toolCallId: bgSub.toolCallId || "",
           })
         }
@@ -909,7 +956,8 @@ export class CursorRequestParser {
         this.logger.debug(
           `收到 conversationAction（未识别） action=${message.value.action.case || "(none)"}`
         )
-        return makeControlMessage("other")
+        return makeControlMessage("other", triggeringFields)
+      }
 
       case "kvClientMessage":
         this.logger.debug("收到 kvClientMessage")
@@ -938,9 +986,10 @@ export class CursorRequestParser {
             | undefined
           const level1Case =
             typeof resultField?.case === "string" ? resultField.case : undefined
-          const nestedResult = resultField?.value?.result as
-            | { case?: string }
-            | undefined
+          const nestedResult =
+            (resultField?.value?.result as { case?: string } | undefined) ||
+            ((resultField as { result?: { case?: string } } | undefined)
+              ?.result as { case?: string } | undefined)
           const level2Case =
             typeof nestedResult?.case === "string"
               ? nestedResult.case

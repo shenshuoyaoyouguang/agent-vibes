@@ -5,6 +5,7 @@ import type { KvServerMessage as KvStorageMessage } from "./kv-storage.service"
 
 import {
   AgentMode,
+  type AgentServerMessage,
   AgentServerMessageSchema,
   // New: ForceBackground / McpState / SubagentAwait exec schemas
   // CommunicateUpdate 完整工具链
@@ -27,6 +28,8 @@ import {
   SubagentAwaitArgsSchema,
   // InteractionUpdate 补齐
   ActiveBranchChangeSchema,
+  FeedbackRequestCategorySchema,
+  FeedbackRequestUpdateSchema,
   PostRequestPromptUpdateSchema,
   PromptSuggestionUpdateSchema,
   // ExecServerMessage 补齐
@@ -373,6 +376,7 @@ import {
   ValueSchema,
 } from "../../gen/google/protobuf/value_pb"
 import { normalizeBugfixResultItems as normalizeBugfixResultItemsFromContract } from "./tools/bugfix-result-normalizer"
+import { CursorProtocolTraceService } from "./cursor-protocol-trace.service"
 import { resolveCursorToolDefinitionKey } from "./tools/cursor-tool-mapper"
 import { resolveMcpCallFields as resolveMcpCallFieldsFromContract } from "./tools/mcp-call-contract"
 
@@ -940,6 +944,10 @@ interface ToolCompletionExtraData {
     shellId?: number
     terminalFileLengthBeforeInputWritten?: number
   }
+  generateImageSuccess?: {
+    filePath?: string
+    imageData?: string
+  }
   toolResultState?: {
     status: ToolResultProjectionStatus
     message?: string
@@ -989,7 +997,6 @@ export class CursorGrpcService {
     "list_mcp_resources",
     "read_lints",
     "fetch",
-    "generate_image",
     "record_screen",
     "computer_use",
     "write_shell_stdin",
@@ -1058,6 +1065,18 @@ export class CursorGrpcService {
     header[0] = 0x00 // flags: no compression
     header.writeUInt32BE(data.length, 1)
     return Buffer.concat([header, data])
+  }
+
+  private serializeAgentServerMessage(
+    msg: AgentServerMessage,
+    context: string
+  ): Buffer {
+    const payload = toBinary(AgentServerMessageSchema, msg)
+    CursorProtocolTraceService.recordServerMessage(msg, {
+      bytes: payload.length,
+      context,
+    })
+    return this.addConnectEnvelope(payload)
   }
 
   /**
@@ -1205,7 +1224,10 @@ export class CursorGrpcService {
         }),
       },
     })
-    return this.addConnectEnvelope(toBinary(AgentServerMessageSchema, msg))
+    return this.serializeAgentServerMessage(
+      msg,
+      `interactionUpdate.${updateCase}`
+    )
   }
 
   /**
@@ -1228,7 +1250,10 @@ export class CursorGrpcService {
         }),
       },
     })
-    return this.addConnectEnvelope(toBinary(AgentServerMessageSchema, msg))
+    return this.serializeAgentServerMessage(
+      msg,
+      `interactionQuery.${queryCase}`
+    )
   }
 
   // ─── Text / Thinking Responses ──────────────────────────────
@@ -1431,6 +1456,30 @@ export class CursorGrpcService {
     return this.wrapInteractionUpdate(
       "activeBranchChange",
       create(ActiveBranchChangeSchema, { path, branchName })
+    )
+  }
+
+  /**
+   * Create FeedbackRequest response
+   * Cursor IDE 用于在会话中请求用户对当前模型回复进行反馈
+   */
+  createFeedbackRequestResponse(
+    requestId: string,
+    canonicalModelName?: string,
+    categories: Array<{ id: string; label: string }> = []
+  ): Buffer {
+    return this.wrapInteractionUpdate(
+      "feedbackRequest",
+      create(FeedbackRequestUpdateSchema, {
+        requestId,
+        canonicalModelName: canonicalModelName || undefined,
+        categories: categories.map((category) =>
+          create(FeedbackRequestCategorySchema, {
+            id: category.id,
+            label: category.label,
+          })
+        ),
+      })
     )
   }
 
@@ -1774,7 +1823,10 @@ export class CursorGrpcService {
       toolCallId,
       execId
     )
-    return this.addConnectEnvelope(toBinary(AgentServerMessageSchema, execMsg))
+    return this.serializeAgentServerMessage(
+      execMsg,
+      `execServerMessage.${toolName}`
+    )
   }
 
   /**
@@ -1804,7 +1856,10 @@ export class CursorGrpcService {
         }),
       },
     })
-    return this.addConnectEnvelope(toBinary(AgentServerMessageSchema, readMsg))
+    return this.serializeAgentServerMessage(
+      readMsg,
+      "execServerMessage.readArgs"
+    )
   }
 
   /**
@@ -1837,7 +1892,10 @@ export class CursorGrpcService {
         }),
       },
     })
-    return this.addConnectEnvelope(toBinary(AgentServerMessageSchema, writeMsg))
+    return this.serializeAgentServerMessage(
+      writeMsg,
+      "execServerMessage.writeArgs"
+    )
   }
 
   /**
@@ -6663,13 +6721,19 @@ export class CursorGrpcService {
         asStringArray(args.referenceImagePaths).length > 0
           ? asStringArray(args.referenceImagePaths)
           : asStringArray(args.reference_image_paths)
+      const generateImageSuccess = extraData?.generateImageSuccess
       const generateImageResultOneOf =
         status === "success"
           ? {
               case: "success" as const,
               value: create(GenerateImageSuccessSchema, {
-                filePath: safeString(args.filePath || args.file_path),
-                imageData: result,
+                filePath: safeString(
+                  generateImageSuccess?.filePath ||
+                    args.filePath ||
+                    args.file_path
+                ),
+                imageData:
+                  safeString(generateImageSuccess?.imageData) || result,
               }),
             }
           : {
@@ -7383,7 +7447,7 @@ export class CursorGrpcService {
         value: stateStructure,
       },
     })
-    return this.addConnectEnvelope(toBinary(AgentServerMessageSchema, msg))
+    return this.serializeAgentServerMessage(msg, "conversationCheckpointUpdate")
   }
 
   // ─── KV Server Message ─────────────────────────────────────
@@ -7433,7 +7497,7 @@ export class CursorGrpcService {
         value: kvMsg,
       },
     })
-    return this.addConnectEnvelope(toBinary(AgentServerMessageSchema, msg))
+    return this.serializeAgentServerMessage(msg, "kvServerMessage")
   }
 
   // ─── Tool 参数编码辅助方法 ─────────────────────────────────

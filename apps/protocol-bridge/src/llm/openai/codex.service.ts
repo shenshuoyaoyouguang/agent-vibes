@@ -82,7 +82,11 @@ import {
 import {
   buildCodexRequest,
   extractWarmupPayload,
+  type CodexCustomToolCall,
   type CodexExecutionRequest,
+  type CodexFunctionCall,
+  type CodexInputItem,
+  type CodexInputMessage,
   type CodexRequest,
 } from "./codex-request-builder"
 import { createCodexExecutionRequestFromClaude } from "./codex-request-translator"
@@ -215,22 +219,34 @@ interface ConversationSlotBinding {
 interface CodexTurnContext {
   /** Current WebSocket session ID (key in wsService.sessions) */
   wsSessionId: string
-  /** response_id captured from the response.completed event */
-  lastResponseId: string | undefined
-  /** Signature of the previous request (model + instructions hash), used for incremental append */
-  lastRequestSignature: string | undefined
+  /** Last completed response metadata used for incremental append */
+  lastResponse: CodexLastResponse | undefined
+  /** Last full request sent on this WebSocket session */
+  lastRequest: Record<string, unknown> | undefined
   /** Whether the connection was reused from cache */
   connectionReused: boolean
+}
+
+interface CodexLastResponse {
+  responseId: string
+  itemsAdded: CodexInputItem[]
 }
 
 /** Cross-turn cached WebSocket connection entry, keyed by slotStickyKey + model */
 interface CachedWsEntry {
   /** Session ID in wsService */
   wsSessionId: string
-  /** response_id from the previous turn, carried across turns */
-  lastResponseId: string | undefined
-  /** Request signature from the previous turn */
-  lastRequestSignature: string | undefined
+  /** Last completed response metadata, carried across turns */
+  lastResponse: CodexLastResponse | undefined
+  /** Last full request sent on this WebSocket session */
+  lastRequest: Record<string, unknown> | undefined
+  /** Last time this cache entry was used or refreshed */
+  updatedAt: number
+}
+
+interface WarmupPayloadCacheEntry {
+  payload: Record<string, unknown>
+  updatedAt: number
 }
 
 @Injectable()
@@ -268,9 +284,12 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   /**
    * Currently active turn contexts, keyed by conversationId.
    * Each turn creates a fresh context; disposed at turn end.
-   * Only one active context per conversation at a time (guarded by stream mutex).
+   * Only one active context per conversation at a time, enforced by conversationStreamLocks.
    */
   private readonly activeTurnContexts = new Map<string, CodexTurnContext>()
+
+  /** Per-conversation stream tail promises used as an internal async mutex. */
+  private readonly conversationStreamLocks = new Map<string, Promise<void>>()
 
   /**
    * Warmup payload cache, keyed by conversationId.
@@ -279,10 +298,14 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
    */
   private readonly warmupPayloadCache = new Map<
     string,
-    Record<string, unknown>
+    WarmupPayloadCacheEntry
   >()
 
   private readonly CONVERSATION_SLOT_TTL_MS = 60 * 60 * 1000
+  private readonly WS_SESSION_CACHE_TTL_MS = 10 * 60 * 1000
+  private readonly WARMUP_PAYLOAD_CACHE_TTL_MS = 30 * 60 * 1000
+  private readonly MAX_CACHED_WS_SESSIONS = 128
+  private readonly MAX_WARMUP_PAYLOAD_CACHE_ENTRIES = 256
   private rateLimitProbePromise: Promise<number> | null = null
   private activeLiveRequests = 0
   private activeRateLimitProbeAbortController: AbortController | null = null
@@ -975,6 +998,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     const existing = this.activeTurnContexts.get(conversationId)
     if (existing) return existing
 
+    this.pruneCodexRuntimeCaches()
     const cacheKey = this.getCachedWsKey(slot, modelName, conversationId)
     const cached = this.cachedWsSessions.get(cacheKey)
 
@@ -984,16 +1008,16 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       this.cachedWsSessions.delete(cacheKey)
       context = {
         wsSessionId: cached.wsSessionId,
-        lastResponseId: cached.lastResponseId,
-        lastRequestSignature: cached.lastRequestSignature,
+        lastResponse: cached.lastResponse,
+        lastRequest: cached.lastRequest,
         connectionReused: true,
       }
     } else {
       // No cached connection; use conversationId as session key (lazy connect)
       context = {
         wsSessionId: conversationId,
-        lastResponseId: undefined,
-        lastRequestSignature: undefined,
+        lastResponse: undefined,
+        lastRequest: undefined,
         connectionReused: false,
       }
     }
@@ -1016,10 +1040,11 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
 
     const cacheKey = this.getCachedWsKey(slot, modelName, conversationId)
     // Return connection to cache (mirrors store_cached_websocket_session)
-    this.cachedWsSessions.set(cacheKey, {
+    this.setCachedWsSession(cacheKey, {
       wsSessionId: context.wsSessionId,
-      lastResponseId: context.lastResponseId,
-      lastRequestSignature: context.lastRequestSignature,
+      lastResponse: context.lastResponse,
+      lastRequest: context.lastRequest,
+      updatedAt: Date.now(),
     })
 
     this.activeTurnContexts.delete(conversationId)
@@ -1027,62 +1052,169 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
 
   /**
    * Automatically inject previous_response_id before sending a request.
-   * Mirrors prepare_websocket_request() + get_incremental_items().
+   * Mirrors official prepare_websocket_request() + get_incremental_items().
    *
-   * Conditions (all mirror the official logic):
-   * 1. The turn context has a lastResponseId
-   * 2. The connection has not been rebuilt (guaranteed by wsSessionId consistency)
-   * 3. The request signature (model + instructions) matches the previous one
+   * We only use previous_response_id when the new full request is a strict extension
+   * of the previous full request plus server-returned output items. This avoids sending
+   * a fabricated delta when the transcript was truncated, compacted, or otherwise rebuilt.
    */
   private prepareRequestWithTurnContext(
     codexRequest: Record<string, unknown>,
     context: CodexTurnContext,
-    conversationId: string,
-    requestSignature: string
+    conversationId: string
   ): Record<string, unknown> {
-    if (!context.lastResponseId) return codexRequest
+    if (!context.lastResponse?.responseId || !context.lastRequest) {
+      context.lastRequest = codexRequest
+      return codexRequest
+    }
 
-    // Check whether the request signature matches
-    if (
-      context.lastRequestSignature &&
-      requestSignature !== context.lastRequestSignature
-    ) {
+    const incrementalInput = this.getIncrementalItems(
+      codexRequest,
+      context.lastRequest,
+      context.lastResponse,
+      true
+    )
+    if (!incrementalInput) {
       this.logger.debug(
-        `[Codex][TurnContext] Discarding response_id=${context.lastResponseId} ` +
-          `for ${conversationId}: request signature changed`
+        `[Codex][TurnContext] Discarding response_id=${context.lastResponse.responseId} ` +
+          `for ${conversationId}: request is not a strict incremental extension`
       )
-      context.lastResponseId = undefined
-      context.lastRequestSignature = undefined
+      context.lastRequest = codexRequest
       return codexRequest
     }
 
     this.logger.debug(
-      `[Codex][TurnContext] Injected previous_response_id=${context.lastResponseId} ` +
-        `for conversation=${conversationId}`
+      `[Codex][TurnContext] Injected previous_response_id=${context.lastResponse.responseId} ` +
+        `for conversation=${conversationId}; incremental_items=${incrementalInput.length}`
     )
+    context.lastRequest = codexRequest
     return {
       ...codexRequest,
-      previous_response_id: context.lastResponseId,
+      input: incrementalInput,
+      previous_response_id: context.lastResponse.responseId,
     }
   }
 
+  private getIncrementalItems(
+    request: Record<string, unknown>,
+    previousRequest: Record<string, unknown>,
+    lastResponse: CodexLastResponse,
+    allowEmptyDelta: boolean
+  ): CodexInputItem[] | undefined {
+    const previousWithoutInput =
+      this.stripRequestInputForIncrementalCompare(previousRequest)
+    const requestWithoutInput =
+      this.stripRequestInputForIncrementalCompare(request)
+    if (
+      JSON.stringify(previousWithoutInput) !==
+      JSON.stringify(requestWithoutInput)
+    ) {
+      return undefined
+    }
+
+    const previousInput = this.getCodexInputItems(previousRequest)
+    const requestInput = this.getCodexInputItems(request)
+    const baseline = [...previousInput, ...lastResponse.itemsAdded]
+    if (
+      requestInput.length < baseline.length ||
+      (!allowEmptyDelta && requestInput.length === baseline.length)
+    ) {
+      return undefined
+    }
+
+    for (let index = 0; index < baseline.length; index++) {
+      if (
+        JSON.stringify(requestInput[index]) !== JSON.stringify(baseline[index])
+      ) {
+        return undefined
+      }
+    }
+
+    return requestInput.slice(baseline.length)
+  }
+
+  private stripRequestInputForIncrementalCompare(
+    request: Record<string, unknown>
+  ): Record<string, unknown> {
+    const {
+      input: _input,
+      previous_response_id: _previousResponseId,
+      ...withoutInput
+    } = request
+    return withoutInput
+  }
+
+  private getCodexInputItems(
+    request: Record<string, unknown>
+  ): CodexInputItem[] {
+    return Array.isArray(request.input)
+      ? (request.input as CodexInputItem[])
+      : []
+  }
+
+  private convertResponseOutputItemToInputItem(
+    item: Record<string, unknown> | undefined
+  ): CodexInputItem | undefined {
+    if (!item) return undefined
+
+    if (item.type === "function_call") {
+      return {
+        type: "function_call",
+        call_id: typeof item.call_id === "string" ? item.call_id : "",
+        name: typeof item.name === "string" ? item.name : "",
+        arguments:
+          typeof item.arguments === "string"
+            ? item.arguments
+            : JSON.stringify(item.arguments ?? {}),
+      } satisfies CodexFunctionCall
+    }
+
+    if (item.type === "custom_tool_call") {
+      return {
+        type: "custom_tool_call",
+        call_id: typeof item.call_id === "string" ? item.call_id : "",
+        name: typeof item.name === "string" ? item.name : "",
+        input:
+          typeof item.input === "string"
+            ? item.input
+            : JSON.stringify(item.input ?? ""),
+      } satisfies CodexCustomToolCall
+    }
+
+    if (item.type === "message") {
+      const rawContent = item.content
+      const content = Array.isArray(rawContent)
+        ? (rawContent as Array<Record<string, unknown>>)
+        : typeof rawContent === "string"
+          ? [{ type: "output_text", text: rawContent }]
+          : []
+
+      return {
+        type: "message",
+        role: typeof item.role === "string" ? item.role : "assistant",
+        content,
+      } satisfies CodexInputMessage
+    }
+
+    return undefined
+  }
+
   /**
-   * Capture the response_id from a response.completed event.
+   * Capture the response_id and output items from a response.completed event.
    * Mirrors map_response_stream() ResponseEvent::Completed → LastResponse.
    */
   private captureResponseInTurnContext(
     conversationId: string,
     responseId: string,
-    requestSignature: string | undefined
+    itemsAdded: CodexInputItem[]
   ): void {
     if (!conversationId || !responseId) return
     const context = this.activeTurnContexts.get(conversationId)
     if (!context) return
-    context.lastResponseId = responseId
-    context.lastRequestSignature = requestSignature
+    context.lastResponse = { responseId, itemsAdded }
     this.logger.debug(
       `[Codex][TurnContext] Captured response_id=${responseId} ` +
-        `for conversation=${conversationId}`
+        `for conversation=${conversationId}; items_added=${itemsAdded.length}`
     )
   }
 
@@ -1096,14 +1228,14 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   ): void {
     const context = this.activeTurnContexts.get(conversationId)
     if (context) {
-      if (context.lastResponseId && reason) {
+      if (context.lastResponse?.responseId && reason) {
         this.logger.debug(
           `[Codex][TurnContext] ${reason} for ${conversationId}, ` +
-            `discarding stale previous_response_id=${context.lastResponseId} (needs_new)`
+            `discarding stale previous_response_id=${context.lastResponse.responseId} (needs_new)`
         )
       }
-      context.lastResponseId = undefined
-      context.lastRequestSignature = undefined
+      context.lastResponse = undefined
+      context.lastRequest = undefined
     }
   }
 
@@ -1112,8 +1244,72 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
    * Used by cache identity and slot selection to distinguish initial vs continuation requests.
    */
   private hasActiveTurnContext(conversationId: string): boolean {
-    const ctx = this.activeTurnContexts.get(conversationId)
-    return !!ctx?.lastResponseId
+    return this.hasConversationContinuationState(conversationId)
+  }
+
+  private hasConversationContinuationState(
+    conversationId: string,
+    slot?: CodexAccountSlot,
+    modelName?: string
+  ): boolean {
+    const normalizedConversationId = conversationId.trim()
+    if (!normalizedConversationId) {
+      return false
+    }
+
+    const activeContext = this.activeTurnContexts.get(normalizedConversationId)
+    if (activeContext?.lastResponse?.responseId) {
+      return true
+    }
+
+    if (!slot || !modelName) {
+      return false
+    }
+
+    this.pruneCodexRuntimeCaches()
+    const cached = this.cachedWsSessions.get(
+      this.getCachedWsKey(slot, modelName, normalizedConversationId)
+    )
+    return !!cached?.lastResponse?.responseId
+  }
+
+  private async acquireConversationStreamLock(
+    conversationId: string
+  ): Promise<() => void> {
+    const normalizedConversationId = conversationId.trim()
+    if (!normalizedConversationId) {
+      return () => {}
+    }
+
+    const previousTail = this.conversationStreamLocks.get(
+      normalizedConversationId
+    )
+    let release!: () => void
+    const currentTail = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    this.conversationStreamLocks.set(normalizedConversationId, currentTail)
+
+    if (previousTail) {
+      try {
+        await previousTail
+      } catch {
+        // 锁尾 promise 理论上只 resolve；这里防御异常，避免永久阻塞后续 turn。
+      }
+    }
+
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      if (
+        this.conversationStreamLocks.get(normalizedConversationId) ===
+        currentTail
+      ) {
+        this.conversationStreamLocks.delete(normalizedConversationId)
+      }
+      release()
+    }
   }
 
   private onLiveRequestStart(): void {
@@ -1125,6 +1321,75 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
 
   private onLiveRequestEnd(): void {
     this.activeLiveRequests = Math.max(0, this.activeLiveRequests - 1)
+  }
+
+  private pruneCodexRuntimeCaches(now: number = Date.now()): void {
+    for (const [key, entry] of this.cachedWsSessions) {
+      if (entry.updatedAt + this.WS_SESSION_CACHE_TTL_MS <= now) {
+        this.cachedWsSessions.delete(key)
+      }
+    }
+    this.pruneMapToMaxSize(this.cachedWsSessions, this.MAX_CACHED_WS_SESSIONS)
+
+    for (const [conversationId, entry] of this.warmupPayloadCache) {
+      if (entry.updatedAt + this.WARMUP_PAYLOAD_CACHE_TTL_MS <= now) {
+        this.warmupPayloadCache.delete(conversationId)
+      }
+    }
+    this.pruneMapToMaxSize(
+      this.warmupPayloadCache,
+      this.MAX_WARMUP_PAYLOAD_CACHE_ENTRIES
+    )
+  }
+
+  private pruneMapToMaxSize<K, V>(map: Map<K, V>, maxSize: number): void {
+    while (map.size > maxSize) {
+      const oldestKey = map.keys().next().value
+      if (oldestKey === undefined) return
+      map.delete(oldestKey)
+    }
+  }
+
+  private setCachedWsSession(cacheKey: string, entry: CachedWsEntry): void {
+    if (!cacheKey) return
+    this.pruneCodexRuntimeCaches()
+    this.cachedWsSessions.set(cacheKey, {
+      ...entry,
+      updatedAt: Date.now(),
+    })
+    this.pruneMapToMaxSize(this.cachedWsSessions, this.MAX_CACHED_WS_SESSIONS)
+  }
+
+  private setWarmupPayloadCache(
+    conversationId: string,
+    payload: Record<string, unknown>
+  ): void {
+    const normalizedConversationId = conversationId.trim()
+    if (!normalizedConversationId) return
+    this.pruneCodexRuntimeCaches()
+    this.warmupPayloadCache.set(normalizedConversationId, {
+      payload,
+      updatedAt: Date.now(),
+    })
+    this.pruneMapToMaxSize(
+      this.warmupPayloadCache,
+      this.MAX_WARMUP_PAYLOAD_CACHE_ENTRIES
+    )
+  }
+
+  private getWarmupPayloadCache(
+    conversationId: string | undefined
+  ): Record<string, unknown> | undefined {
+    const normalizedConversationId = conversationId?.trim()
+    if (!normalizedConversationId) return undefined
+    this.pruneCodexRuntimeCaches()
+    const entry = this.warmupPayloadCache.get(normalizedConversationId)
+    if (!entry) return undefined
+
+    entry.updatedAt = Date.now()
+    this.warmupPayloadCache.delete(normalizedConversationId)
+    this.warmupPayloadCache.set(normalizedConversationId, entry)
+    return entry.payload
   }
 
   /**
@@ -2630,9 +2895,14 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     >,
     slot: CodexAccountSlot
   ): string {
+    this.pruneCodexRuntimeCaches()
     const conversationIdRaw = this.getConversationId(request)
     const useStableInitialCacheIdentity =
-      !this.hasActiveTurnContext(conversationIdRaw)
+      !this.hasConversationContinuationState(
+        conversationIdRaw,
+        slot,
+        request.model
+      )
     const conversationId = useStableInitialCacheIdentity
       ? ""
       : this.getConversationId(request)
@@ -2869,6 +3139,151 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     )
   }
 
+  async generateImage(input: {
+    prompt: string
+    model?: string
+    conversationId?: string
+    outputFormat?: string
+  }): Promise<{
+    imageData: string
+    revisedPrompt?: string
+    status?: string
+  }> {
+    const prompt = input.prompt.trim()
+    if (!prompt) {
+      throw new Error("Image generation prompt is required")
+    }
+
+    const requestedModel = input.model?.trim() || ""
+    const modelName =
+      requestedModel && this.hasSupportingAccount(requestedModel)
+        ? requestedModel
+        : DEFAULT_CODEX_RATE_LIMIT_MODEL
+    const conversationId =
+      input.conversationId || `image-${crypto.randomUUID()}`
+    const slot = this.selectRequestSlot(modelName, conversationId, {
+      preferWarmPool: false,
+    })
+    const token = await this.getBearerToken(slot)
+    if (!token) {
+      throw new Error(
+        "Codex backend not configured: no API key or access token"
+      )
+    }
+
+    const codexRequest = buildCodexRequest(
+      {
+        model: modelName,
+        conversationId,
+        messages: [
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+        tools: [
+          {
+            type: "image_generation",
+            name: "image_generation",
+            description: "Generate an image from the user prompt.",
+            output_format: input.outputFormat?.trim() || "png",
+          },
+        ],
+        parallelToolCalls: false,
+        textVerbosity: "low",
+      },
+      modelName
+    ) as Record<string, unknown>
+
+    const url = this.buildUrl(slot, "responses")
+    const headers = this.buildHeaders(slot, token, true, undefined, {
+      conversationId,
+    })
+    const fetchOptions: RequestInit & { dispatcher?: unknown } = {
+      method: "POST",
+      headers,
+      body: JSON.stringify(codexRequest),
+      signal: AbortSignal.timeout(600_000),
+    }
+    const dispatcher = this.buildProxyDispatcher(slot)
+    if (dispatcher) {
+      fetchOptions.dispatcher = dispatcher
+    }
+
+    const response = await fetch(url, fetchOptions)
+    if (!response.ok) {
+      const errorBody = await response.text()
+      throw this.createCodexApiError(response.status, errorBody)
+    }
+
+    this.captureCodexRateLimitHeaders(
+      response.headers,
+      slot,
+      modelName,
+      "request"
+    )
+    const fullBody = await response.text()
+    let imageData = ""
+    let revisedPrompt: string | undefined
+    let status: string | undefined
+
+    for (const line of fullBody.split("\n")) {
+      const payload = this.parseCodexSsePayload(line.trim())
+      const item =
+        payload?.type === "response.output_item.done" &&
+        payload.item &&
+        typeof payload.item === "object"
+          ? (payload.item as Record<string, unknown>)
+          : undefined
+      if (item?.type === "image_generation_call") {
+        if (typeof item.result === "string" && item.result.trim()) {
+          imageData = item.result.trim()
+        }
+        if (typeof item.revised_prompt === "string") {
+          revisedPrompt = item.revised_prompt
+        }
+        if (typeof item.status === "string") {
+          status = item.status
+        }
+      }
+
+      const responseOutput =
+        payload?.type === "response.completed" &&
+        payload.response &&
+        typeof payload.response === "object"
+          ? (payload.response as Record<string, unknown>).output
+          : undefined
+      if (Array.isArray(responseOutput)) {
+        for (const outputItem of responseOutput) {
+          if (
+            outputItem &&
+            typeof outputItem === "object" &&
+            (outputItem as Record<string, unknown>).type ===
+              "image_generation_call"
+          ) {
+            const record = outputItem as Record<string, unknown>
+            if (typeof record.result === "string" && record.result.trim()) {
+              imageData = record.result.trim()
+            }
+            if (typeof record.revised_prompt === "string") {
+              revisedPrompt = record.revised_prompt
+            }
+            if (typeof record.status === "string") {
+              status = record.status
+            }
+          }
+        }
+      }
+    }
+
+    if (!imageData) {
+      throw new Error("Codex image_generation completed without image data")
+    }
+
+    markAccountSuccess(slot, modelName)
+    return { imageData, revisedPrompt, status }
+  }
+
   /**
    * Core execution logic with cooldown-aware account selection and
    * automatic retry on 429 (switches to next available account).
@@ -2881,7 +3296,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       request.model,
       this.getConversationId(request),
       {
-        preferWarmPool: !this.hasActiveTurnContext(
+        preferWarmPool: !this.hasConversationContinuationState(
           this.getConversationId(request)
         ),
       }
@@ -3347,6 +3762,10 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         ? forwardHeadersOrAbortSignal
         : abortSignal
 
+    const conversationId = this.getConversationId(request)
+    const releaseConversationLock =
+      await this.acquireConversationStreamLock(conversationId)
+
     this.onLiveRequestStart()
     try {
       yield* this.executeStreamWithCooldownRetry(
@@ -3357,6 +3776,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       )
     } finally {
       this.onLiveRequestEnd()
+      releaseConversationLock()
     }
   }
 
@@ -3401,23 +3821,22 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       slot = this.selectWarmupSlot(modelName, conversationId)
       const httpUrl = this.buildUrl(slot, "responses")
       wsUrl = this.wsService.buildWebSocketUrl(httpUrl)
-      const warmupConversationId = this.getConversationId(request)
-      if (warmupConversationId) {
-        sessionId = this.getOrCreateTurnContext(
-          warmupConversationId,
-          slot,
-          request.model
-        ).wsSessionId
-      } else {
-        // Startup warmup (no conversationId): use cacheKey as session ID.
-        // After warmup, connection info is written to cachedWsSessions for getOrCreateTurnContext.
-        const cacheKey = this.getCachedWsKey(slot, request.model)
-        sessionId = cacheKey
-        // Pre-register in cachedWsSessions so getOrCreateTurnContext can take and reuse it
-        this.cachedWsSessions.set(cacheKey, {
-          wsSessionId: cacheKey,
-          lastResponseId: undefined,
-          lastRequestSignature: undefined,
+      const cacheKey = this.getCachedWsKey(
+        slot,
+        request.model,
+        conversationId || undefined
+      )
+      const cached = this.cachedWsSessions.get(cacheKey)
+      sessionId = cached?.wsSessionId || conversationId || cacheKey
+
+      // Warmup 只准备可复用的 connection cache，不创建 active turn context。
+      // activeTurnContexts 只属于真实 stream turn，避免 warmup 占用或污染 turn lifecycle。
+      if (!cached) {
+        this.setCachedWsSession(cacheKey, {
+          wsSessionId: sessionId,
+          lastResponse: undefined,
+          lastRequest: undefined,
+          updatedAt: Date.now(),
         })
       }
     } catch (error) {
@@ -3526,11 +3945,16 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       }
 
       // Send generate:false warmup payload to prime the server-side prompt cache (mirrors Codex CLI).
-      // IMPORTANT: Skip when the turn context already has a captured response_id.
+      // IMPORTANT: Skip when the conversation already has a cached response_id.
       // Sending generate:false would create a new response on the server and invalidate
       // the previous_response_id routing needed by the upcoming continuation request.
+      const cachedEntry = this.cachedWsSessions.get(
+        this.getCachedWsKey(slot, modelName, conversationId || undefined)
+      )
       const skipWarmupPayload =
-        conversationId && this.hasActiveTurnContext(conversationId)
+        !!conversationId &&
+        (this.hasActiveTurnContext(conversationId) ||
+          !!cachedEntry?.lastResponse?.responseId)
       if (warmupPayload && !reusedConnection && !skipWarmupPayload) {
         let warmupBody = { ...warmupPayload }
         if (cacheId) {
@@ -3572,10 +3996,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
    */
   warmup(hint: ProviderWarmupHint): void {
     const warmupPayload =
-      hint.warmupPayload ||
-      (hint.conversationId
-        ? this.warmupPayloadCache.get(hint.conversationId)
-        : undefined)
+      hint.warmupPayload || this.getWarmupPayloadCache(hint.conversationId)
 
     void this.prewarmSessionConnection(
       {
@@ -3602,7 +4023,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     conversationId: string,
     payload: Record<string, unknown>
   ): void {
-    this.warmupPayloadCache.set(conversationId, payload)
+    this.setWarmupPayloadCache(conversationId, payload)
   }
 
   /**
@@ -3615,6 +4036,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     // We need the slot + model to compute the cache key, but since the context
     // is being disposed (conversation ending), we just delete without caching.
     this.activeTurnContexts.delete(conversationId)
+    this.conversationStreamLocks.delete(conversationId)
     this.warmupPayloadCache.delete(conversationId)
     // Also clean up any cachedWsSessions entries for this conversation.
     for (const [key, entry] of this.cachedWsSessions) {
@@ -3633,7 +4055,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       request.model,
       this.getConversationId(request),
       {
-        preferWarmPool: !this.hasActiveTurnContext(
+        preferWarmPool: !this.hasConversationContinuationState(
           this.getConversationId(request)
         ),
       }
@@ -3659,7 +4081,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     // ensuring the adapter always has an up-to-date warmup snapshot.
     const conversationId = this.getConversationId(request)
     if (conversationId) {
-      this.warmupPayloadCache.set(
+      this.setWarmupPayloadCache(
         conversationId,
         extractWarmupPayload(codexRequest as CodexRequest)
       )
@@ -4161,7 +4583,6 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       ? this.getOrCreateTurnContext(conversationId, slot, modelName)
       : undefined
     const sessionId = turnContext?.wsSessionId || ""
-    const requestSignature = this.computeRequestSignature(codexRequest)
 
     if (!sessionId) {
       const ws = await this.wsService.connect(
@@ -4179,8 +4600,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         requestStartedAt,
         "",
         abortSignal,
-        conversationId,
-        requestSignature
+        conversationId
       )
       return
     }
@@ -4218,8 +4638,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         codexRequest = this.prepareRequestWithTurnContext(
           codexRequest,
           turnContext,
-          conversationId,
-          requestSignature
+          conversationId
         )
       }
 
@@ -4246,8 +4665,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           requestStartedAt,
           sessionId,
           abortSignal,
-          conversationId,
-          requestSignature
+          conversationId
         )
         return
       } catch (error) {
@@ -4282,8 +4700,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           requestStartedAt,
           sessionId,
           abortSignal,
-          conversationId,
-          requestSignature
+          conversationId
         )
       }
     } finally {
@@ -4301,10 +4718,10 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     requestStartedAt: number,
     sessionId: string,
     abortSignal?: AbortSignal,
-    conversationId?: string,
-    requestSignature?: string
+    conversationId?: string
   ): AsyncGenerator<string, void, unknown> {
     const state = createStreamState()
+    const itemsAdded: CodexInputItem[] = []
     let loggedFirstUpstreamEvent = false
     let loggedFirstContentEvent = false
     let responseCompleted = false
@@ -4329,10 +4746,20 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       const wsBody = this.wsService.buildWebSocketRequestBody(codexRequest)
 
       for await (const msg of this.wsService.streamViaWebSocket(ws, wsBody)) {
+        if (msg.type === "response.output_item.done") {
+          const item = this.convertResponseOutputItemToInputItem(
+            (msg as Record<string, unknown>).item as
+              | Record<string, unknown>
+              | undefined
+          )
+          if (item) {
+            itemsAdded.push(item)
+          }
+        }
+
         if (msg.type === "response.completed") {
           responseCompleted = true
           // Mirrors map_response_stream() ResponseEvent::Completed → LastResponse.
-          // Automatically capture response_id into the turn context.
           if (conversationId && sessionId) {
             const response = (msg as Record<string, unknown>).response as
               | Record<string, unknown>
@@ -4343,7 +4770,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
               this.captureResponseInTurnContext(
                 conversationId,
                 capturedId,
-                requestSignature
+                itemsAdded
               )
             }
           }
