@@ -3,9 +3,9 @@
   "displayName": "Agent Vibes",
   "publisher": "funny-vibes",
   "description": "Unified AI Agent Gateway — Route Antigravity, Claude, and GPT backends through Cursor IDE and Claude Code CLI with protocol-native translation.",
-  "version": "0.1.20",
+  "version": "0.1.21",
   "agentVibes": {
-    "cursorVersion": "3.3.16"
+    "cursorVersion": "3.3.30"
   },
   "private": true,
   "license": "MIT",
