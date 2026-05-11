@@ -22,6 +22,11 @@ import {
   getDefaultAgentToolNames,
   isCursorBuiltInToolAllowed,
 } from "./cursor-tool-mapper"
+import {
+  getCursorSkillMetadata,
+  normalizeSkillName,
+  normalizePathForMatch,
+} from "./cursor-skill-policy"
 import { KvStorageService } from "../kv-storage.service"
 import { CursorProtocolTraceService } from "../cursor-protocol-trace.service"
 
@@ -182,6 +187,8 @@ export interface ParsedCursorRequest {
 
   // Cursor 规则（保留协议原始结构，避免在解析阶段丢失元数据）
   cursorRules?: CursorRule[]
+  selectedCursorRulePaths?: string[]
+  selectedCursorRuleNames?: string[]
 
   // Cursor Commands (/ 命令 — 用户定义的可复用工作流)
   cursorCommands?: Array<{ name: string; content: string }>
@@ -1325,6 +1332,8 @@ export class CursorRequestParser {
 
     // 收集 requestContext.rules
     const contextRules = requestContext?.rules ? [...requestContext.rules] : []
+    const selectedCursorRulePaths = new Set<string>()
+    const selectedCursorRuleNames = new Set<string>()
 
     // 收集 selectedContext.cursorRules（SelectedCursorRule 包装了 CursorRule）
     if (action && actionCase === "userMessageAction") {
@@ -1337,6 +1346,17 @@ export class CursorRequestParser {
         )
         for (const selected of selectedRules) {
           if (selected.rule) {
+            if (selected.rule.fullPath) {
+              selectedCursorRulePaths.add(
+                normalizePathForMatch(selected.rule.fullPath)
+              )
+            }
+            const selectedSkill = getCursorSkillMetadata(selected.rule)
+            if (selectedSkill?.name) {
+              selectedCursorRuleNames.add(
+                normalizeSkillName(selectedSkill.name)
+              )
+            }
             if (
               !selected.rule.fullPath ||
               !existingPaths.has(selected.rule.fullPath)
@@ -1664,6 +1684,14 @@ export class CursorRequestParser {
             ? { rootPath, directories, files: [] }
             : undefined,
           cursorRules,
+          selectedCursorRulePaths:
+            selectedCursorRulePaths.size > 0
+              ? Array.from(selectedCursorRulePaths)
+              : undefined,
+          selectedCursorRuleNames:
+            selectedCursorRuleNames.size > 0
+              ? Array.from(selectedCursorRuleNames)
+              : undefined,
           cursorCommands:
             cursorCommands.length > 0 ? cursorCommands : undefined,
           customSystemPrompt: customSystemPrompt || undefined,
@@ -1711,6 +1739,14 @@ export class CursorRequestParser {
         ? { rootPath, directories, files: [] }
         : undefined,
       cursorRules,
+      selectedCursorRulePaths:
+        selectedCursorRulePaths.size > 0
+          ? Array.from(selectedCursorRulePaths)
+          : undefined,
+      selectedCursorRuleNames:
+        selectedCursorRuleNames.size > 0
+          ? Array.from(selectedCursorRuleNames)
+          : undefined,
       cursorCommands: cursorCommands.length > 0 ? cursorCommands : undefined,
       customSystemPrompt: customSystemPrompt || undefined,
       contextTokenLimit,

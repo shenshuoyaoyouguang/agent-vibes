@@ -111,7 +111,7 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
   CLIENT_SIDE_TOOL_V2_EDIT_FILE_V2: {
     name: "edit_file_v2",
     description:
-      "Edit a file with exact search and replace. Before editing, read the file in the current conversation. Prefer a small unique search snippet copied verbatim from read_file output. If read_file output includes display-only line number prefixes, do not include those prefixes in search or replace. Do not use run_terminal_command with sed, perl, python, or shell patching for normal file edits when this tool can express the change.",
+      "Edit a file with exact search and replace. Before editing an existing file, read the file in the current conversation. Prefer a small unique search snippet copied verbatim from read_file output. To create a new file, set search to an empty string and replace to the full file content. If read_file output includes display-only line number prefixes, do not include those prefixes in search or replace. Do not use run_terminal_command with cat heredoc, tee, echo redirection, sed, perl, python, or shell patching for normal file creation or edits when this tool can express the change.",
     input_schema: {
       type: "object",
       properties: {
@@ -200,7 +200,7 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
   CLIENT_SIDE_TOOL_V2_RUN_TERMINAL_COMMAND_V2: {
     name: "run_terminal_command",
     description:
-      "Run a command in the terminal. Do NOT use this for normal repository search, file reading, or deterministic file edits when grep_search, read_file, list_directory, or edit_file_v2 can express the task. In particular, avoid grep, rg, find, sed, cat, head, and tail for ordinary code inspection when structured tools are available. Use this when the user explicitly wants command execution or no structured tool fits.",
+      "Run a command in the terminal. Do NOT use this for normal repository search, file reading, deterministic file creation, or deterministic file edits when grep_search, read_file, list_directory, or edit_file_v2 can express the task. In particular, avoid grep, rg, find, sed, cat, head, tail, cat heredoc, tee, and echo redirection for ordinary file work when structured tools are available. Use this when the user explicitly wants command execution or no structured tool fits.",
     input_schema: {
       type: "object",
       properties: {
@@ -418,10 +418,17 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
 
   CLIENT_SIDE_TOOL_V2_FETCH_RULES: {
     name: "fetch_rules",
-    description: "Fetch active project/agent rules for current conversation",
+    description:
+      "Fetch active project/agent rules, or load a specific Cursor skill by name",
     input_schema: {
       type: "object",
-      properties: {},
+      properties: {
+        skill_name: {
+          type: "string",
+          description:
+            "Optional Cursor skill name to activate and load, such as canvas",
+        },
+      },
       required: [],
     },
   },

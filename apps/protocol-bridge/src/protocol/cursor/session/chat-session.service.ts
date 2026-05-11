@@ -327,6 +327,9 @@ export interface ChatSession {
   projectContext?: ParsedCursorRequest["projectContext"]
   codeChunks?: ParsedCursorRequest["codeChunks"]
   cursorRules?: ParsedCursorRequest["cursorRules"]
+  selectedCursorRulePaths?: ParsedCursorRequest["selectedCursorRulePaths"]
+  selectedCursorRuleNames?: ParsedCursorRequest["selectedCursorRuleNames"]
+  activeCursorSkillNames?: string[]
   cursorCommands?: ParsedCursorRequest["cursorCommands"]
   customSystemPrompt?: ParsedCursorRequest["customSystemPrompt"]
   explicitContext?: string
@@ -2148,6 +2151,9 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       // user/resume action. Restoring them from persisted session state causes
       // stale/duplicated default rules to leak across turns.
       cursorRules: undefined,
+      selectedCursorRulePaths: undefined,
+      selectedCursorRuleNames: undefined,
+      activeCursorSkillNames: [],
       cursorCommands: persisted.cursorCommands,
       customSystemPrompt: persisted.customSystemPrompt,
       explicitContext: persisted.explicitContext,
@@ -2281,6 +2287,9 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       projectContext: initialRequest?.projectContext,
       codeChunks: initialRequest?.codeChunks,
       cursorRules: initialRequest?.cursorRules,
+      selectedCursorRulePaths: initialRequest?.selectedCursorRulePaths,
+      selectedCursorRuleNames: initialRequest?.selectedCursorRuleNames,
+      activeCursorSkillNames: [],
       cursorCommands: initialRequest?.cursorCommands,
       customSystemPrompt: initialRequest?.customSystemPrompt,
       explicitContext: initialRequest?.explicitContext,
@@ -2397,6 +2406,8 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       }
       if (initialRequest) {
         session.cursorRules = initialRequest.cursorRules
+        session.selectedCursorRulePaths = initialRequest.selectedCursorRulePaths
+        session.selectedCursorRuleNames = initialRequest.selectedCursorRuleNames
       }
       session.cursorCommands = initialRequest?.cursorCommands
       session.customSystemPrompt = initialRequest?.customSystemPrompt

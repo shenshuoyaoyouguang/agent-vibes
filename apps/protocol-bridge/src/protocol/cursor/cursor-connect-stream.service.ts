@@ -108,6 +108,13 @@ import {
   resolveMcpToolDefinition,
 } from "./tools/mcp-call-contract"
 import {
+  findCursorSkillByName,
+  findCursorSkillForInternalPath,
+  normalizeSkillName,
+  resolveCursorSkillPolicy,
+  type CursorSkillMetadata,
+} from "./tools/cursor-skill-policy"
+import {
   buildNumberedLineEntries,
   extractEditFailureSelection,
   findToolResultAppendPlan,
@@ -180,7 +187,12 @@ type PromptContext = Pick<
   | "customSystemPrompt"
   | "explicitContext"
   | "mcpToolDefs"
->
+  | "selectedCursorRulePaths"
+  | "selectedCursorRuleNames"
+> & {
+  newMessage?: ParsedCursorRequest["newMessage"]
+  activeCursorSkillNames?: string[]
+}
 
 /**
  * Message content item types - compatible with chat-session.manager.ts MessageContent
@@ -456,6 +468,28 @@ interface TopLevelContinuationDecision {
   repeatedEditPaths: string[]
   reasons: string[]
 }
+
+type AvoidableShellCommandClassification =
+  | {
+      kind: "file_write"
+      recommendedTool: "edit_file_v2"
+      reason: string
+    }
+  | {
+      kind: "file_read"
+      recommendedTool: "read_file"
+      reason: string
+    }
+  | {
+      kind: "file_search"
+      recommendedTool: "grep_search"
+      reason: string
+    }
+  | {
+      kind: "file_discovery"
+      recommendedTool: "list_directory" | "file_search" | "glob_search"
+      reason: string
+    }
 
 interface AssistantTurnStreamParams {
   conversationId: string
@@ -1658,14 +1692,26 @@ export class CursorConnectStreamService {
   }
 
   private buildPromptContextFromSession(session: ChatSession): PromptContext {
+    const latestUserMessage =
+      this.extractLatestUserPlainText(
+        session.messages as Array<{
+          role: "user" | "assistant"
+          content: MessageContent
+        }>
+      ) || undefined
+
     return {
       projectContext: session.projectContext,
       codeChunks: session.codeChunks,
       cursorRules: session.cursorRules,
+      selectedCursorRulePaths: session.selectedCursorRulePaths,
+      selectedCursorRuleNames: session.selectedCursorRuleNames,
+      activeCursorSkillNames: session.activeCursorSkillNames,
       cursorCommands: session.cursorCommands,
       customSystemPrompt: session.customSystemPrompt,
       explicitContext: session.explicitContext,
       mcpToolDefs: session.mcpToolDefs,
+      newMessage: latestUserMessage,
     }
   }
 
@@ -3351,6 +3397,8 @@ ${raw}
       projectContext: session.projectContext,
       codeChunks: session.codeChunks,
       cursorRules: session.cursorRules,
+      selectedCursorRulePaths: session.selectedCursorRulePaths,
+      selectedCursorRuleNames: session.selectedCursorRuleNames,
       cursorCommands: session.cursorCommands,
       customSystemPrompt: session.customSystemPrompt,
       explicitContext: session.explicitContext,
@@ -3437,22 +3485,24 @@ ${raw}
     const normalized = text.trim().toLowerCase()
     if (!normalized) return false
 
-    const asksAboutFailure =
-      /(why|failed|failure|error|unexpected|accidental|accidentally|triggered|为何|为什么|怎么回事|意外|触发|失败|报错|错误|故障|问题)/i.test(
-        normalized
-      )
-    const hasImageNoun =
-      /(image|picture|photo|illustration|diagram|logo|icon|poster|mockup|visual|图片|图像|图标|示意图|插图|海报|头像|视觉|logo)/i.test(
-        normalized
-      )
-    const hasCreateVerb =
-      /(generate|create|draw|make|render|design|生成|创建|绘制|画|制作|做|设计)/i.test(
-        normalized
-      )
-    const explicitRequestPrefix =
-      /(please|can you|help me|帮我|请|直接|给我|为我).{0,24}(generate|create|draw|make|render|design|生成|创建|绘制|画|制作|做|设计)/i.test(
-        normalized
-      )
+    const asksAboutFailure = this.containsAnyTerm(
+      normalized,
+      CursorConnectStreamService.INTENT_FAILURE_TERMS
+    )
+    const hasImageNoun = this.containsAnyTerm(
+      normalized,
+      CursorConnectStreamService.IMAGE_TARGET_TERMS
+    )
+    const hasCreateVerb = this.containsAnyTerm(
+      normalized,
+      CursorConnectStreamService.IMAGE_ACTION_TERMS
+    )
+    const explicitRequestPrefix = this.containsOrderedTermsWithinWindow(
+      normalized,
+      CursorConnectStreamService.REQUEST_PREFIX_TERMS,
+      CursorConnectStreamService.IMAGE_ACTION_TERMS,
+      24
+    )
 
     if (!hasImageNoun || !hasCreateVerb) {
       return false
@@ -3466,7 +3516,7 @@ ${raw}
   private isImageGenerationToolName(toolName: string): boolean {
     const normalized = toolName.trim().toLowerCase()
     if (!normalized) return false
-    const compact = normalized.replace(/[^a-z0-9]/g, "")
+    const compact = this.compactAsciiAlphaNumeric(normalized)
     return (
       normalized === "generate_image" ||
       normalized === "create_diagram" ||
@@ -3477,6 +3527,124 @@ ${raw}
       compact === "clientsidetoolv2generateimage" ||
       compact === "clientsidetoolv2creatediagram"
     )
+  }
+
+  private buildInactiveCursorSkillToolError(
+    session: ChatSession,
+    toolName: string,
+    input: Record<string, unknown>
+  ): string | null {
+    const targetPath = this.pickCursorSkillTargetPath(toolName, input)
+    if (!targetPath) {
+      return null
+    }
+    const skill = findCursorSkillForInternalPath(
+      session.cursorRules,
+      targetPath
+    )
+    if (!skill) {
+      return null
+    }
+    if (this.isCursorSkillActive(session, skill.name)) {
+      return null
+    }
+
+    const message =
+      `Cursor skill access blocked: skill "${skill.name}" is available but not active. ` +
+      `Load it with fetch_rules({ skill_name: "${skill.name}" }) before using its internal files or generated workspace.`
+    this.logger.warn(
+      `${message}; tool=${toolName}; path=${targetPath || "(none)"}`
+    )
+    return message
+  }
+
+  private pickCursorSkillTargetPath(
+    toolName: string,
+    input: Record<string, unknown>
+  ): string {
+    const normalizedTool = toolName.trim().toLowerCase()
+    if (!normalizedTool) {
+      return ""
+    }
+
+    const mayTouchPath =
+      normalizedTool.includes("read") ||
+      normalizedTool.includes("list") ||
+      normalizedTool.includes("ls") ||
+      normalizedTool.includes("edit") ||
+      normalizedTool.includes("write") ||
+      normalizedTool.includes("delete") ||
+      normalizedTool.includes("file") ||
+      normalizedTool.includes("dir")
+    if (!mayTouchPath) {
+      return ""
+    }
+
+    return (
+      this.pickFirstString(input, [
+        "path",
+        "filePath",
+        "file_path",
+        "targetPath",
+        "target_path",
+        "directory",
+        "dir",
+      ]) || ""
+    )
+  }
+
+  private containsAnyTerm(text: string, terms: readonly string[]): boolean {
+    return terms.some((term) => text.includes(term))
+  }
+
+  private containsOrderedTermsWithinWindow(
+    text: string,
+    leftTerms: readonly string[],
+    rightTerms: readonly string[],
+    maxCharsBetween: number
+  ): boolean {
+    for (const left of this.findTermRanges(text, leftTerms)) {
+      for (const right of this.findTermRanges(text, rightTerms)) {
+        if (
+          right.start >= left.end &&
+          right.start - left.end <= maxCharsBetween
+        ) {
+          return true
+        }
+      }
+    }
+    return false
+  }
+
+  private findTermRanges(
+    text: string,
+    terms: readonly string[]
+  ): Array<{ start: number; end: number }> {
+    const ranges: Array<{ start: number; end: number }> = []
+    for (const term of terms) {
+      if (!term) continue
+      let searchFrom = 0
+      while (searchFrom < text.length) {
+        const start = text.indexOf(term, searchFrom)
+        if (start < 0) break
+        ranges.push({ start, end: start + term.length })
+        searchFrom = start + Math.max(term.length, 1)
+      }
+    }
+    return ranges
+  }
+
+  private compactAsciiAlphaNumeric(text: string): string {
+    let compact = ""
+    for (const char of text) {
+      const code = char.charCodeAt(0)
+      const isDigit = code >= 48 && code <= 57
+      const isLowerAlpha = code >= 97 && code <= 122
+      if (isDigit || isLowerAlpha) {
+        compact += char
+      }
+    }
+    return compact
   }
 
   private tryParseJsonRecord(value: string): Record<string, unknown> | null {
@@ -7710,6 +7878,17 @@ ${raw}
       }
     }
 
+    const avoidableShellDispatchError = this.buildAvoidableShellDispatchError(
+      session,
+      normalizedToolName,
+      input
+    )
+    if (avoidableShellDispatchError) {
+      return {
+        errorMessage: avoidableShellDispatchError,
+      }
+    }
+
     if (
       normalizedToolName === "mcp" ||
       normalizedToolName === "mcp_tool" ||
@@ -11334,6 +11513,40 @@ ${raw}
     content: string
     state: { status: ToolResultStatus; message?: string }
   }> {
+    const session = this.sessionManager.getSession(conversationId)
+    const requestedSkillName = this.pickFirstString(input, [
+      "skill_name",
+      "skillName",
+      "name",
+    ])
+    if (requestedSkillName) {
+      const skill = findCursorSkillByName(
+        session?.cursorRules,
+        requestedSkillName
+      )
+      if (!skill || !session) {
+        const message = `Cursor skill not found: ${requestedSkillName}`
+        return {
+          content: `[fetch_rules error] ${message}`,
+          state: { status: "error", message },
+        }
+      }
+
+      this.activateCursorSkillForSession(session, skill.name, "fetch_rules")
+      input.skill_name = skill.name
+      input.path = skill.fullPath
+      input.content = skill.content
+      return {
+        content:
+          `[fetch_rules success] skill=${skill.name}\n` +
+          (skill.fullPath
+            ? `Base directory for this skill: ${path.dirname(skill.fullPath)}\n\n`
+            : "") +
+          skill.content,
+        state: { status: "success" },
+      }
+    }
+
     const rootPath = this.resolveWorkspaceRoot(conversationId)
     const candidates = [
       ".cursor/rules",
@@ -11358,14 +11571,46 @@ ${raw}
     input.totalCount = rules.length
     input.path = rules[0]?.path || ""
 
+    const skillPolicy = resolveCursorSkillPolicy({
+      rules: session?.cursorRules,
+      selectedRulePaths: session?.selectedCursorRulePaths,
+      selectedRuleNames: session?.selectedCursorRuleNames,
+      activeSkillNames: session?.activeCursorSkillNames,
+      projectRoot: session?.projectContext?.rootPath,
+      contextPaths: (session?.codeChunks || []).map((chunk) => chunk.path),
+    })
+    input.available_skills = skillPolicy.availableSkills.map((skill) => ({
+      name: skill.name,
+      active: skill.active,
+      activation_reason: skill.activationReason,
+      description: skill.description,
+      when_to_use: skill.whenToUse,
+      paths: skill.paths,
+      path: skill.fullPath,
+    }))
+
     const preview =
       rules.length > 0
         ? rules
             .map((rule) => `Path: ${rule.path}\n${rule.content}`)
             .join("\n\n---\n\n")
         : "- (no rules found)"
+    const skillPreview =
+      skillPolicy.availableSkills.length > 0
+        ? "\n\nAvailable Cursor Skills:\n" +
+          skillPolicy.availableSkills
+            .map(
+              (skill) =>
+                `- ${skill.name} [${skill.active ? "active" : "inactive"}]` +
+                (skill.description
+                  ? `: ${this.truncateText(skill.description, 180)}`
+                  : "")
+            )
+            .join("\n") +
+          "\nUse fetch_rules({ skill_name }) to load an inactive skill."
+        : ""
     return {
-      content: `[fetch_rules success] total=${rules.length}\n${preview}`,
+      content: `[fetch_rules success] total=${rules.length}\n${preview}${skillPreview}`,
       state: { status: "success" },
     }
   }
@@ -13255,8 +13500,32 @@ ${raw}
     const execDispatchResolution = validationErrorMessage
       ? { target: null, errorMessage: validationErrorMessage }
       : this.resolveExecDispatchTarget(session, canonicalToolName, input)
-    const execDispatchTarget = execDispatchResolution.target
-    const deferredToolFamily = validationErrorMessage
+    const pathForSkillActivation = this.pickCursorSkillTargetPath(
+      execDispatchResolution.target?.toolName || canonicalToolName,
+      execDispatchResolution.target?.input || input
+    )
+    if (pathForSkillActivation) {
+      this.activateCursorSkillsForPath(
+        session,
+        pathForSkillActivation,
+        `tool_path:${canonicalToolName}`
+      )
+    }
+    const unrequestedCanvasError = validationErrorMessage
+      ? null
+      : this.buildInactiveCursorSkillToolError(
+          session,
+          execDispatchResolution.target?.toolName || canonicalToolName,
+          execDispatchResolution.target?.input || input
+        )
+    const dispatchErrorMessage =
+      validationErrorMessage ||
+      unrequestedCanvasError ||
+      execDispatchResolution.errorMessage
+    const execDispatchTarget = unrequestedCanvasError
+      ? null
+      : execDispatchResolution.target
+    const deferredToolFamily = dispatchErrorMessage
       ? undefined
       : execDispatchTarget && canonicalToolName === "generate_image"
         ? undefined
@@ -13277,8 +13546,7 @@ ${raw}
       ),
       deferredToolFamily,
       execDispatchTarget: execDispatchTarget || undefined,
-      dispatchErrorMessage:
-        validationErrorMessage || execDispatchResolution.errorMessage,
+      dispatchErrorMessage,
       canDispatchExec: Boolean(execDispatchTarget),
       protocolToolName: execDispatchTarget?.toolName || canonicalToolName,
       protocolToolInput: execDispatchTarget?.input || input,
@@ -13680,6 +13948,125 @@ ${raw}
     return null
   }
 
+  private latestUserExplicitlyRequestsShellExecution(
+    session: ChatSession | undefined
+  ): boolean {
+    if (!session) return false
+    const latestUserText =
+      this.extractLatestUserPlainText(
+        session.messages as Array<{
+          role: "user" | "assistant"
+          content: MessageContent
+        }>
+      ) || ""
+    const normalized = latestUserText.trim().toLowerCase()
+    if (!normalized) return false
+    return (
+      normalized.includes("run_terminal_command") ||
+      normalized.includes("shell") ||
+      normalized.includes("terminal") ||
+      normalized.includes("命令行") ||
+      normalized.includes("终端") ||
+      normalized.includes("执行命令") ||
+      normalized.includes("运行命令") ||
+      normalized.includes("用命令")
+    )
+  }
+
+  private classifyAvoidableShellCommand(
+    command: string | null
+  ): AvoidableShellCommandClassification | null {
+    if (!command) return null
+    const normalized = command.trim().toLowerCase()
+    if (!normalized) return null
+
+    // Deterministic repository file writes must go through the edit protocol so
+    // Cursor can render the diff and the model receives a structured result.
+    if (
+      /(^|[\n;&|])\s*(?:cat|printf|echo)\b[^\n]*(?:>|>>)\s*[^&|;\s]+/.test(
+        normalized
+      ) ||
+      /(^|[\n;&|])\s*tee\s+(?:-[a-z]+\s+)*[^&|;\s]+/.test(normalized) ||
+      /(^|[\n;&|])\s*(?:sed\b[^\n]*\s-i\b|perl\b[^\n]*\s-pi\b)/.test(
+        normalized
+      ) ||
+      /\b(?:writefilesync|writefile|write_text)\s*\(/.test(normalized) ||
+      /\bopen\s*\([^)]*["'](?:w|a|x)\+?["']/.test(normalized)
+    ) {
+      return {
+        kind: "file_write",
+        recommendedTool: "edit_file_v2",
+        reason: "deterministic file write through shell",
+      }
+    }
+
+    if (
+      /^(?:cat|sed\s+-n|head|tail|nl)\b/.test(normalized) &&
+      !/[<>]/.test(normalized)
+    ) {
+      return {
+        kind: "file_read",
+        recommendedTool: "read_file",
+        reason: "file inspection through shell",
+      }
+    }
+
+    if (/^(?:rg|grep|git\s+grep)\b/.test(normalized)) {
+      return {
+        kind: "file_search",
+        recommendedTool: "grep_search",
+        reason: "repository text search through shell",
+      }
+    }
+
+    if (/^(?:ls|find|fd|tree)\b/.test(normalized)) {
+      return {
+        kind: "file_discovery",
+        recommendedTool: "list_directory",
+        reason: "file discovery through shell",
+      }
+    }
+
+    return null
+  }
+
+  private buildAvoidableShellDispatchError(
+    session: ChatSession,
+    normalizedToolName: string,
+    input: Record<string, unknown>
+  ): string | undefined {
+    if (
+      normalizedToolName !== "run_terminal_command" &&
+      normalizedToolName !== "run_terminal_command_v2" &&
+      normalizedToolName !== "exec_command" &&
+      normalizedToolName !== "shell" &&
+      normalizedToolName !== "run_command"
+    ) {
+      return undefined
+    }
+
+    if (this.latestUserExplicitlyRequestsShellExecution(session)) {
+      return undefined
+    }
+
+    const command = this.pickShellCommand(input)
+    const classification = this.classifyAvoidableShellCommand(command)
+    if (!classification) {
+      return undefined
+    }
+
+    const commandPreview = this.truncateForToolSummary(command || "", 220)
+    const recommendation =
+      classification.kind === "file_write"
+        ? "Use edit_file_v2. For a new file, call edit_file_v2 with search set to an empty string and replace set to the full file content. For an existing file, read_file first, then edit_file_v2 with a small exact search snippet."
+        : `Use ${classification.recommendedTool} instead.`
+    const message =
+      `run_terminal_command rejected: ${classification.reason}; ` +
+      `${recommendation} command=${JSON.stringify(commandPreview)}`
+    this.logger.warn(message)
+    return message
+  }
+
   private truncateForToolSummary(value: string, maxChars: number): string {
     const normalized = value.trim()
     if (normalized.length <= maxChars) {
@@ -13727,6 +14114,12 @@ ${raw}
         normalized
       )
     ) {
+      return false
+    }
+    if (this.classifyAvoidableShellCommand(command)?.kind === "file_write") {
+      return false
+    }
+    if (/[^\d]>>?[^&|]/.test(normalized)) {
       return false
     }
 
@@ -18643,6 +19036,82 @@ ${raw}
     "- Exception: code comments and commit messages default to English unless the user specifies otherwise.",
   ].join("\n")
 
+  private static readonly INTENT_FAILURE_TERMS = [
+    "why",
+    "failed",
+    "failure",
+    "error",
+    "unexpected",
+    "accidental",
+    "accidentally",
+    "triggered",
+    "debug",
+    "diagnose",
+    "investigate",
+    "log",
+    "为何",
+    "为什么",
+    "怎么回事",
+    "意外",
+    "触发",
+    "失败",
+    "报错",
+    "错误",
+    "故障",
+    "问题",
+    "排查",
+    "日志",
+    "总是",
+  ] as const
+
+  private static readonly REQUEST_PREFIX_TERMS = [
+    "please",
+    "can you",
+    "help me",
+    "帮我",
+    "请",
+    "直接",
+    "给我",
+    "为我",
+  ] as const
+
+  private static readonly IMAGE_TARGET_TERMS = [
+    "image",
+    "picture",
+    "photo",
+    "illustration",
+    "diagram",
+    "logo",
+    "icon",
+    "poster",
+    "mockup",
+    "visual",
+    "图片",
+    "图像",
+    "图标",
+    "示意图",
+    "插图",
+    "海报",
+    "头像",
+    "视觉",
+  ] as const
+
+  private static readonly IMAGE_ACTION_TERMS = [
+    "generate",
+    "create",
+    "draw",
+    "make",
+    "render",
+    "design",
+    "生成",
+    "创建",
+    "绘制",
+    "画",
+    "制作",
+    "做",
+    "设计",
+  ] as const
+
   /**
    * Build system prompt from context
    */
@@ -18655,11 +19124,18 @@ ${raw}
 
     parts.push(this.buildCursorToolUsageSection())
 
+    const cursorSkillPolicy = this.resolveCursorSkillPolicyForPrompt(context)
     const cursorRulesSection = this.buildCursorRulesSection(
-      this.resolveEffectiveRuleContents(context.cursorRules)
+      this.resolveEffectiveRulesForPrompt(context, cursorSkillPolicy)
     )
     if (cursorRulesSection) {
       parts.push(cursorRulesSection)
+    }
+    const cursorSkillsSection = this.buildCursorSkillsCatalogSection(
+      cursorSkillPolicy.availableSkills
+    )
+    if (cursorSkillsSection) {
+      parts.push(cursorSkillsSection)
     }
 
     if (context.cursorCommands && context.cursorCommands.length > 0) {
@@ -18709,11 +19185,18 @@ ${raw}
 
     parts.push(this.buildCodexToolUsageSection())
 
+    const cursorSkillPolicy = this.resolveCursorSkillPolicyForPrompt(context)
     const cursorRulesSection = this.buildCursorRulesSection(
-      this.resolveEffectiveRuleContents(context.cursorRules)
+      this.resolveEffectiveRulesForPrompt(context, cursorSkillPolicy)
     )
     if (cursorRulesSection) {
       parts.push(cursorRulesSection)
+    }
+    const cursorSkillsSection = this.buildCursorSkillsCatalogSection(
+      cursorSkillPolicy.availableSkills
+    )
+    if (cursorSkillsSection) {
+      parts.push(cursorSkillsSection)
     }
 
     if (context.cursorCommands && context.cursorCommands.length > 0) {
@@ -18777,6 +19260,7 @@ ${raw}
       "- To search file contents, use grep_search instead of grep or rg.",
       "- To discover files or inspect directory contents, use glob_search, file_search, or list_directory instead of find or ls.",
       "- To edit existing files, use edit_file_v2 instead of sed, awk, perl, python, or shell patching.",
+      "- To create a new file, use edit_file_v2 with search set to an empty string and replace set to the full file content; do not use cat heredoc, tee, echo redirection, or shell-based file creation.",
       "- Before editing, read the file in the current conversation and copy a small unique search snippet verbatim from read_file output. Do not include any display-only line number prefixes.",
       "- If the task already requires a report, artifact, or file edit and you have enough evidence, perform that write now instead of only saying that you will do it next.",
       "- Reserve run_terminal_command for build/test execution, system commands, or tasks where no structured tool can express the work.",
@@ -18792,6 +19276,7 @@ ${raw}
       "- To search file contents, use grep_search instead of grep or rg.",
       "- To discover files or inspect directory contents, use glob_search, file_search, or list_directory instead of find or ls.",
       "- To edit existing files, use edit_file_v2 instead of sed, awk, perl, python, or shell patching.",
+      "- To create a new file, use edit_file_v2 with search set to an empty string and replace set to the full file content; do not use cat heredoc, tee, echo redirection, or shell-based file creation.",
       "- Before editing, read the file in the current conversation and copy a small unique search snippet verbatim from read_file output. Do not include any display-only line number prefixes.",
       "- If you need to continue an existing shell session, use write_shell_stdin instead of starting a fresh run_terminal_command.",
       "- Prefer MCP resources over web_search when the required context is available from a configured MCP server.",
@@ -18892,7 +19377,11 @@ ${raw}
       })
     }
 
-    const ruleContents = this.resolveEffectiveRuleContents(context.cursorRules)
+    const cursorSkillPolicy = this.resolveCursorSkillPolicyForPrompt(context)
+    const ruleContents = this.resolveEffectiveRuleContentsForPrompt(
+      context,
+      cursorSkillPolicy
+    )
     if (ruleContents.length > 0) {
       contextMessages.push({
         role: "user",
@@ -18903,6 +19392,15 @@ ${raw}
         role: "user",
         content:
           "<user_rules>\nThe user has not defined any custom rules.\n</user_rules>",
+      })
+    }
+    const cursorSkillsSection = this.buildCursorSkillsCatalogSection(
+      cursorSkillPolicy.availableSkills
+    )
+    if (cursorSkillsSection) {
+      contextMessages.push({
+        role: "user",
+        content: `<cursor_skills>\n${cursorSkillsSection}\n</cursor_skills>`,
       })
     }
 
@@ -19000,36 +19498,185 @@ ${raw}
     return contextMessages
   }
 
-  private resolveEffectiveRuleContents(
-    rules?: PromptContext["cursorRules"] | string[]
-  ): string[] {
-    const ruleContents = Array.isArray(rules)
-      ? rules
-          .map((rule) =>
-            typeof rule === "string" ? rule : (rule.content ?? "")
-          )
-          .map((content) => content.trim())
-          .filter((content) => content.length > 0)
-      : []
-    const kbContents = this.knowledgeBaseService
+  private resolveCursorSkillPolicyForPrompt(context: PromptContext) {
+    const policy = resolveCursorSkillPolicy({
+      rules: context.cursorRules,
+      selectedRulePaths: context.selectedCursorRulePaths,
+      selectedRuleNames: context.selectedCursorRuleNames,
+      activeSkillNames: context.activeCursorSkillNames,
+      projectRoot: context.projectContext?.rootPath,
+      contextPaths: (context.codeChunks || []).map((chunk) => chunk.path),
+    })
+
+    if (policy.suppressedSkills.length > 0) {
+      this.logger.warn(
+        `Suppressed ${policy.suppressedSkills.length} inactive Cursor skill rule(s) for prompt: ` +
+          policy.suppressedSkills.map((skill) => skill.name).join(", ") +
+          "; use fetch_rules({ skill_name }) to load a skill before applying its workflow"
+      )
+    }
+
+    return policy
+  }
+
+  private buildCursorSkillsCatalogSection(
+    skills: CursorSkillMetadata[]
+  ): string | null {
+    if (skills.length === 0) {
+      return null
+    }
+
+    const lines = [
+      "Available Cursor Skills:",
+      "These are discoverable skill workflows. Inactive skills are listed by metadata only; their full instructions are not active prompt rules.",
+      "To activate a skill, call fetch_rules with skill_name, then follow the returned skill instructions.",
+      "Do not read skill files or skill-owned internal workspace paths directly before the skill is active.",
+      "",
+    ]
+
+    for (const skill of skills.slice(0, 24)) {
+      const state = skill.active
+        ? `active:${skill.activationReason || "unknown"}`
+        : "inactive"
+      const details = [
+        skill.description
+          ? `description=${this.truncateText(skill.description, 220)}`
+          : "",
+        skill.whenToUse
+          ? `when_to_use=${this.truncateText(skill.whenToUse, 220)}`
+          : "",
+        skill.paths.length > 0 ? `paths=${skill.paths.join(", ")}` : "",
+      ].filter(Boolean)
+      lines.push(
+        `- ${skill.name} [${state}]${details.length > 0 ? `: ${details.join("; ")}` : ""}`
+      )
+    }
+
+    if (skills.length > 24) {
+      lines.push(`- ... ${skills.length - 24} more skill(s) omitted`)
+    }
+
+    return lines.join("\n")
+  }
+
+  private truncateText(text: string, maxChars: number): string {
+    const normalized = text.replace(/\s+/g, " ").trim()
+    if (normalized.length <= maxChars) {
+      return normalized
+    }
+    return `${normalized.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`
+  }
+
+  private isCursorSkillActive(
+    session: ChatSession,
+    skillName: string
+  ): boolean {
+    const normalized = normalizeSkillName(skillName)
+    if (!normalized) return false
+    if (
+      (session.activeCursorSkillNames || []).some(
+        (name) => normalizeSkillName(name) === normalized
+      )
+    ) {
+      return true
+    }
+    return resolveCursorSkillPolicy({
+      rules: session.cursorRules,
+      selectedRulePaths: session.selectedCursorRulePaths,
+      selectedRuleNames: session.selectedCursorRuleNames,
+      activeSkillNames: session.activeCursorSkillNames,
+      projectRoot: session.projectContext?.rootPath,
+      contextPaths: (session.codeChunks || []).map((chunk) => chunk.path),
+    }).activeSkills.some((skill) => skill.name === normalized)
+  }
+
+  private activateCursorSkillForSession(
+    session: ChatSession,
+    skillName: string,
+    reason: string
+  ): void {
+    const normalized = normalizeSkillName(skillName)
+    if (!normalized) return
+    const activeNames = new Set(
+      (session.activeCursorSkillNames || []).map((name) =>
+        normalizeSkillName(name)
+      )
+    )
+    if (activeNames.has(normalized)) {
+      return
+    }
+    session.activeCursorSkillNames = [
+      ...(session.activeCursorSkillNames || []),
+      normalized,
+    ]
+    this.sessionManager.markSessionDirty(session.conversationId)
+    this.logger.log(
+      `Activated Cursor skill "${normalized}" for session ${session.conversationId}; reason=${reason}`
+    )
+  }
+
+  private activateCursorSkillsForPath(
+    session: ChatSession,
+    rawPath: string,
+    reason: string
+  ): void {
+    if (!rawPath) return
+    const policy = resolveCursorSkillPolicy({
+      rules: session.cursorRules,
+      selectedRulePaths: session.selectedCursorRulePaths,
+      selectedRuleNames: session.selectedCursorRuleNames,
+      activeSkillNames: session.activeCursorSkillNames,
+      projectRoot: session.projectContext?.rootPath,
+      contextPaths: [rawPath],
+    })
+    for (const skill of policy.activeSkills) {
+      if (skill.activationReason === "path_match") {
+        this.activateCursorSkillForSession(session, skill.name, reason)
+      }
+    }
+  }
+
+  private resolveEffectiveRulesForPrompt(
+    context: PromptContext,
+    skillPolicy = this.resolveCursorSkillPolicyForPrompt(context)
+  ): Array<CursorRule | string> {
+    const cursorRules = skillPolicy.promptRules
+    const kbRules = this.knowledgeBaseService
       .list()
       .map((item) => item.knowledge?.trim() ?? "")
       .filter((content) => content.length > 0)
 
     const seen = new Set<string>()
-    const merged: string[] = []
-    for (const content of [...ruleContents, ...kbContents]) {
+    const merged: Array<CursorRule | string> = []
+    for (const rule of [...cursorRules, ...kbRules]) {
+      const content = this.getCursorRuleContent(rule).trim()
+      if (!content) {
+        continue
+      }
       if (seen.has(content)) {
         continue
       }
       seen.add(content)
-      merged.push(content)
+      merged.push(rule)
     }
     return merged
   }
 
+  private resolveEffectiveRuleContentsForPrompt(
+    context: PromptContext,
+    skillPolicy = this.resolveCursorSkillPolicyForPrompt(context)
+  ): string[] {
+    return this.resolveEffectiveRulesForPrompt(context, skillPolicy)
+      .map((rule) => this.getCursorRuleContent(rule).trim())
+      .filter((content) => content.length > 0)
+  }
+
+  private getCursorRuleContent(rule: CursorRule | string): string {
+    return typeof rule === "string" ? rule : (rule.content ?? "")
+  }
+
   private buildCursorRulesSection(
-    rules?: PromptContext["cursorRules"] | string[]
+    rules?: Array<CursorRule | string>
   ): string | null {
     if (!Array.isArray(rules) || rules.length === 0) {
       return null
