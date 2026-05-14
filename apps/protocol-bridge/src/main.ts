@@ -16,6 +16,7 @@ import * as fs from "fs"
 import * as os from "os"
 import * as path from "path"
 import { AppModule } from "./app.module"
+import { ForwardProxyServer } from "./forward-proxy"
 import { ModelRouterService } from "./llm/shared/model-router.service"
 import { registerContentTypeParsers } from "./shared/content-type-parsers"
 import { registerRequestHooks } from "./shared/request-hooks"
@@ -241,6 +242,50 @@ async function bootstrap() {
   const port = process.env.PORT || 2026
   await app.listen(port, "0.0.0.0")
 
+  // ── Forward Proxy (SSH remote-development mode) ───────────────────
+  // Optional HTTP CONNECT proxy that lets a remote SSH host route Cursor
+  // traffic back to this bridge through an `ssh -R` reverse tunnel,
+  // without requiring root on the remote machine.
+  //
+  // Disabled when:
+  //   • FORWARD_PROXY_ENABLED=false
+  //   • FORWARD_PROXY_PORT is set to "0"
+  // Defaults to 127.0.0.1:18080 (loopback only).
+  const forwardProxyEnabled =
+    process.env.FORWARD_PROXY_ENABLED !== "false" &&
+    process.env.FORWARD_PROXY_PORT !== "0"
+  let forwardProxy: ForwardProxyServer | null = null
+  if (forwardProxyEnabled) {
+    const forwardProxyPort = Number.parseInt(
+      process.env.FORWARD_PROXY_PORT || "18080",
+      10
+    )
+    if (Number.isFinite(forwardProxyPort) && forwardProxyPort > 0) {
+      const bridgePortNumeric = Number.parseInt(String(port), 10) || 2026
+      forwardProxy = new ForwardProxyServer({
+        port: forwardProxyPort,
+        bridgePort: bridgePortNumeric,
+        bindHost: process.env.FORWARD_PROXY_BIND || "127.0.0.1",
+      })
+      try {
+        await forwardProxy.start()
+      } catch (err) {
+        logger.warn(
+          `Forward proxy failed to start on port ${forwardProxyPort}: ${err instanceof Error ? err.message : String(err)}`
+        )
+        forwardProxy = null
+      }
+    }
+  }
+
+  for (const sig of ["SIGINT", "SIGTERM"] as const) {
+    process.once(sig, () => {
+      void (async () => {
+        await forwardProxy?.stop()
+      })()
+    })
+  }
+
   const protocol = useHttp2 ? "https" : "http"
   const http2Status = useHttp2
     ? "ENABLED (HTTP/2 only)"
@@ -322,6 +367,7 @@ ${empty}
 ${line(`${c.green}▸${c.reset} Server    ${c.bold}${c.green}${serverUrl}${c.reset}`)}
 ${line(`${c.green}▸${c.reset} API Docs  ${c.bold}${c.green}${serverUrl}/docs${c.reset}`)}
 ${line(`${c.green}▸${c.reset} HTTP/2    ${c.bold}${c.white}${http2Status}${c.reset}`)}
+${line(`${c.green}▸${c.reset} SSH proxy ${c.bold}${c.white}${forwardProxy ? `http://127.0.0.1:${process.env.FORWARD_PROXY_PORT || 18080}` : "DISABLED"}${c.reset}`)}
 ${line(`${c.green}▸${c.reset} Mode      ${c.bold}${c.white}${isDebug ? "DEBUG (verbose + file log)" : "NORMAL (quiet)"}${c.reset}`)}
 ${empty}
 ${sep}

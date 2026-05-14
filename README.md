@@ -472,6 +472,122 @@ Behavior:
   configured cap among the currently available candidates so retries do not overflow a smaller provider window.
 - Official `api.anthropic.com` accounts use `x-api-key`; third-party endpoints use `Authorization: Bearer ...`.
 
+## SSH Remote Development
+
+When Cursor IDE is connected to a remote machine over SSH (the workspace
+lives on the remote host, not on your laptop), agent traffic is generated
+by the remote-side `cursor-server` process. The local hosts file /
+loopback redirect that powers Agent Vibes on a regular workstation cannot
+intercept that traffic — yet most users have no `sudo` on the remote
+host to set up a second bridge there.
+
+To handle this case, the bridge ships an HTTP forward proxy that lets
+the remote `cursor-server` route Cursor traffic back to the bridge
+running on your laptop, **without root on the remote**.
+
+### How it works
+
+```text
+┌─ Local laptop (Cursor IDE host) ──────────────────────────┐
+│                                                            │
+│  Bridge process                                            │
+│   ├─ HTTPS server   127.0.0.1:2026   (existing)            │
+│   └─ Forward proxy  127.0.0.1:18080  (new, loopback only)  │
+│         │                                                   │
+│         │  CONNECT api2.cursor.sh:443                       │
+│         ▼                                                   │
+│         splice → 127.0.0.1:2026  (bridge handles TLS)       │
+└────────┬───────────────────────────────────────────────────┘
+         │   ssh -R 18080:127.0.0.1:18080 user@remote
+         ▼
+┌─ Remote SSH host (no sudo required) ──────────────────────┐
+│                                                            │
+│  HTTPS_PROXY=http://127.0.0.1:18080                        │
+│  cursor-server / agent runtime                             │
+│         │ HTTPS api2.cursor.sh:443                          │
+│         ▼                                                   │
+│  127.0.0.1:18080  (reverse-tunneled to your laptop)         │
+└────────────────────────────────────────────────────────────┘
+```
+
+For Cursor agent domains the proxy splices the TLS connection straight
+to the local bridge. For any other host the proxy behaves like a normal
+HTTPS proxy and connects to the real upstream, so the remote shell can
+keep using `HTTPS_PROXY` for everything.
+
+### Setup
+
+Configure on your local laptop (one-time):
+
+1. Make sure the bridge is running. On startup the banner now shows:
+
+   ```text
+   ▸ SSH proxy http://127.0.0.1:18080
+   ```
+
+   The proxy binds to loopback only and is opt-out via
+   `FORWARD_PROXY_ENABLED=false` or `FORWARD_PROXY_PORT=0`.
+
+2. Open the SSH connection with a reverse tunnel that exposes port 18080
+   on the remote host:
+
+   ```bash
+   ssh -R 18080:127.0.0.1:18080 user@remote-host
+   ```
+
+   Or add it to `~/.ssh/config`:
+
+   ```sshconfig
+   Host my-remote
+     HostName remote-host
+     User myuser
+     RemoteForward 18080 127.0.0.1:18080
+   ```
+
+Configure on the remote host (each shell, no sudo):
+
+1. Trust the bridge CA so HTTPS verification passes inside Node-based
+   agents. Copy the CA from your laptop (`~/.agent-vibes/certs/ca.pem`)
+   to the remote host once and point Node to it:
+
+   ```bash
+   # on the remote host
+   mkdir -p ~/.agent-vibes/certs
+   # copy ca.pem from your laptop, e.g. via scp from your laptop:
+   #   scp ~/.agent-vibes/certs/ca.pem \
+   #       user@remote-host:~/.agent-vibes/certs/ca.pem
+   export NODE_EXTRA_CA_CERTS=$HOME/.agent-vibes/certs/ca.pem
+   ```
+
+2. Point the agent runtime at the proxy and start `cursor-server`:
+
+   ```bash
+   export HTTPS_PROXY=http://127.0.0.1:18080
+   export HTTP_PROXY=http://127.0.0.1:18080
+   # then launch / restart cursor-server in the same shell, e.g.
+   #   ~/.cursor-server/bin/cursor-server &
+   ```
+
+   Persist by adding the same exports to `~/.bashrc` / `~/.zshrc` /
+   `~/.profile`.
+
+### Troubleshooting
+
+- `curl -x http://127.0.0.1:18080 https://api2.cursor.sh/health` on the
+  remote host should return `{"status":"ok",...}`. If it hangs, check
+  that `ssh -R` is active and that `127.0.0.1:18080` on the remote
+  really forwards back to your laptop.
+- `tls: x509: certificate signed by unknown authority` —
+  `NODE_EXTRA_CA_CERTS` was not set or points at a CA that does not
+  match the bridge certificates. Re-copy `ca.pem`.
+- The remote agent runtime ignores `HTTPS_PROXY` — confirm the env vars
+  are exported in the same shell that starts `cursor-server`. Some
+  launchers (`systemd --user`, tmux panes that pre-date the export)
+  keep stale env.
+- The proxy refuses the connection — verify the bridge is running
+  (`▸ SSH proxy ...` banner line) and that no other process is listening
+  on `127.0.0.1:18080` on your laptop.
+
 ## Project Structure
 
 ```text

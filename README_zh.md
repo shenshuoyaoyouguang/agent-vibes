@@ -448,6 +448,96 @@ agent-vibes sync --codex
   确保失败回退时也不会撞上较小提供方的窗口。
 - 官方 `api.anthropic.com` 使用 `x-api-key`；第三方兼容端点使用 `Authorization: Bearer ...`。
 
+## SSH 远程开发
+
+当 Cursor IDE 通过 SSH 连接远程主机（工作区在远端而非本地笔记本）时，agent 流量是由远端的 `cursor-server` 进程发出的。本地的 hosts/回环重定向无法拦截远端流量；同时大多数用户在远端主机上没有 `sudo`，无法再装一份 bridge。
+
+为此 bridge 内置了一个 HTTP 正向代理，让远端 `cursor-server` 在**无需 root** 的情况下，把 Cursor 流量回转到本机笔记本上的 bridge。
+
+### 工作原理
+
+```text
+┌─ 本地笔记本（运行 Cursor IDE） ──────────────────────────┐
+│                                                          │
+│  Bridge 进程                                             │
+│   ├─ HTTPS 服务   127.0.0.1:2026   （已有）              │
+│   └─ Forward 代理 127.0.0.1:18080  （新增，仅回环）       │
+│         │                                                 │
+│         │  CONNECT api2.cursor.sh:443                     │
+│         ▼                                                 │
+│         splice → 127.0.0.1:2026  （bridge 处理 TLS）       │
+└────────┬─────────────────────────────────────────────────┘
+         │   ssh -R 18080:127.0.0.1:18080 user@remote
+         ▼
+┌─ 远端 SSH 主机（无需 sudo） ─────────────────────────────┐
+│                                                          │
+│  HTTPS_PROXY=http://127.0.0.1:18080                      │
+│  cursor-server / agent runtime                           │
+│         │ HTTPS api2.cursor.sh:443                        │
+│         ▼                                                 │
+│  127.0.0.1:18080  （由 ssh -R 反向隧道转回笔记本）         │
+└──────────────────────────────────────────────────────────┘
+```
+
+对 Cursor agent 域名，代理会把 TLS 连接直接 splice 到本地 bridge；对其他域名，代理表现为普通 HTTPS 代理，连到真实上游。这样远端 shell 可以全程使用同一个 `HTTPS_PROXY`。
+
+### 配置步骤
+
+本地笔记本（一次配置）：
+
+1. 启动 bridge。启动 banner 中应能看到：
+
+   ```text
+   ▸ SSH proxy http://127.0.0.1:18080
+   ```
+
+   代理仅绑定回环地址；可通过 `FORWARD_PROXY_ENABLED=false` 或 `FORWARD_PROXY_PORT=0` 关闭。
+
+2. 通过反向隧道开启 SSH 连接，把 18080 暴露到远端：
+
+   ```bash
+   ssh -R 18080:127.0.0.1:18080 user@remote-host
+   ```
+
+   或写入 `~/.ssh/config`：
+
+   ```sshconfig
+   Host my-remote
+     HostName remote-host
+     User myuser
+     RemoteForward 18080 127.0.0.1:18080
+   ```
+
+远端主机（每个 shell，无需 sudo）：
+
+1. 把本机 bridge 的 CA 拷到远端，让 Node 信任：
+
+   ```bash
+   # 在远端
+   mkdir -p ~/.agent-vibes/certs
+   # 把本机 ~/.agent-vibes/certs/ca.pem 拷过来，例如在本机：
+   #   scp ~/.agent-vibes/certs/ca.pem user@remote-host:~/.agent-vibes/certs/ca.pem
+   export NODE_EXTRA_CA_CERTS=$HOME/.agent-vibes/certs/ca.pem
+   ```
+
+2. 让 agent runtime 走代理，再启动 `cursor-server`：
+
+   ```bash
+   export HTTPS_PROXY=http://127.0.0.1:18080
+   export HTTP_PROXY=http://127.0.0.1:18080
+   # 在同一 shell 中重启 cursor-server，例如：
+   #   ~/.cursor-server/bin/cursor-server &
+   ```
+
+   把上面 export 写入 `~/.bashrc` / `~/.zshrc` / `~/.profile` 即可持久化。
+
+### 故障排查
+
+- 在远端执行 `curl -x http://127.0.0.1:18080 https://api2.cursor.sh/health`，应返回 `{"status":"ok",...}`。如果卡住，先确认 `ssh -R` 仍在生效，远端 `127.0.0.1:18080` 真的回转到笔记本。
+- 出现 `tls: x509: certificate signed by unknown authority`：未设置 `NODE_EXTRA_CA_CERTS`，或 CA 与 bridge 证书不匹配；重新拷贝 `ca.pem`。
+- 远端 agent runtime 不走代理：确认 `HTTPS_PROXY` 等环境变量是在拉起 `cursor-server` 的那个 shell 中导出的；某些启动方式（`systemd --user`、早于 `export` 的 tmux 面板）会保留旧 env。
+- 代理拒绝连接：确认本地 bridge 在跑（banner 显示 `▸ SSH proxy ...`），并且笔记本上 `127.0.0.1:18080` 没有被其他进程占用。
+
 ## 项目结构
 
 ```text
