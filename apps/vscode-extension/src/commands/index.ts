@@ -1,6 +1,7 @@
 import * as path from "path"
 import * as vscode from "vscode"
 import { CMD, STATE } from "../constants"
+import { t, tFmt } from "../i18n/messages-i18n"
 import { AccountSyncService } from "../services/account-sync"
 import {
   importCodexCpaJsonDirectory,
@@ -9,10 +10,10 @@ import {
 } from "../services/backend-account-sync"
 import { BridgeManager } from "../services/bridge-manager"
 import { CertManager } from "../services/cert-manager"
-import { CursorChecksumsService } from "../services/cursor-checksums"
-import { CursorPatchManagerService } from "../services/cursor-patch-manager"
 import { CertTrustService } from "../services/cert-trust"
 import { ConfigManager } from "../services/config-manager"
+import { CursorChecksumsService } from "../services/cursor-checksums"
+import { CursorPatchManagerService } from "../services/cursor-patch-manager"
 import { ExtensionUpdateService } from "../services/extension-update"
 import { NetworkManager } from "../services/network-manager"
 import { logger } from "../utils/logger"
@@ -129,12 +130,12 @@ export function registerCommands(
     await context.globalState.update(STATE.FORWARDING_RELOAD_PROMPTED, true)
 
     const action = await vscode.window.showInformationMessage(
-      "Forwarding is enabled. Fully restart Cursor to apply DNS/hosts changes.",
-      "Quit Cursor Now",
-      "Later"
+      t("forwarding.enabledRestart"),
+      t("forwarding.action.quit"),
+      t("setup.action.later")
     )
 
-    if (action === "Quit Cursor Now") {
+    if (action === t("forwarding.action.quit")) {
       await vscode.commands.executeCommand("workbench.action.quit")
     }
   }
@@ -150,14 +151,14 @@ export function registerCommands(
         if (network.isForwardingActive()) {
           logger.info("Forwarding already active from previous session")
           vscode.window.showInformationMessage(
-            "Bridge started! Forwarding already active."
+            t("forwarding.bridgeStartedAlready")
           )
           return
         }
         // Execute forwarding in terminal (requires sudo)
         executePrivileged(
           network.getEnableCommand(),
-          "Agent Vibes — Enable Forwarding"
+          t("terminal.enableForwarding")
         )
         void promptReloadAfterForwardingEnabled()
       }
@@ -170,7 +171,7 @@ export function registerCommands(
       if (network.isForwardingActive()) {
         executePrivileged(
           network.getDisableCommand(),
-          "Agent Vibes — Disable Forwarding"
+          t("terminal.disableForwarding")
         )
       }
       await bridge.stop()
@@ -189,23 +190,23 @@ export function registerCommands(
     vscode.commands.registerCommand(CMD.APPLY_CURSOR_CHECKSUMS, async () => {
       const result = cursorChecksums.apply()
       if (!result.success) {
-        const detail = result.errors.join("; ") || "Unknown error"
+        const detail = result.errors.join("; ") || t("checksums.unknownError")
         void vscode.window.showErrorMessage(
-          `Failed to update Cursor checksums: ${detail}`
+          tFmt("checksums.failed", { detail })
         )
         return
       }
 
       const message =
         result.updated > 0
-          ? `Updated ${result.updated} Cursor checksum(s). Fully restart Cursor to apply.`
-          : "Cursor checksums already match the current core files."
+          ? tFmt("checksums.updated", { count: result.updated })
+          : t("checksums.alreadyMatched")
       const action = await vscode.window.showInformationMessage(
         message,
-        "Quit Cursor Now",
-        "Later"
+        t("forwarding.action.quit"),
+        t("setup.action.later")
       )
-      if (action === "Quit Cursor Now") {
+      if (action === t("forwarding.action.quit")) {
         await vscode.commands.executeCommand("workbench.action.quit")
       }
     })
@@ -215,22 +216,19 @@ export function registerCommands(
     vscode.commands.registerCommand(CMD.RESET_CURSOR_PATCHES, async () => {
       const result = cursorPatchManager.resetAllPatches()
       if (!result.success) {
-        const detail = result.errors.join("; ") || "Unknown error"
+        const detail = result.errors.join("; ") || t("checksums.unknownError")
         void vscode.window.showErrorMessage(
-          `Failed to reset Cursor patches: ${detail}`
+          tFmt("patches.resetFailed", { detail })
         )
         return
       }
 
-      const parts: string[] = []
-      parts.push(`Reset ${result.restored} Cursor file(s)`)
-
       const action = await vscode.window.showInformationMessage(
-        `${parts.join(", ")}. Fully restart Cursor to apply.`,
-        "Quit Cursor Now",
-        "Later"
+        tFmt("patches.resetSummary", { count: result.restored }),
+        t("forwarding.action.quit"),
+        t("setup.action.later")
       )
-      if (action === "Quit Cursor Now") {
+      if (action === t("forwarding.action.quit")) {
         await vscode.commands.executeCommand("workbench.action.quit")
       }
     })
@@ -248,12 +246,14 @@ export function registerCommands(
 
         const result = await sync.syncToBridge(config)
         void vscode.window.showInformationMessage(
-          `Synced Antigravity IDE credentials for ${result.email}`
+          tFmt("sync.antigravityIde.success", { email: result.email })
         )
       } catch (err) {
         logger.error("Failed to sync Antigravity IDE credentials", err)
         vscode.window.showErrorMessage(
-          `Credential sync failed: ${err instanceof Error ? err.message : String(err)}`
+          tFmt("sync.antigravityIde.failed", {
+            message: err instanceof Error ? err.message : String(err),
+          })
         )
       }
     })
@@ -271,9 +271,7 @@ export function registerCommands(
         const accountsDir = path.join(toolsDir, "accounts")
 
         if (!fs.existsSync(indexPath)) {
-          vscode.window.showErrorMessage(
-            `Antigravity Tools not found (~/.antigravity_tools/accounts.json missing)`
-          )
+          vscode.window.showErrorMessage(t("sync.antigravityTools.notFound"))
           return
         }
 
@@ -281,7 +279,7 @@ export function registerCommands(
           accounts?: Array<{ id?: string }>
         }
         if (!Array.isArray(index.accounts) || index.accounts.length === 0) {
-          vscode.window.showWarningMessage("No accounts in Antigravity Tools")
+          vscode.window.showWarningMessage(t("sync.antigravityTools.empty"))
           return
         }
 
@@ -319,9 +317,7 @@ export function registerCommands(
         }
 
         if (loaded.length === 0) {
-          vscode.window.showWarningMessage(
-            "No valid accounts found in Antigravity Tools"
-          )
+          vscode.window.showWarningMessage(t("sync.antigravityTools.invalid"))
           return
         }
 
@@ -357,12 +353,14 @@ export function registerCommands(
 
         logger.info(`Synced ${loaded.length} account(s) from Antigravity Tools`)
         vscode.window.showInformationMessage(
-          `Synced ${loaded.length} account(s) from Antigravity Tools`
+          tFmt("sync.antigravityTools.success", { count: loaded.length })
         )
       } catch (err) {
         logger.error("Failed to sync Antigravity Tools", err)
         vscode.window.showErrorMessage(
-          `Sync failed: ${err instanceof Error ? err.message : String(err)}`
+          tFmt("sync.antigravityTools.failed", {
+            message: err instanceof Error ? err.message : String(err),
+          })
         )
       }
     })
@@ -374,12 +372,17 @@ export function registerCommands(
         const result = syncClaudeAccount(config)
         logger.info(result.summary)
         vscode.window.showInformationMessage(
-          `${result.summary} → ${path.basename(result.destinationPath)}`
+          tFmt("sync.summaryWithDest", {
+            summary: result.summary,
+            dest: path.basename(result.destinationPath),
+          })
         )
       } catch (err) {
         logger.error("Failed to sync Claude credentials", err)
         vscode.window.showErrorMessage(
-          `Claude sync failed: ${err instanceof Error ? err.message : String(err)}`
+          tFmt("sync.claude.failed", {
+            message: err instanceof Error ? err.message : String(err),
+          })
         )
       }
     })
@@ -391,12 +394,17 @@ export function registerCommands(
         const result = syncCodexAccount(config)
         logger.info(result.summary)
         vscode.window.showInformationMessage(
-          `${result.summary} → ${path.basename(result.destinationPath)}`
+          tFmt("sync.summaryWithDest", {
+            summary: result.summary,
+            dest: path.basename(result.destinationPath),
+          })
         )
       } catch (err) {
         logger.error("Failed to sync Codex credentials", err)
         vscode.window.showErrorMessage(
-          `Codex sync failed: ${err instanceof Error ? err.message : String(err)}`
+          tFmt("sync.codex.failed", {
+            message: err instanceof Error ? err.message : String(err),
+          })
         )
       }
     })
@@ -411,7 +419,7 @@ export function registerCommands(
           canSelectFiles: true,
           canSelectFolders: true,
           canSelectMany: false,
-          openLabel: "Import CPA JSONs",
+          openLabel: t("sync.cpa.openLabel"),
           filters: {
             JSON: ["json"],
           },
@@ -430,12 +438,17 @@ export function registerCommands(
         const result = importCodexCpaJsonDirectory(config, sourceDir)
         logger.info(result.summary)
         vscode.window.showInformationMessage(
-          `${result.summary} → ${path.basename(result.destinationPath)}`
+          tFmt("sync.summaryWithDest", {
+            summary: result.summary,
+            dest: path.basename(result.destinationPath),
+          })
         )
       } catch (err) {
         logger.error("Failed to import Codex CPA JSON directory", err)
         vscode.window.showErrorMessage(
-          `Codex CPA import failed: ${err instanceof Error ? err.message : String(err)}`
+          tFmt("sync.cpa.failed", {
+            message: err instanceof Error ? err.message : String(err),
+          })
         )
       }
     })
@@ -450,7 +463,9 @@ export function registerCommands(
         } catch (err) {
           logger.error("Failed to open OpenAI-compatible accounts file", err)
           vscode.window.showErrorMessage(
-            `Open OpenAI-compatible accounts file failed: ${err instanceof Error ? err.message : String(err)}`
+            tFmt("file.openOpenAICompatFailed", {
+              message: err instanceof Error ? err.message : String(err),
+            })
           )
         }
       }
@@ -464,7 +479,9 @@ export function registerCommands(
       } catch (err) {
         logger.error("Failed to open Claude API accounts file", err)
         vscode.window.showErrorMessage(
-          `Open Claude API accounts file failed: ${err instanceof Error ? err.message : String(err)}`
+          tFmt("file.openClaudeApiFailed", {
+            message: err instanceof Error ? err.message : String(err),
+          })
         )
       }
     })
@@ -486,21 +503,18 @@ export function registerCommands(
         )
 
         if (nodeCaOk && systemTrustOk) {
-          vscode.window.showInformationMessage(
-            "SSL certificates regenerated. CA is already trusted (system + Node.js)."
-          )
+          vscode.window.showInformationMessage(t("cert.alreadyTrusted"))
           return
         }
 
         // Step 3: Offer one-click trust setup
         const action = await vscode.window.showInformationMessage(
-          "SSL certificates generated. Trust the CA now? " +
-            "(Requires password — configures system trust + Cursor environment)",
-          "Trust CA Now",
-          "Skip"
+          t("cert.generated.prompt"),
+          t("cert.action.trust"),
+          t("cert.action.skip")
         )
 
-        if (action === "Trust CA Now") {
+        if (action === t("cert.action.trust")) {
           const scriptPath = CertTrustService.generateTrustScript(
             config.caCertPath
           )
@@ -508,16 +522,18 @@ export function registerCommands(
             // Windows: Run PowerShell script elevated
             executePrivileged(
               `powershell -ExecutionPolicy Bypass -File "${scriptPath}"`,
-              "Agent Vibes — Trust CA"
+              t("terminal.trustCa")
             )
           } else {
-            executePrivileged(scriptPath, "Agent Vibes — Trust CA")
+            executePrivileged(scriptPath, t("terminal.trustCa"))
           }
         }
       } catch (err) {
         logger.error("Failed to generate certificates", err)
         vscode.window.showErrorMessage(
-          `Failed to generate SSL certificates: ${err instanceof Error ? err.message : String(err)}`
+          tFmt("cert.failed", {
+            message: err instanceof Error ? err.message : String(err),
+          })
         )
       }
     })
@@ -528,13 +544,13 @@ export function registerCommands(
   context.subscriptions.push(
     vscode.commands.registerCommand(CMD.ENABLE_FORWARDING, () => {
       if (network.isForwardingActive()) {
-        vscode.window.showInformationMessage("Forwarding is already active.")
+        vscode.window.showInformationMessage(t("forwarding.alreadyActive"))
         return
       }
 
       executePrivileged(
         network.getEnableCommand(),
-        "Agent Vibes — Enable Forwarding"
+        t("terminal.enableForwarding")
       )
       void promptReloadAfterForwardingEnabled()
     })
@@ -544,7 +560,7 @@ export function registerCommands(
     vscode.commands.registerCommand(CMD.DISABLE_FORWARDING, () => {
       executePrivileged(
         network.getDisableCommand(),
-        "Agent Vibes — Disable Forwarding"
+        t("terminal.disableForwarding")
       )
     })
   )
@@ -555,9 +571,19 @@ export function registerCommands(
       const loopbackSummary =
         forwarding.hasLoopbackAlias === null
           ? ""
-          : ` | Loopback: ${forwarding.hasLoopbackAlias ? "✓" : "✗"}`
+          : tFmt("forwarding.loopbackSuffix", {
+              flag: forwarding.hasLoopbackAlias ? "✓" : "✗",
+            })
       vscode.window.showInformationMessage(
-        `Forwarding: ${forwarding.active ? "✅ Active" : "❌ Inactive"} | Hosts: ${forwarding.hasHosts ? "✓" : "✗"}${loopbackSummary} | ${forwarding.backendLabel}: ${forwarding.backendConfigured ? "✓" : "✗"}`
+        tFmt("forwarding.statusLine", {
+          state: forwarding.active
+            ? t("forwarding.state.active")
+            : t("forwarding.state.inactive"),
+          hosts: forwarding.hasHosts ? "✓" : "✗",
+          loopback: loopbackSummary,
+          backendLabel: forwarding.backendLabel,
+          backend: forwarding.backendConfigured ? "✓" : "✗",
+        })
       )
     })
   )
@@ -577,7 +603,9 @@ export function registerCommands(
       } catch (err) {
         logger.error("Failed to check for extension updates", err)
         vscode.window.showErrorMessage(
-          `Update check failed: ${err instanceof Error ? err.message : String(err)}`
+          tFmt("update.checkFailed", {
+            message: err instanceof Error ? err.message : String(err),
+          })
         )
       }
     })

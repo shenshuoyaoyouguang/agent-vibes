@@ -11,6 +11,7 @@ import {
   GITHUB_RELEASES_API_URL,
   GITHUB_RELEASES_URL,
 } from "../constants"
+import { t, tFmt } from "../i18n/messages-i18n"
 import { logger } from "../utils/logger"
 import { getPlatformTarget } from "../utils/platform"
 
@@ -205,9 +206,7 @@ export class ExtensionUpdateService {
 
     if (release.draft) {
       if (userInitiated) {
-        void vscode.window.showWarningMessage(
-          "The latest GitHub release is still marked as draft."
-        )
+        void vscode.window.showWarningMessage(t("update.draftWarn"))
       }
       return
     }
@@ -216,7 +215,10 @@ export class ExtensionUpdateService {
     if (compareVersions(latestVersion, currentVersion) <= 0) {
       if (userInitiated) {
         void vscode.window.showInformationMessage(
-          `${EXTENSION_DISPLAY_NAME} is already up to date (${currentVersion}).`
+          tFmt("update.upToDate", {
+            name: EXTENSION_DISPLAY_NAME,
+            version: currentVersion,
+          })
         )
       }
       return
@@ -234,35 +236,41 @@ export class ExtensionUpdateService {
 
     if (!asset) {
       const action = await vscode.window.showWarningMessage(
-        `Agent Vibes ${latestVersion} is available, but no VSIX asset was found for ${getPlatformTarget()}.`,
-        "Open Release"
+        tFmt("update.assetMissing", {
+          version: latestVersion,
+          target: getPlatformTarget(),
+        }),
+        t("update.action.openRelease")
       )
-      if (action === "Open Release") {
+      if (action === t("update.action.openRelease")) {
         await vscode.env.openExternal(vscode.Uri.parse(releaseUrl))
       }
       return
     }
 
+    const installLabel = t("update.action.install")
+    const viewLabel = t("update.action.viewRelease")
+    const skipLabel = t("update.action.skip")
     const choices = userInitiated
-      ? (["Install Update", "View Release"] as const)
-      : (["Install Update", "View Release", "Skip This Version"] as const)
+      ? [installLabel, viewLabel]
+      : [installLabel, viewLabel, skipLabel]
 
     const action = await vscode.window.showInformationMessage(
-      `Agent Vibes ${latestVersion} is available from GitHub Releases.`,
+      tFmt("update.available", { version: latestVersion }),
       ...choices
     )
 
-    if (action === "Install Update") {
+    if (action === installLabel) {
       await this.installUpdate(latestVersion, asset, releaseUrl)
       return
     }
 
-    if (action === "View Release") {
+    if (action === viewLabel) {
       await vscode.env.openExternal(vscode.Uri.parse(releaseUrl))
       return
     }
 
-    if (action === "Skip This Version") {
+    if (action === skipLabel) {
       await this.context.globalState.update(SKIPPED_VERSION_KEY, latestVersion)
     }
   }
@@ -281,11 +289,14 @@ export class ExtensionUpdateService {
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
-          title: `Installing ${EXTENSION_DISPLAY_NAME} ${version}`,
+          title: tFmt("update.installing.title", {
+            name: EXTENSION_DISPLAY_NAME,
+            version,
+          }),
           cancellable: false,
         },
         async (progress) => {
-          progress.report({ message: "Downloading VSIX..." })
+          progress.report({ message: t("update.progress.downloading") })
 
           await downloadFile(
             asset.browser_download_url,
@@ -297,12 +308,14 @@ export class ExtensionUpdateService {
 
               progress.report({
                 increment: 0,
-                message: `Downloading VSIX... ${Math.floor((done / total) * 100)}%`,
+                message: tFmt("update.progress.downloadingPct", {
+                  pct: Math.floor((done / total) * 100),
+                }),
               })
             }
           )
 
-          progress.report({ message: "Installing VSIX..." })
+          progress.report({ message: t("update.progress.installing") })
           await vscode.commands.executeCommand(
             "workbench.extensions.installExtension",
             vscode.Uri.file(downloadPath)
@@ -313,21 +326,27 @@ export class ExtensionUpdateService {
       await this.context.globalState.update(SKIPPED_VERSION_KEY, undefined)
 
       const reloadAction = await vscode.window.showInformationMessage(
-        `${EXTENSION_DISPLAY_NAME} ${version} installed. Reload Cursor to activate it.`,
-        "Reload Window",
-        "Later"
+        tFmt("update.installed", {
+          name: EXTENSION_DISPLAY_NAME,
+          version,
+        }),
+        t("update.action.reload"),
+        t("update.action.later")
       )
 
-      if (reloadAction === "Reload Window") {
+      if (reloadAction === t("update.action.reload")) {
         await vscode.commands.executeCommand("workbench.action.reloadWindow")
       }
     } catch (error) {
       logger.error("Failed to install extension update", error)
       const action = await vscode.window.showErrorMessage(
-        `Failed to install Agent Vibes ${version}: ${error instanceof Error ? error.message : String(error)}`,
-        "Open Release"
+        tFmt("update.installFailed", {
+          version,
+          message: error instanceof Error ? error.message : String(error),
+        }),
+        t("update.action.openRelease")
       )
-      if (action === "Open Release") {
+      if (action === t("update.action.openRelease")) {
         await vscode.env.openExternal(vscode.Uri.parse(releaseUrl))
       }
     } finally {

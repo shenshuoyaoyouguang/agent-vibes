@@ -1,6 +1,7 @@
 import * as vscode from "vscode"
 import { registerCommands } from "./commands"
 import { CMD, STATE, type ServerState } from "./constants"
+import { t, tFmt } from "./i18n/messages-i18n"
 import { BridgeManager } from "./services/bridge-manager"
 import { CertManager } from "./services/cert-manager"
 import { ConfigManager } from "./services/config-manager"
@@ -66,8 +67,8 @@ export async function activate(
       try {
         if (bridgeRunning) {
           statusIndicator?.showBusy(
-            "Restarting…",
-            `Agent Vibes — Restarting bridge on port ${nextPort}`
+            t("bridge.restartingBusy"),
+            tFmt("bridge.restartingTooltip", { port: nextPort })
           )
           await bridge?.restart()
           logger.info(`Bridge restarted on new port ${nextPort}`)
@@ -77,19 +78,19 @@ export async function activate(
         const message = error instanceof Error ? error.message : String(error)
         logger.error(`Failed to restart bridge after port change`, error)
         void vscode.window.showErrorMessage(
-          `Agent Vibes failed to restart on port ${nextPort}: ${message}`
+          tFmt("bridge.failedRestart", { port: nextPort, message })
         )
         return
       }
 
       if (forwardingActive && network) {
         statusIndicator?.showBusy(
-          "Reconfiguring…",
-          `Agent Vibes — Reconfiguring forwarding for port ${nextPort}`
+          t("bridge.reconfiguringBusy"),
+          tFmt("bridge.reconfiguringTooltip", { port: nextPort })
         )
         executePrivileged(
           network.getReconfigureCommand(previousPort),
-          "Agent Vibes — Reconfigure Forwarding"
+          t("terminal.reconfigureForwarding")
         )
         setTimeout(() => statusIndicator?.clearBusy(), 8000)
       } else {
@@ -118,24 +119,22 @@ export async function activate(
 
   if (needsCerts || !hasAnyAccounts) {
     const missing: string[] = []
-    if (needsCerts) missing.push("SSL certificates")
-    if (!hasAnyAccounts) missing.push("backend accounts")
+    if (needsCerts) missing.push(t("setup.missing.certs"))
+    if (!hasAnyAccounts) missing.push(t("setup.missing.accounts"))
 
     const action = await vscode.window.showInformationMessage(
-      `Agent Vibes needs setup: ${missing.join(" and ")} not configured.`,
-      "Setup Now",
-      "Later"
+      tFmt("setup.needsSetup", { missing: missing.join(" / ") }),
+      t("setup.action.now"),
+      t("setup.action.later")
     )
 
-    if (action === "Setup Now") {
+    if (action === t("setup.action.now")) {
       if (needsCerts) {
         await vscode.commands.executeCommand(CMD.GENERATE_CERT)
       }
       if (!hasAnyAccounts) {
         await vscode.commands.executeCommand(CMD.OPEN_DASHBOARD)
-        vscode.window.showInformationMessage(
-          "Add at least one backend account from the Agent Vibes Dashboard."
-        )
+        vscode.window.showInformationMessage(t("setup.addAccountHint"))
       }
     }
   }
@@ -152,12 +151,12 @@ export async function activate(
     await context.globalState.update(STATE.FORWARDING_RELOAD_PROMPTED, true)
 
     const action = await vscode.window.showInformationMessage(
-      "Forwarding is enabled. Fully restart Cursor to apply DNS/hosts changes.",
-      "Quit Cursor Now",
-      "Later"
+      t("forwarding.enabledRestart"),
+      t("forwarding.action.quit"),
+      t("setup.action.later")
     )
 
-    if (action === "Quit Cursor Now") {
+    if (action === t("forwarding.action.quit")) {
       await vscode.commands.executeCommand("workbench.action.quit")
     }
   }
@@ -176,14 +175,14 @@ export async function activate(
           } else {
             // Prompt user to enable forwarding via sudo terminal
             const action = await vscode.window.showInformationMessage(
-              "Bridge is running! Enable network forwarding? (requires sudo)",
-              "Enable",
-              "Later"
+              t("forwarding.promptEnable"),
+              t("forwarding.action.enable"),
+              t("setup.action.later")
             )
-            if (action === "Enable") {
+            if (action === t("forwarding.action.enable")) {
               executePrivileged(
                 network!.getEnableCommand(),
-                "Agent Vibes — Enable Forwarding"
+                t("terminal.enableForwarding")
               )
               void promptReloadAfterForwardingEnabled()
             }

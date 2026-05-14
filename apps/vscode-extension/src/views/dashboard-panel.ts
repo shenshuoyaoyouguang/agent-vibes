@@ -5,6 +5,21 @@ import * as path from "path"
 import * as tls from "tls"
 import * as vscode from "vscode"
 import { CMD, CURSOR_DOMAINS } from "../constants"
+import {
+  type DashboardLocale,
+  formatUi,
+  getDashboardPanelTitle,
+  getOverviewMessages,
+  getSettingsCopy,
+  getUiPack,
+  readDashboardLocale,
+  translateChecksumStatusDesc,
+  translateCursorBuildUnknown,
+  translateNotFound,
+  translateOnOff,
+  translatePatchResetHint,
+} from "../i18n/dashboard-i18n"
+import { t, tFmt } from "../i18n/messages-i18n"
 import { BridgeManager } from "../services/bridge-manager"
 import { startCodexOAuthFlow } from "../services/codex-oauth-service"
 import { ConfigManager } from "../services/config-manager"
@@ -127,6 +142,16 @@ export class DashboardPanel {
 
     // Watch account config files for external changes
     this.watchAccountFiles()
+
+    this.disposables.push(
+      vscode.workspace.onDidChangeConfiguration((e) => {
+        if (e.affectsConfiguration("agentVibes.language")) {
+          this.panel.title = getDashboardPanelTitle(readDashboardLocale())
+          this.panel.webview.html = this.getHtml()
+          this.sendAllData()
+        }
+      })
+    )
   }
 
   /**
@@ -139,6 +164,9 @@ export class DashboardPanel {
     network: NetworkManager
   ): void {
     if (DashboardPanel.currentPanel) {
+      DashboardPanel.currentPanel.panel.title = getDashboardPanelTitle(
+        readDashboardLocale()
+      )
       DashboardPanel.currentPanel.panel.reveal(vscode.ViewColumn.One)
       DashboardPanel.currentPanel.sendAllData()
       return
@@ -146,7 +174,7 @@ export class DashboardPanel {
 
     const panel = vscode.window.createWebviewPanel(
       DashboardPanel.viewType,
-      "Agent Vibes Dashboard",
+      getDashboardPanelTitle(readDashboardLocale()),
       vscode.ViewColumn.One,
       {
         enableScripts: true,
@@ -275,7 +303,7 @@ export class DashboardPanel {
       case "copyLogPath":
         if (msg.raw) {
           await vscode.env.clipboard.writeText(msg.raw)
-          void vscode.window.showInformationMessage("Log file path copied")
+          void vscode.window.showInformationMessage(t("dash.logCopied"))
         }
         break
 
@@ -650,8 +678,13 @@ export class DashboardPanel {
       "thinkingBudgetAuto",
       "antigravitySystemPrompt",
       "antigravityOfficialTools",
+      "autoCheckUpdates",
     ])
-    const allowedNumbers = new Set(["port", "healthCheckInterval"])
+    const allowedNumbers = new Set([
+      "port",
+      "healthCheckInterval",
+      "updateCheckIntervalHours",
+    ])
     const allowedStrings = new Set([
       "language",
       "dataDir",
@@ -671,11 +704,15 @@ export class DashboardPanel {
 
       if (key === "debugMode") {
         const action = await vscode.window.showInformationMessage(
-          `Debug Mode ${value ? "enabled" : "disabled"}. Restart bridge to apply?`,
-          "Restart",
-          "Later"
+          tFmt("dash.debugModeChanged", {
+            state: value
+              ? t("dash.debugMode.enabled")
+              : t("dash.debugMode.disabled"),
+          }),
+          t("dash.action.restart"),
+          t("dash.action.later")
         )
-        if (action === "Restart") {
+        if (action === t("dash.action.restart")) {
           await this.bridge.restart()
         }
       }
@@ -709,8 +746,8 @@ export class DashboardPanel {
       if (key !== "language") {
         vscode.window.showInformationMessage(
           str
-            ? `${key} updated. Restart bridge to apply.`
-            : `${key} reset to default.`
+            ? tFmt("dash.settingUpdated", { key })
+            : tFmt("dash.settingReset", { key })
         )
       }
       this.sendAllData()
@@ -774,9 +811,7 @@ export class DashboardPanel {
     )
 
     if (tokenEntries.length === 0) {
-      vscode.window.showWarningMessage(
-        "No valid refresh tokens found in the input."
-      )
+      vscode.window.showWarningMessage(t("dash.token.invalid"))
       return
     }
 
@@ -791,7 +826,7 @@ export class DashboardPanel {
     }
 
     vscode.window.showInformationMessage(
-      `Added ${added} account(s) to ${channel}.`
+      tFmt("dash.token.added", { count: added, channel })
     )
     this.sendAllData()
   }
@@ -800,10 +835,18 @@ export class DashboardPanel {
    * Send all dashboard data to the webview.
    */
   private sendAllData(): void {
+    const locale = readDashboardLocale()
+    const uiPack = getUiPack(locale)
+    const st = getSettingsCopy(locale)
+
     const resetPatchState = this.cursorPatchManager.getResetState()
+    const resetHintLocalized = translatePatchResetHint(
+      locale,
+      resetPatchState.hint
+    )
     const cursorBuildInfo = getCursorProductMetadata()
     const forwardingActive = this.network.isForwardingActive()
-    const cursorBuildValue = cursorBuildInfo
+    const cursorBuildRaw = cursorBuildInfo
       ? [
           cursorBuildInfo.version,
           cursorBuildInfo.commit ? cursorBuildInfo.commit.slice(0, 12) : null,
@@ -814,16 +857,21 @@ export class DashboardPanel {
           .filter((part): part is string => Boolean(part))
           .join(" • ")
       : "Unknown"
+    const cursorBuildValue = translateCursorBuildUnknown(locale, cursorBuildRaw)
     const cursorChecksumsStatus = this.cursorChecksums.getStatus()
     const checksumToggleValue =
       cursorChecksumsStatus.differsFromBaseline === true
-    const checksumStatusDesc = !cursorChecksumsStatus.productExists
+    const checksumStatusDescRaw = !cursorChecksumsStatus.productExists
       ? "Cursor product.json was not found in a supported install location."
       : cursorChecksumsStatus.differsFromBaseline === true
         ? "Core file checksums were updated from the original product.json backup."
         : cursorChecksumsStatus.allMatched
           ? "Core file checksums already match product.json."
           : `${cursorChecksumsStatus.mismatchCount} core file checksum(s) differ from product.json. This usually only needs manual repair after out-of-band core file changes.`
+    const checksumStatusDesc = translateChecksumStatusDesc(
+      locale,
+      checksumStatusDescRaw
+    )
     const channelAccountsData = {
       codex: this.getChannelData("codex"),
       "openai-compat": this.getChannelData("openai-compat"),
@@ -840,6 +888,8 @@ export class DashboardPanel {
     )
 
     const statusData = {
+      locale,
+      uiPack,
       bridge: this.bridge.state === "running" ? "Running" : this.bridge.state,
       port: this.config.port,
       forwarding: forwardingActive,
@@ -847,7 +897,7 @@ export class DashboardPanel {
       hasCertificates: this.config.hasCertificates(),
       totalAccounts,
       defaultProxyUrl: this.getDefaultProxyUrl(),
-      setup: this.getOverviewPayload(channelAccountsData),
+      setup: this.getOverviewPayload(channelAccountsData, locale),
       versions: this.versionInfo,
     }
 
@@ -863,6 +913,10 @@ export class DashboardPanel {
       data: accountsData,
     })
 
+    const agentCfg = vscode.workspace.getConfiguration("agentVibes")
+    const languageValue =
+      agentCfg.get<string>("language") === "zh" ? "zh" : "en"
+
     // Settings — only configurable items, grouped by module
     this.panel.webview.postMessage({
       type: "settingsUpdate",
@@ -870,32 +924,58 @@ export class DashboardPanel {
         groups: [
           {
             id: "general",
-            label: "General",
-            desc: "General extension preferences.",
-            items: [],
+            label: st.groups.general.label,
+            desc: st.groups.general.desc,
+            items: [
+              {
+                label: st.groups.general.items.language.label,
+                desc: st.groups.general.items.language.desc,
+                type: "select",
+                key: "language",
+                value: languageValue,
+                options: [
+                  { value: "en", label: st.general.langEn },
+                  { value: "zh", label: st.general.langZh },
+                ],
+              },
+              {
+                label: st.groups.general.items.autoCheckUpdates.label,
+                desc: st.groups.general.items.autoCheckUpdates.desc,
+                type: "toggle",
+                key: "autoCheckUpdates",
+                value: agentCfg.get<boolean>("autoCheckUpdates") ?? true,
+              },
+              {
+                label: st.groups.general.items.updateCheckIntervalHours.label,
+                desc: st.groups.general.items.updateCheckIntervalHours.desc,
+                type: "number",
+                key: "updateCheckIntervalHours",
+                value: agentCfg.get<number>("updateCheckIntervalHours") ?? 12,
+              },
+            ],
           },
           {
             id: "bridge",
-            label: "Bridge",
-            desc: "Local proxy bridge that intercepts Cursor API traffic.",
+            label: st.groups.bridge.label,
+            desc: st.groups.bridge.desc,
             items: [
               {
-                label: "Auto Start",
-                desc: "Start the bridge automatically when the IDE launches",
+                label: st.groups.bridge.items.autoStart.label,
+                desc: st.groups.bridge.items.autoStart.desc,
                 type: "toggle",
                 key: "autoStart",
                 value: this.config.autoStart,
               },
               {
-                label: "Port",
-                desc: "HTTPS port the bridge listens on (requires restart)",
+                label: st.groups.bridge.items.port.label,
+                desc: st.groups.bridge.items.port.desc,
                 type: "number",
                 key: "port",
                 value: this.config.port,
               },
               {
-                label: "Health Check Interval",
-                desc: "Seconds between health check polls, 0 to disable",
+                label: st.groups.bridge.items.healthCheckInterval.label,
+                desc: st.groups.bridge.items.healthCheckInterval.desc,
                 type: "number",
                 key: "healthCheckInterval",
                 value: this.config.healthCheckInterval,
@@ -904,26 +984,28 @@ export class DashboardPanel {
           },
           {
             id: "antigravity",
-            label: "Antigravity",
-            desc: "Antigravity (Google Cloud Code) backend settings. Changing these defaults away from the upstream behavior may increase account suspension risk.",
+            label: st.groups.antigravity.label,
+            desc: st.groups.antigravity.desc,
             items: [
               {
-                label: "System Prompt",
-                desc: "Default Antigravity system prompt; off = Cursor+Claude Code hybrid (requires restart)",
+                label:
+                  st.groups.antigravity.items.antigravitySystemPrompt.label,
+                desc: st.groups.antigravity.items.antigravitySystemPrompt.desc,
                 type: "toggle",
                 key: "antigravitySystemPrompt",
                 value: this.config.antigravitySystemPrompt,
               },
               {
-                label: "Thinking Budget",
-                desc: "Default Antigravity thinking budget; off = auto-estimation (requires restart)",
+                label: st.groups.antigravity.items.thinkingBudgetAuto.label,
+                desc: st.groups.antigravity.items.thinkingBudgetAuto.desc,
                 type: "toggle",
                 key: "thinkingBudgetAuto",
                 value: this.config.thinkingBudgetAuto,
               },
               {
-                label: "Official Tools",
-                desc: "Default Antigravity tool declarations; off = passthrough Cursor tools (requires restart)",
+                label:
+                  st.groups.antigravity.items.antigravityOfficialTools.label,
+                desc: st.groups.antigravity.items.antigravityOfficialTools.desc,
                 type: "toggle",
                 key: "antigravityOfficialTools",
                 value: this.config.antigravityOfficialTools,
@@ -932,89 +1014,77 @@ export class DashboardPanel {
           },
           {
             id: "storage",
-            label: "Storage",
-            desc: "Override default file paths. Leave empty to use defaults.",
+            label: st.groups.storage.label,
+            desc: st.groups.storage.desc,
             items: [
               {
-                label: "Data Directory",
-                desc: "Root directory for all Agent Vibes data (default: ~/.agent-vibes)",
+                label: st.groups.storage.items.dataDir.label,
+                desc: st.groups.storage.items.dataDir.desc,
                 type: "path",
                 key: "dataDir",
-                value:
-                  vscode.workspace
-                    .getConfiguration("agentVibes")
-                    .get<string>("dataDir") || "",
+                value: agentCfg.get<string>("dataDir") || "",
                 placeholder: this.config.dataDir,
               },
               {
-                label: "Antigravity Accounts File",
-                desc: "Custom path for antigravity-accounts.json",
+                label: st.groups.storage.items.antigravityAccountsPath.label,
+                desc: st.groups.storage.items.antigravityAccountsPath.desc,
                 type: "path",
                 key: "antigravityAccountsPath",
-                value:
-                  vscode.workspace
-                    .getConfiguration("agentVibes")
-                    .get<string>("antigravityAccountsPath") || "",
+                value: agentCfg.get<string>("antigravityAccountsPath") || "",
                 placeholder: this.config.antigravityAccountsPath,
               },
               {
-                label: "Codex Accounts File",
-                desc: "Custom path for codex-accounts.json",
+                label: st.groups.storage.items.codexAccountsPath.label,
+                desc: st.groups.storage.items.codexAccountsPath.desc,
                 type: "path",
                 key: "codexAccountsPath",
-                value:
-                  vscode.workspace
-                    .getConfiguration("agentVibes")
-                    .get<string>("codexAccountsPath") || "",
+                value: agentCfg.get<string>("codexAccountsPath") || "",
                 placeholder: this.config.codexAccountsPath,
               },
               {
-                label: "OpenAI-Compat Accounts File",
-                desc: "Custom path for openai-compat-accounts.json",
+                label: st.groups.storage.items.openaiCompatAccountsPath.label,
+                desc: st.groups.storage.items.openaiCompatAccountsPath.desc,
                 type: "path",
                 key: "openaiCompatAccountsPath",
-                value:
-                  vscode.workspace
-                    .getConfiguration("agentVibes")
-                    .get<string>("openaiCompatAccountsPath") || "",
+                value: agentCfg.get<string>("openaiCompatAccountsPath") || "",
                 placeholder: this.config.openaiCompatAccountsPath,
               },
               {
-                label: "Claude API Accounts File",
-                desc: "Custom path for claude-api-accounts.json",
+                label: st.groups.storage.items.claudeApiAccountsPath.label,
+                desc: st.groups.storage.items.claudeApiAccountsPath.desc,
                 type: "path",
                 key: "claudeApiAccountsPath",
-                value:
-                  vscode.workspace
-                    .getConfiguration("agentVibes")
-                    .get<string>("claudeApiAccountsPath") || "",
+                value: agentCfg.get<string>("claudeApiAccountsPath") || "",
                 placeholder: this.config.claudeApiAccountsPath,
               },
             ],
           },
           {
             id: "patch",
-            label: "Patch",
-            desc: "Local Cursor repair, redirect, and checksum tools.",
+            label: st.groups.patch.label,
+            desc: st.groups.patch.desc,
             items: [
               {
-                label: "Cursor App Root",
-                desc: "Detected Cursor installation used for local patch operations.",
-                value: cursorChecksumsStatus.appRootPath || "Not found",
+                label: st.groups.patch.items.cursorAppRoot.label,
+                desc: st.groups.patch.items.cursorAppRoot.desc,
+                value: translateNotFound(
+                  locale,
+                  cursorChecksumsStatus.appRootPath || "Not found"
+                ),
               },
               {
-                label: "Cursor Build",
-                desc: "Detected Cursor build identity used to scope patch baselines across upgrades.",
+                label: st.groups.patch.items.cursorBuild.label,
+                desc: st.groups.patch.items.cursorBuild.desc,
                 value: cursorBuildValue,
               },
               {
-                label: "Reset All Patches",
-                desc: "One-click restore back to the captured original Cursor baseline.",
+                label: st.groups.patch.items.resetPatches.label,
+                desc: st.groups.patch.items.resetPatches.desc,
                 type: "actions",
-                hint: resetPatchState.hint,
+                hint: resetHintLocalized,
                 actions: [
                   {
-                    label: "Reset All",
+                    label: st.patch.resetAll,
                     command: CMD.RESET_CURSOR_PATCHES,
                     tone: "secondary",
                     disabled: !resetPatchState.canReset,
@@ -1022,9 +1092,12 @@ export class DashboardPanel {
                 ],
               },
               {
-                label: "Fix Checksums Next",
-                desc: "Ported from the Fix VSCode Checksums Next extension for manual Cursor checksum repair.",
-                value: checksumToggleValue ? "On" : "Off",
+                label: st.groups.patch.items.fixChecksums.label,
+                desc: st.groups.patch.items.fixChecksums.desc,
+                value: translateOnOff(
+                  locale,
+                  checksumToggleValue ? "On" : "Off"
+                ),
                 hint: checksumStatusDesc,
               },
             ],
@@ -1037,8 +1110,10 @@ export class DashboardPanel {
   }
 
   private getOverviewPayload(
-    accountsData: Record<AccountChannel, DashboardAccountChannelData>
+    accountsData: Record<AccountChannel, DashboardAccountChannelData>,
+    locale: DashboardLocale
   ): DashboardOverviewPayload {
+    const o = getOverviewMessages(locale)
     const hasCertificates = this.config.hasCertificates()
     const bridgeRunning = this.bridge.state === "running"
     const forwardingActive = this.network.isForwardingActive()
@@ -1047,33 +1122,39 @@ export class DashboardPanel {
       0
     )
 
+    const fwd = this.network.getForwardingBackend()
+    const forwardingActiveDesc =
+      fwd === "relay"
+        ? o.forwardingRelay
+        : fwd === "portproxy"
+          ? o.forwardingPortproxy
+          : o.forwardingIptables
+
     const steps: DashboardOverviewStep[] = [
       {
         id: "certs",
-        label: "Generate local certificates",
-        description: hasCertificates
-          ? "TLS certificates are available for the local bridge."
-          : "Create the local CA and bridge certificates required for HTTPS traffic interception.",
+        label: o.certsLabel,
+        description: hasCertificates ? o.certsDone : o.certsTodo,
         status: hasCertificates ? "done" : "action",
-        actionLabel: hasCertificates ? undefined : "Generate certs",
+        actionLabel: hasCertificates ? undefined : o.certsAction,
         command: hasCertificates ? undefined : CMD.GENERATE_CERT,
       },
       {
         id: "accounts",
-        label: "Connect at least one backend account",
+        label: o.accountsLabel,
         description:
           totalAccounts > 0
-            ? `${totalAccounts} account(s) available across configured backends.`
-            : "Add at least one available backend account.",
+            ? formatUi(o.accountsCount, { n: totalAccounts })
+            : o.accountsTodo,
         status: totalAccounts > 0 ? "done" : "action",
         actionLabel: undefined,
       },
       {
         id: "bridge",
-        label: "Start local bridge",
+        label: o.bridgeLabel,
         description: bridgeRunning
-          ? `Bridge is running on port ${this.config.port}.`
-          : "Launch the local bridge.",
+          ? formatUi(o.bridgeRunning, { port: this.config.port })
+          : o.bridgeTodo,
         status: bridgeRunning
           ? "done"
           : totalAccounts > 0 && hasCertificates
@@ -1082,7 +1163,7 @@ export class DashboardPanel {
         actionLabel:
           bridgeRunning || !hasCertificates || totalAccounts === 0
             ? undefined
-            : "Start bridge",
+            : o.bridgeAction,
         command:
           bridgeRunning || !hasCertificates || totalAccounts === 0
             ? undefined
@@ -1090,17 +1171,15 @@ export class DashboardPanel {
       },
       {
         id: "forwarding",
-        label: "Enable traffic forwarding",
-        description: forwardingActive
-          ? `Hosts mapping and ${this.network.getForwardingBackend() === "relay" ? "TCP relay" : this.network.getForwardingBackend() === "portproxy" ? "port proxy" : "iptables"} appear active.`
-          : "Redirect Cursor domains to the local bridge.",
+        label: o.forwardingLabel,
+        description: forwardingActive ? forwardingActiveDesc : o.forwardingTodo,
         status: forwardingActive
           ? "done"
           : bridgeRunning
             ? "action"
             : "pending",
         actionLabel:
-          forwardingActive || !bridgeRunning ? undefined : "Enable forwarding",
+          forwardingActive || !bridgeRunning ? undefined : o.forwardingAction,
         command:
           forwardingActive || !bridgeRunning
             ? undefined
@@ -1112,9 +1191,8 @@ export class DashboardPanel {
     const nextAction = steps.find((step) => step.status === "action")
 
     let overallState: DashboardOverviewPayload["overallState"] = "setup"
-    let headline = "Setup required"
-    let summary =
-      "Finish the remaining setup steps to route Cursor traffic through Agent Vibes."
+    let headline = o.setupHeadline
+    let summary = o.setupSummary
 
     if (
       completedSteps === steps.length ||
@@ -1124,13 +1202,12 @@ export class DashboardPanel {
         hasCertificates)
     ) {
       overallState = "ready"
-      headline = "Ready"
-      summary = "Everything is ready."
+      headline = o.readyHeadline
+      summary = o.readySummary
     } else if (completedSteps >= 2 || bridgeRunning || totalAccounts > 0) {
       overallState = "attention"
-      headline = "Almost there"
-      summary =
-        "Core pieces are in place, but the flow is not fully complete yet. Finish the next actionable step below."
+      headline = o.attentionHeadline
+      summary = o.attentionSummary
     }
 
     return {
@@ -1141,7 +1218,7 @@ export class DashboardPanel {
       totalSteps: steps.length,
       nextActionLabel:
         nextAction?.actionLabel ||
-        (overallState === "ready" ? "Restart bridge" : "Review setup"),
+        (overallState === "ready" ? o.restartAction : o.reviewAction),
       nextActionCommand:
         nextAction?.command ||
         (overallState === "ready" ? CMD.RESTART_SERVER : undefined),
@@ -1864,7 +1941,7 @@ export class DashboardPanel {
     const account = accounts[accountIndex]
     if (!account) {
       void vscode.window.showWarningMessage(
-        `Codex CLI: invalid account index ${accountIndex}`
+        tFmt("dash.codex.invalidIndex", { index: accountIndex })
       )
       return
     }
@@ -1880,9 +1957,7 @@ export class DashboardPanel {
     const email = String(account.email || "")
 
     if (!refreshToken) {
-      void vscode.window.showWarningMessage(
-        "Codex CLI: this account has no refresh token and cannot be activated."
-      )
+      void vscode.window.showWarningMessage(t("dash.codex.noRefreshToken"))
       return
     }
 
@@ -1924,13 +1999,13 @@ export class DashboardPanel {
       const label = email || accountId || "unknown"
       logger.info(`Codex CLI activated for ${label}`)
       void vscode.window.showInformationMessage(
-        `Codex CLI: switched to ${label}`
+        tFmt("dash.codex.switched", { label })
       )
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err)
       logger.error("Failed to write Codex CLI auth file", err)
       void vscode.window.showErrorMessage(
-        `Codex CLI activation failed: ${errMsg}`
+        tFmt("dash.codex.activateFailed", { message: errMsg })
       )
     }
   }
@@ -2023,7 +2098,7 @@ export class DashboardPanel {
       this.sendAllData()
     } catch (error) {
       const message =
-        error instanceof Error ? error.message : "Failed to open account file"
+        error instanceof Error ? error.message : t("file.openAccountFailed")
       vscode.window.showErrorMessage(message)
     }
   }
@@ -2056,6 +2131,11 @@ export class DashboardPanel {
       "dashboard.html"
     )
     let html = fs.readFileSync(htmlPath, "utf-8")
+
+    const locale = readDashboardLocale()
+    const uiPack = getUiPack(locale)
+    const localeScript = `<script>window.__AV_UI__=${JSON.stringify(uiPack)};window.__AV_LOCALE__=${JSON.stringify(locale)};</script>`
+    html = html.replace("</head>", `${localeScript}</head>`)
 
     // Inject icon URI for branding
     const iconUri = this.panel.webview.asWebviewUri(

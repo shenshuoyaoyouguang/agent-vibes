@@ -1,6 +1,7 @@
 import * as vscode from "vscode"
 import type { ServerState } from "../constants"
 import { EXTENSION_DISPLAY_NAME } from "../constants"
+import { t, tFmt } from "../i18n/messages-i18n"
 
 const LOADING_COLOR = "#34d399"
 
@@ -42,19 +43,19 @@ export class StatusIndicator {
     switch (this.state) {
       case "running":
         this.item.text = `$(circle-filled) ${EXTENSION_DISPLAY_NAME}`
-        this.item.tooltip = "Agent Vibes — Running (click to open dashboard)"
+        this.item.tooltip = t("status.tooltip.running")
         this.item.backgroundColor = undefined
         this.item.color = undefined
         break
       case "starting":
-        this.item.text = `$(sync~spin) ${EXTENSION_DISPLAY_NAME} Starting…`
-        this.item.tooltip = "Agent Vibes — Starting..."
+        this.item.text = `$(sync~spin) ${EXTENSION_DISPLAY_NAME} ${t("status.text.starting")}`
+        this.item.tooltip = t("status.tooltip.starting")
         this.item.backgroundColor = undefined
         this.item.color = LOADING_COLOR
         break
       case "error":
         this.item.text = `$(warning) ${EXTENSION_DISPLAY_NAME}`
-        this.item.tooltip = "Agent Vibes — Error (click to open dashboard)"
+        this.item.tooltip = t("status.tooltip.error")
         this.item.backgroundColor = new vscode.ThemeColor(
           "statusBarItem.errorBackground"
         )
@@ -63,7 +64,7 @@ export class StatusIndicator {
       case "stopped":
       default:
         this.item.text = `$(circle-outline) ${EXTENSION_DISPLAY_NAME}`
-        this.item.tooltip = "Agent Vibes — Stopped (click to open dashboard)"
+        this.item.tooltip = t("status.tooltip.stopped")
         this.item.backgroundColor = undefined
         this.item.color = undefined
         break
@@ -78,7 +79,7 @@ export class StatusIndicator {
   showBusy(label: string, tooltip?: string): void {
     this.transientStatus = {
       text: `$(sync~spin) ${EXTENSION_DISPLAY_NAME} ${label}`,
-      tooltip: tooltip || `Agent Vibes — ${label}`,
+      tooltip: tooltip || tFmt("status.tooltip.busy", { label }),
       backgroundColor: undefined,
       color: LOADING_COLOR,
     }
