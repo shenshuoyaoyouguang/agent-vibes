@@ -183,6 +183,8 @@ export class DashboardPanel {
       }
     )
 
+    panel.iconPath = vscode.Uri.joinPath(extensionUri, "resources", "icon.png")
+
     DashboardPanel.currentPanel = new DashboardPanel(
       panel,
       extensionUri,
@@ -2142,7 +2144,7 @@ export class DashboardPanel {
       vscode.Uri.joinPath(this.extensionUri, "resources", "icon.png")
     )
     html = html.replace(
-      'id="overview-logo" src=""',
+      /id="overview-logo"\s+src=""/,
       `id="overview-logo" src="${iconUri}"`
     )
 
