@@ -538,6 +538,58 @@ agent-vibes sync --codex
 - 远端 agent runtime 不走代理：确认 `HTTPS_PROXY` 等环境变量是在拉起 `cursor-server` 的那个 shell 中导出的；某些启动方式（`systemd --user`、早于 `export` 的 tmux 面板）会保留旧 env。
 - 代理拒绝连接：确认本地 bridge 在跑（banner 显示 `▸ SSH proxy ...`），并且笔记本上 `127.0.0.1:18080` 没有被其他进程占用。
 
+## 常见问题 / 故障排查
+
+### `agent-vibes forward on` 在系统全局 TUN 代理下不生效
+
+现象：执行 `npm run cursor:forward:on`（或 `agent-vibes forward on`）后，Cursor 仍然无法连到 bridge，Diagnostics 报 DNS / 转发失败，或 `curl https://api2.cursor.sh/health` 卡住。
+
+根因：系统代理工作在 **TUN 模式**（Clash Verge、Mihomo、V2RayN TUN、sing-box 等）下，会在网络层拦截所有流量，**早于** hosts 文件改写或回环重定向生效。
+即使代理规则里写了 `127.0.0.0/8 -> DIRECT`，上游解析器也可能已经把 `localhost` / Cursor 域名劫持到 fake-ip 段，导致 IP-CIDR 规则根本没匹配上。
+
+修复方案（以 Clash Verge Rev 为例，其他 TUN 客户端有等价配置项）：
+
+1. **把回环和私网段从 TUN 接口排除。** 写到全局 merge / override 配置中，避免被订阅更新覆盖：
+
+   ```yaml
+   tun:
+     enable: true
+     stack: system
+     auto-route: true
+     auto-detect-interface: true
+     route-exclude-address:
+       - 127.0.0.0/8
+       - 192.168.0.0/16
+       - 10.0.0.0/8
+       - 172.16.0.0/12
+   ```
+
+2. **把本地域名加入 fake-ip 过滤**，防止 DNS 劫持把 `localhost` 改写到 fake-ip 池：
+
+   ```yaml
+   dns:
+     fake-ip-filter:
+       - "localhost"
+       - "*.localhost"
+       - "*.local"
+       - "*.cursor.sh"
+   ```
+
+3. **在规则列表最前面显式追加 DIRECT 规则**，确保优先级高于 `MATCH,PROXY`：
+
+   ```yaml
+   rules:
+     - DOMAIN,localhost,DIRECT
+     - DOMAIN-SUFFIX,.local,DIRECT
+     - DOMAIN-SUFFIX,cursor.sh,DIRECT
+     - IP-CIDR,127.0.0.0/8,DIRECT
+     # ... 已有规则
+   ```
+
+4. 重新加载代理配置后，再次执行 `npm run cursor:forward:on` 即可生效。
+
+如果只是想快速验证是否是 TUN 引起的，可以临时把 TUN 客户端切到 **Rule** 模式（或临时关闭 TUN），观察转发是否恢复正常。
+
 ## 项目结构
 
 ```text

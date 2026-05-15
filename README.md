@@ -588,6 +588,70 @@ Configure on the remote host (each shell, no sudo):
   (`▸ SSH proxy ...` banner line) and that no other process is listening
   on `127.0.0.1:18080` on your laptop.
 
+## FAQ / Troubleshooting
+
+### `agent-vibes forward on` does not take effect when a system-wide TUN proxy is enabled
+
+Symptom: after running `npm run cursor:forward:on` (or `agent-vibes forward on`),
+Cursor still cannot reach the bridge, Diagnostics report DNS/forwarding failures,
+or `curl https://api2.cursor.sh/health` hangs.
+
+Root cause: a system proxy in **TUN mode** (Clash Verge, Mihomo, V2RayN TUN,
+sing-box, etc.) intercepts traffic at the network layer **before** the local
+hosts file rewrite or loopback redirect can take effect. Even when proxy rules
+declare `127.0.0.0/8 -> DIRECT`, the upstream resolver may already have hijacked
+`localhost` / Cursor domains into a fake-ip range, so the IP-CIDR rule never
+matches.
+
+Fix (using Clash Verge Rev as an example — other TUN clients have equivalent
+settings):
+
+1. **Bypass loopback and private ranges from the TUN interface.** Add to the
+   global merge / override config so it survives subscription updates:
+
+   ```yaml
+   tun:
+     enable: true
+     stack: system
+     auto-route: true
+     auto-detect-interface: true
+     route-exclude-address:
+       - 127.0.0.0/8
+       - 192.168.0.0/16
+       - 10.0.0.0/8
+       - 172.16.0.0/12
+   ```
+
+2. **Exclude local domains from fake-ip resolution** so DNS hijacking does
+   not rewrite `localhost` into the fake-ip pool:
+
+   ```yaml
+   dns:
+     fake-ip-filter:
+       - "localhost"
+       - "*.localhost"
+       - "*.local"
+       - "*.cursor.sh"
+   ```
+
+3. **Add explicit DIRECT rules at the top of the rule list** so they take
+   priority over `MATCH,PROXY`:
+
+   ```yaml
+   rules:
+     - DOMAIN,localhost,DIRECT
+     - DOMAIN-SUFFIX,.local,DIRECT
+     - DOMAIN-SUFFIX,cursor.sh,DIRECT
+     - IP-CIDR,127.0.0.0/8,DIRECT
+     # ... existing rules
+   ```
+
+4. Reload the proxy configuration, then re-run `npm run cursor:forward:on`.
+
+If you only need a quick test without changing the proxy config, switching
+the TUN client to **Rule** mode (or temporarily disabling TUN) is enough to
+verify whether TUN is the cause.
+
 ## Project Structure
 
 ```text
