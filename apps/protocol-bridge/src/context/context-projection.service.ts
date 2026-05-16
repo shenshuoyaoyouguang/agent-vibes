@@ -1,19 +1,45 @@
 import { Injectable } from "@nestjs/common"
 import {
+  ContextAttachmentBuilderService,
+  ContextAttachmentSnapshot,
+} from "./context-attachment-builder.service"
+import {
   ContextCompactionCommit,
   ContextConversationState,
   ContextTranscriptRecord,
   ProjectedContextMessage,
 } from "./types"
-import {
-  ContextAttachmentBuilderService,
-  ContextAttachmentSnapshot,
-} from "./context-attachment-builder.service"
 
 @Injectable()
 export class ContextProjectionService {
   constructor(private readonly attachments: ContextAttachmentBuilderService) {}
 
+  /**
+   * Project a backend-facing view of the conversation.
+   *
+   * Layout (from front to back):
+   *   `[boundary, summary]* (compaction commit chain)`
+   *   `[attachments]`        (live working state — todos, file snapshots, ...)
+   *   `[retained records]`   (raw transcript past the latest commit)
+   *
+   * Why attachments go BEFORE retained records:
+   *
+   * Putting the live attachments in front gives the model a stable "current
+   * world state" header that reflects the agent's actual workspace
+   * (recently-edited files, todo list, sub-agent activity) before it walks
+   * the chronological history.  This is the same ordering claude-code uses
+   * for its post-compact attachments and matches operator intuition when
+   * inspecting the projected payload.
+   *
+   * The downside is that easily-changing attachments (todos, file_states)
+   * can invalidate prompt-cache entries on backends that key cache hits
+   * off the message prefix.  The bridge currently routes to providers
+   * with mixed cache-edit support, so we keep this ordering for
+   * correctness/observability and revisit only if a provider-specific
+   * optimisation makes it worthwhile.  See
+   * `ContextAttachmentBuilderService` for the per-attachment token budgets
+   * that bound how much content is "in front" of the records.
+   */
   project(
     state: ContextConversationState,
     options?: {

@@ -182,6 +182,12 @@
         "title": "Restart Server",
         "category": "Agent Vibes",
         "icon": "$(debug-restart)"
+      },
+      {
+        "command": "agentVibes.compactCurrentSession",
+        "title": "Compact Current Session",
+        "category": "Agent Vibes",
+        "icon": "$(archive)"
       }
     ],
     "configuration": {

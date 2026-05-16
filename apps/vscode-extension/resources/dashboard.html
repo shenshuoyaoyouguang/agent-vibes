@@ -1575,6 +1575,30 @@
           </div>
           <div class="test-list" id="tests-root"></div>
         </div>
+        <div class="section">
+          <div class="section-head">
+            <span class="section-title" data-i18n="section.contextTelemetry"
+              >Context Telemetry</span
+            >
+            <button
+              type="button"
+              class="btn"
+              onclick="refreshContextTelemetry()"
+              data-i18n="contextTelemetry.refresh"
+            >
+              Refresh
+            </button>
+          </div>
+          <div
+            class="context-telemetry-hint muted"
+            id="context-telemetry-hint"
+            data-i18n="contextTelemetry.hint"
+          >
+            Cumulative counters since the bridge process started. Values reset
+            on bridge restart.
+          </div>
+          <div id="context-telemetry-root" class="test-list"></div>
+        </div>
       </div>
 
       <!-- ── Logs ── -->
@@ -2170,6 +2194,8 @@
         if (m.type === "codexOAuthStatus") handleCodexOAuthStatus(m.data)
         if (m.type === "kiroOAuthStatus") handleKiroOAuthStatus(m.data)
         if (m.type === "kiroQuotaUpdate") handleKiroQuotaUpdate(m.data)
+        if (m.type === "contextTelemetryUpdate")
+          handleContextTelemetryUpdate(m.data)
       })
 
       window.addEventListener("resize", function () {
@@ -6215,7 +6241,104 @@
         }
       }
 
+      // ── Context telemetry (Diagnostics tab) ──
+
+      var contextTelemetryHydrated = false
+
+      function refreshContextTelemetry() {
+        var root = document.getElementById("context-telemetry-root")
+        if (root && !root.children.length) {
+          root.innerHTML =
+            '<div class="muted" style="padding:var(--sp-2);">' +
+            (L("contextTelemetry.loading") || "Loading...") +
+            "</div>"
+        }
+        vscode.postMessage({ type: "getContextTelemetry" })
+      }
+
+      function handleContextTelemetryUpdate(data) {
+        var root = document.getElementById("context-telemetry-root")
+        if (!root) return
+        contextTelemetryHydrated = true
+        if (!data || typeof data !== "object") {
+          root.innerHTML =
+            '<div class="muted" style="padding:var(--sp-2);">' +
+            (L("contextTelemetry.unavailable") ||
+              "Telemetry unavailable. Start the bridge to see counters.") +
+            "</div>"
+          return
+        }
+        var grouped = data && data.grouped ? data.grouped : {}
+        var counters = data && data.counters ? data.counters : {}
+        var eventNames = Object.keys(grouped)
+        if (eventNames.length === 0) {
+          root.innerHTML =
+            '<div class="muted" style="padding:var(--sp-2);">' +
+            (L("contextTelemetry.empty") ||
+              "No context-management events recorded yet.") +
+            "</div>"
+          return
+        }
+        eventNames.sort()
+        var rows = eventNames.map(function (eventName) {
+          var scopes = grouped[eventName] || {}
+          var totalCount = Object.keys(scopes).reduce(function (acc, scope) {
+            var v = scopes[scope]
+            return acc + (typeof v === "number" ? v : 0)
+          }, 0)
+          var scopeCount = Object.keys(scopes).length
+          var scopeLabel =
+            scopeCount === 1 && scopes.global !== undefined
+              ? "global"
+              : scopeCount + " scope" + (scopeCount === 1 ? "" : "s")
+          var safeName = String(eventName).replace(/[^a-zA-Z0-9_.-]/g, "_")
+          return (
+            '<div class="test-row" data-event="' +
+            safeName +
+            '">' +
+            '<div class="test-row-head">' +
+            '<span class="test-name">' +
+            escapeHtml(eventName) +
+            "</span>" +
+            '<span class="test-status">' +
+            totalCount +
+            "</span>" +
+            "</div>" +
+            '<div class="muted" style="padding:0 var(--sp-2) var(--sp-2);font-size:11px;">' +
+            scopeLabel +
+            "</div>" +
+            "</div>"
+          )
+        })
+        root.innerHTML = rows.join("")
+        var hint = document.getElementById("context-telemetry-hint")
+        if (hint) {
+          var ts = data && data.timestamp ? data.timestamp : ""
+          var labelTemplate =
+            L("contextTelemetry.fetchedAt") || "Updated at {timestamp}"
+          var labelText = ts
+            ? labelTemplate.replace("{timestamp}", ts)
+            : L("contextTelemetry.hint") ||
+              "Cumulative counters since bridge start. Resets on bridge restart."
+          hint.textContent = labelText
+        }
+        // Reference counters so a future "raw export" affordance has direct
+        // access without re-fetching.  Stored on the root for inspection.
+        root.__contextTelemetryCounters = counters
+      }
+
+      function escapeHtml(value) {
+        if (value === null || value === undefined) return ""
+        return String(value)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#39;")
+      }
+
       initTests()
+      refreshContextTelemetry()
 
       vscode.postMessage({ type: "getAll" })
     </script>

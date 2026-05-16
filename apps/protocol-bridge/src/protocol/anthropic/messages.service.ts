@@ -2,6 +2,7 @@ import { Injectable, Logger, OnModuleInit } from "@nestjs/common"
 import {
   type ContextAttachmentSnapshot,
   ContextManagerService,
+  detectPromptTooLong,
   TokenCounterService,
   UnifiedMessage,
 } from "../../context"
@@ -9,13 +10,13 @@ import {
   AnthropicApiService,
   DEFAULT_CLAUDE_API_CONTEXT_LIMIT_TOKENS,
 } from "../../llm/anthropic/anthropic-api.service"
+import { KiroService } from "../../llm/aws/kiro.service"
 import { GoogleModelCacheService } from "../../llm/google/google-model-cache.service"
 import { GoogleService } from "../../llm/google/google.service"
 import {
   GOOGLE_STARTUP_UPSTREAM_CHECK_ENV,
   isGoogleStartupUpstreamCheckEnabled,
 } from "../../llm/google/startup-probe-policy"
-import { KiroService } from "../../llm/aws/kiro.service"
 import type { CodexForwardHeaders } from "../../llm/openai/codex-header-utils"
 import { CodexService } from "../../llm/openai/codex.service"
 import { OpenaiCompatService } from "../../llm/openai/openai-compat.service"
@@ -438,6 +439,58 @@ export class MessagesService implements OnModuleInit {
     return message.length > 200 ? `${message.slice(0, 200)}…` : message
   }
 
+  private async dispatchToRoutedBackend(
+    dto: CreateMessageDto,
+    route: ModelRouteResult,
+    forwardHeaders?: Record<string, string>,
+    codexForwardHeaders?: CodexForwardHeaders
+  ): Promise<AnthropicResponse> {
+    if (route.backend === "claude-api") {
+      this.logger.log(`[ROUTE] Claude API backend | model: ${route.model}`)
+      return await this.anthropicApiService.sendClaudeMessage(
+        dto,
+        forwardHeaders
+      )
+    }
+
+    if (route.backend === "kiro") {
+      this.logger.log(`[ROUTE] Kiro backend | model: ${route.model}`)
+      return await this.kiroService.sendClaudeMessage(dto)
+    }
+
+    if (route.backend === "openai-compat") {
+      this.logger.log(`[ROUTE] OpenAI-compat backend | model: ${route.model}`)
+      return await this.openaiCompatService.sendClaudeMessage(dto)
+    }
+
+    if (route.backend === "codex") {
+      this.logger.log(`[ROUTE] Codex backend | model: ${route.model}`)
+      return await this.codexService.sendClaudeMessage(dto, codexForwardHeaders)
+    }
+
+    this.logger.log(`[ROUTE] Google backend | model: ${route.model}`)
+    return await this.googleService.sendClaudeMessage(dto)
+  }
+
+  /**
+   * Build a stable key for the reactive-compaction circuit breaker.
+   *
+   * `_conversationId` is preferred when the client provides one (it gives
+   * us a per-session counter), otherwise we fall back to a coarse hash of
+   * the message-array length plus the model so unrelated stateless
+   * requests do not share the same breaker.  The key never carries user
+   * content — only structural metadata — so it is safe to log.
+   */
+  private buildReactiveRecoveryKey(
+    dto: CreateMessageDto,
+    route: ModelRouteResult
+  ): string {
+    if (typeof dto._conversationId === "string" && dto._conversationId) {
+      return `anthropic:${dto._conversationId}`
+    }
+    return `anthropic:stateless:${route.backend}:${route.model}:${dto.messages.length}`
+  }
+
   private async executeRoutedMessage(
     dto: CreateMessageDto,
     route: ModelRouteResult,
@@ -463,35 +516,33 @@ export class MessagesService implements OnModuleInit {
       }
 
       const routedDto = this.prepareDtoForRoute(dto, route)
-
-      if (route.backend === "claude-api") {
-        this.logger.log(`[ROUTE] Claude API backend | model: ${route.model}`)
-        return await this.anthropicApiService.sendClaudeMessage(
+      const recoveryKey = this.buildReactiveRecoveryKey(dto, route)
+      try {
+        const response = await this.dispatchToRoutedBackend(
           routedDto,
-          forwardHeaders
-        )
-      }
-
-      if (route.backend === "kiro") {
-        this.logger.log(`[ROUTE] Kiro backend | model: ${route.model}`)
-        return await this.kiroService.sendClaudeMessage(routedDto)
-      }
-
-      if (route.backend === "openai-compat") {
-        this.logger.log(`[ROUTE] OpenAI-compat backend | model: ${route.model}`)
-        return await this.openaiCompatService.sendClaudeMessage(routedDto)
-      }
-
-      if (route.backend === "codex") {
-        this.logger.log(`[ROUTE] Codex backend | model: ${route.model}`)
-        return await this.codexService.sendClaudeMessage(
-          routedDto,
+          route,
+          forwardHeaders,
           codexForwardHeaders
         )
+        // Successful turn — drop any stale failure counter so the next
+        // attempt starts from a clean slate.
+        this.contextManager.resetReactiveFailures(recoveryKey)
+        return response
+      } catch (innerError) {
+        const recovered = await this.tryReactivePromptTooLongRecovery(
+          dto,
+          route,
+          innerError,
+          recoveryKey,
+          forwardHeaders,
+          codexForwardHeaders
+        )
+        if (recovered) {
+          this.contextManager.resetReactiveFailures(recoveryKey)
+          return recovered
+        }
+        throw innerError
       }
-
-      this.logger.log(`[ROUTE] Google backend | model: ${route.model}`)
-      return await this.googleService.sendClaudeMessage(routedDto)
     } catch (error) {
       const fallback = this.modelRouter.getFallbackRoute(
         dto.model,
@@ -525,6 +576,113 @@ export class MessagesService implements OnModuleInit {
     }
   }
 
+  /**
+   * Identify upstream prompt-too-long errors and, when found, reactively
+   * compact the conversation and retry the same backend once.  Returns
+   * the successful response when recovery worked, otherwise `undefined`
+   * so the caller can re-throw the original error.
+   *
+   * Recovery is gated by a circuit breaker living on
+   * `ContextManagerService` so we cannot loop forever on conversations
+   * whose minimum payload still exceeds the upstream cap.
+   */
+  private async tryReactivePromptTooLongRecovery(
+    dto: CreateMessageDto,
+    route: ModelRouteResult,
+    error: unknown,
+    recoveryKey: string,
+    forwardHeaders?: Record<string, string>,
+    codexForwardHeaders?: CodexForwardHeaders
+  ): Promise<AnthropicResponse | undefined> {
+    const detection = detectPromptTooLong(error)
+    if (!detection.matched) return undefined
+
+    const previousBudget = this.resolveContextBudget(dto, route)
+    const outcome =
+      this.contextManager.applyReactivePromptTooLongRecoveryFromMessages(
+        dto.messages as UnifiedMessage[],
+        this.EMPTY_ATTACHMENT_SNAPSHOT,
+        {
+          maxTokens: previousBudget.maxTokens,
+          systemPromptTokens: previousBudget.systemPromptTokens,
+          pendingToolUseIds: dto._pendingToolUseIds,
+        },
+        {
+          actualTokens: detection.actualTokens,
+          maxTokens: detection.maxTokens,
+        },
+        recoveryKey
+      )
+    if (!outcome.shouldRetry || !outcome.result) {
+      this.logger.warn(
+        `[REACTIVE-COMPACT] giving up for ${recoveryKey}: ${
+          outcome.reason ?? "unknown"
+        } (failures=${outcome.consecutiveFailures})`
+      )
+      return undefined
+    }
+
+    this.logger.warn(
+      `[REACTIVE-COMPACT] retrying ${route.backend}/${route.model} after prompt-too-long: ` +
+        `${dto.messages.length} → ${outcome.result.messages.length} messages`
+    )
+
+    const recoveredDto: CreateMessageDto = {
+      ...dto,
+      messages: outcome.result.messages as typeof dto.messages,
+    }
+    const routedDto = this.prepareDtoForRoute(recoveredDto, route)
+    return await this.dispatchToRoutedBackend(
+      routedDto,
+      route,
+      forwardHeaders,
+      codexForwardHeaders
+    )
+  }
+
+  private async *streamFromRoutedBackend(
+    dto: CreateMessageDto,
+    route: ModelRouteResult,
+    forwardHeaders?: Record<string, string>,
+    codexForwardHeaders?: CodexForwardHeaders
+  ): AsyncGenerator<string, void, unknown> {
+    if (route.backend === "claude-api") {
+      this.logger.log(
+        `[ROUTE] Claude API backend | model: ${route.model} | stream: true`
+      )
+      yield* this.anthropicApiService.sendClaudeMessageStream(
+        dto,
+        forwardHeaders
+      )
+      return
+    }
+    if (route.backend === "kiro") {
+      this.logger.log(
+        `[ROUTE] Kiro backend | model: ${route.model} | stream: true`
+      )
+      yield* this.kiroService.sendClaudeMessageStream(dto)
+      return
+    }
+    if (route.backend === "openai-compat") {
+      this.logger.log(
+        `[ROUTE] OpenAI-compat backend | model: ${route.model} | stream: true`
+      )
+      yield* this.openaiCompatService.sendClaudeMessageStream(dto)
+      return
+    }
+    if (route.backend === "codex") {
+      this.logger.log(
+        `[ROUTE] Codex backend | model: ${route.model} | stream: true`
+      )
+      yield* this.codexService.sendClaudeMessageStream(dto, codexForwardHeaders)
+      return
+    }
+    this.logger.log(
+      `[ROUTE] Google backend | model: ${route.model} | stream: true`
+    )
+    yield* this.googleService.sendClaudeMessageStream(dto)
+  }
+
   private async *executeRoutedMessageStream(
     dto: CreateMessageDto,
     route: ModelRouteResult,
@@ -556,6 +714,8 @@ export class MessagesService implements OnModuleInit {
       }
     }
 
+    const recoveryKey = this.buildReactiveRecoveryKey(dto, route)
+
     try {
       if (
         route.backend === "codex" &&
@@ -572,59 +732,11 @@ export class MessagesService implements OnModuleInit {
       }
 
       const routedDto = this.prepareDtoForRoute(dto, route)
-
-      if (route.backend === "claude-api") {
-        this.logger.log(
-          `[ROUTE] Claude API backend | model: ${route.model} | stream: true`
-        )
-        for await (const event of this.anthropicApiService.sendClaudeMessageStream(
+      try {
+        for await (const event of this.streamFromRoutedBackend(
           routedDto,
-          forwardHeaders
-        )) {
-          yield* handleEvent(event)
-        }
-        if (!emittedAny) {
-          for (const b of buffer) yield b
-        }
-        return
-      }
-
-      if (route.backend === "kiro") {
-        this.logger.log(
-          `[ROUTE] Kiro backend | model: ${route.model} | stream: true`
-        )
-        for await (const event of this.kiroService.sendClaudeMessageStream(
-          routedDto
-        )) {
-          yield* handleEvent(event)
-        }
-        if (!emittedAny) {
-          for (const b of buffer) yield b
-        }
-        return
-      }
-
-      if (route.backend === "openai-compat") {
-        this.logger.log(
-          `[ROUTE] OpenAI-compat backend | model: ${route.model} | stream: true`
-        )
-        for await (const event of this.openaiCompatService.sendClaudeMessageStream(
-          routedDto
-        )) {
-          yield* handleEvent(event)
-        }
-        if (!emittedAny) {
-          for (const b of buffer) yield b
-        }
-        return
-      }
-
-      if (route.backend === "codex") {
-        this.logger.log(
-          `[ROUTE] Codex backend | model: ${route.model} | stream: true`
-        )
-        for await (const event of this.codexService.sendClaudeMessageStream(
-          routedDto,
+          route,
+          forwardHeaders,
           codexForwardHeaders
         )) {
           yield* handleEvent(event)
@@ -632,19 +744,68 @@ export class MessagesService implements OnModuleInit {
         if (!emittedAny) {
           for (const b of buffer) yield b
         }
+        this.contextManager.resetReactiveFailures(recoveryKey)
         return
-      }
-
-      this.logger.log(
-        `[ROUTE] Google backend | model: ${route.model} | stream: true`
-      )
-      for await (const event of this.googleService.sendClaudeMessageStream(
-        routedDto
-      )) {
-        yield* handleEvent(event)
-      }
-      if (!emittedAny) {
-        for (const b of buffer) yield b
+      } catch (innerError) {
+        // Reactive recovery is only safe before any byte has reached the
+        // client.  Once we have emitted real data, the SSE stream is
+        // committed and another retry would deliver duplicate events.
+        if (emittedAny) {
+          throw innerError
+        }
+        const detection = detectPromptTooLong(innerError)
+        if (!detection.matched) {
+          throw innerError
+        }
+        const previousBudget = this.resolveContextBudget(dto, route)
+        const outcome =
+          this.contextManager.applyReactivePromptTooLongRecoveryFromMessages(
+            dto.messages as UnifiedMessage[],
+            this.EMPTY_ATTACHMENT_SNAPSHOT,
+            {
+              maxTokens: previousBudget.maxTokens,
+              systemPromptTokens: previousBudget.systemPromptTokens,
+              pendingToolUseIds: dto._pendingToolUseIds,
+            },
+            {
+              actualTokens: detection.actualTokens,
+              maxTokens: detection.maxTokens,
+            },
+            recoveryKey
+          )
+        if (!outcome.shouldRetry || !outcome.result) {
+          this.logger.warn(
+            `[REACTIVE-COMPACT] stream giving up for ${recoveryKey}: ${
+              outcome.reason ?? "unknown"
+            } (failures=${outcome.consecutiveFailures})`
+          )
+          throw innerError
+        }
+        this.logger.warn(
+          `[REACTIVE-COMPACT] stream retrying ${route.backend}/${route.model} after prompt-too-long: ` +
+            `${dto.messages.length} → ${outcome.result.messages.length} messages`
+        )
+        const recoveredDto: CreateMessageDto = {
+          ...dto,
+          messages: outcome.result.messages as typeof dto.messages,
+        }
+        const retryRoutedDto = this.prepareDtoForRoute(recoveredDto, route)
+        // Reset the leading-event buffer so we can replay it cleanly on
+        // the retry.  emittedAny is still false here by construction.
+        buffer = []
+        for await (const event of this.streamFromRoutedBackend(
+          retryRoutedDto,
+          route,
+          forwardHeaders,
+          codexForwardHeaders
+        )) {
+          yield* handleEvent(event)
+        }
+        if (!emittedAny) {
+          for (const b of buffer) yield b
+        }
+        this.contextManager.resetReactiveFailures(recoveryKey)
+        return
       }
     } catch (error) {
       const fallback = this.modelRouter.getFallbackRoute(

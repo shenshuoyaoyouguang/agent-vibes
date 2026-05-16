@@ -3733,6 +3733,60 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * List currently in-memory session ids along with a small bundle of
+   * activity / token metadata so the dashboard can offer a "compact this
+   * session" picker.  Persisted-but-not-loaded sessions are intentionally
+   * skipped — bringing them into memory would happen anyway when the
+   * dashboard issues a manual compaction request, and listing every
+   * historical session would bloat the response.
+   */
+  listSessionSummaries(): Array<{
+    conversationId: string
+    model: string
+    messageCount: number
+    transcriptRecordCount: number
+    activeCompactionId?: string
+    compactionEpoch: number
+    lastActivityAt: string
+  }> {
+    const summaries: Array<
+      ReturnType<ChatSessionManager["buildSessionSummary"]>
+    > = []
+    for (const [conversationId, session] of this.sessions) {
+      summaries.push(this.buildSessionSummary(conversationId, session))
+    }
+    summaries.sort(
+      (a, b) =>
+        new Date(b.lastActivityAt).getTime() -
+        new Date(a.lastActivityAt).getTime()
+    )
+    return summaries
+  }
+
+  private buildSessionSummary(
+    conversationId: string,
+    session: ChatSession
+  ): {
+    conversationId: string
+    model: string
+    messageCount: number
+    transcriptRecordCount: number
+    activeCompactionId?: string
+    compactionEpoch: number
+    lastActivityAt: string
+  } {
+    return {
+      conversationId,
+      model: session.model || "",
+      messageCount: session.messages.length,
+      transcriptRecordCount: session.messageRecords.length,
+      activeCompactionId: session.contextState.activeCompactionId,
+      compactionEpoch: session.contextState.compactionEpoch ?? 0,
+      lastActivityAt: session.lastActivityAt.toISOString(),
+    }
+  }
+
+  /**
    * Delete session
    */
   deleteSession(conversationId: string): void {

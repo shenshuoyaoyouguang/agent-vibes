@@ -1,4 +1,11 @@
 import { Injectable, Logger } from "@nestjs/common"
+import { findRoundAlignedTruncationIndex } from "./api-round-grouping"
+import { ContextTelemetryService } from "./context-telemetry.service"
+import { TokenCounterService } from "./token-counter.service"
+import {
+  enforceToolProtocol,
+  type EnforceToolProtocolOptions,
+} from "./tool-protocol-integrity"
 import {
   ToolPair,
   UnifiedMessage,
@@ -6,11 +13,6 @@ import {
   isToolUseBlock,
   normalizeContent,
 } from "./types"
-import { TokenCounterService } from "./token-counter.service"
-import {
-  enforceToolProtocol,
-  type EnforceToolProtocolOptions,
-} from "./tool-protocol-integrity"
 
 /**
  * Result of sanitizeMessages operation
@@ -40,7 +42,10 @@ export interface SanitizeResult {
 export class ToolIntegrityService {
   private readonly logger = new Logger(ToolIntegrityService.name)
 
-  constructor(private readonly tokenCounter: TokenCounterService) {}
+  constructor(
+    private readonly tokenCounter: TokenCounterService,
+    private readonly telemetry: ContextTelemetryService
+  ) {}
 
   /**
    * Extract all tool_use IDs from a message
@@ -341,6 +346,48 @@ export class ToolIntegrityService {
   }
 
   /**
+   * Find a round-aligned truncation point first, then refine with the
+   * tool-integrity walker.  This prevents the per-message walker from
+   * cutting through the middle of a tool_use → tool_result chain when a
+   * cleaner whole-round cut is available.
+   *
+   * Returns the same kind of index as
+   * `findBudgetSafeTruncationPointWithIntegrity` and is safe to use as a
+   * drop-in replacement when the caller already feeds in a clean message
+   * suffix (e.g. retained transcript records after the projection
+   * boundary).
+   */
+  findRoundAlignedTruncationPoint(
+    messages: UnifiedMessage[],
+    targetTokens: number,
+    options?: {
+      mode?: EnforceToolProtocolOptions["mode"]
+    }
+  ): number {
+    if (messages.length === 0) return 0
+    const roundIndex = findRoundAlignedTruncationIndex(
+      messages,
+      targetTokens,
+      (slice) => this.tokenCounter.countMessages(slice as UnifiedMessage[])
+    )
+    if (roundIndex >= messages.length) {
+      return messages.length
+    }
+
+    // Walk forward from the round boundary to honour the tool-pair invariant
+    // and budget.  This handles the rare case where a single round still
+    // exceeds the budget by itself: the per-message walker can shave from
+    // within it.
+    const slice = messages.slice(roundIndex)
+    const refined = this.findBudgetSafeTruncationPointWithIntegrity(
+      slice,
+      targetTokens,
+      options
+    )
+    return roundIndex + refined
+  }
+
+  /**
    * Find the earliest truncation point that both preserves tool integrity and
    * actually fits within the requested token budget.
    *
@@ -588,6 +635,18 @@ export class ToolIntegrityService {
           `removed ${result.removedOrphanToolResults} orphan tool_result, ` +
           `${result.removedEmptyMessages} empty message(s)`
       )
+      if (guardResult.removedToolResults > 0) {
+        this.telemetry.recordEvent({
+          event: "integrity.orphan_tool_result_removed",
+          delta: guardResult.removedToolResults,
+        })
+      }
+      if (guardResult.injectedToolResults > 0) {
+        this.telemetry.recordEvent({
+          event: "integrity.synthetic_tool_result_injected",
+          delta: guardResult.injectedToolResults,
+        })
+      }
     }
 
     return result

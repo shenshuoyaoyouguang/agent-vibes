@@ -330,6 +330,10 @@ export class DashboardPanel {
         void this.sendKiroQuotaStatus()
         break
 
+      case "getContextTelemetry":
+        void this.sendContextTelemetry()
+        break
+
       case "getUsageSummary":
         void this.sendUsageSummary()
         break
@@ -593,6 +597,40 @@ export class DashboardPanel {
         `Kiro quota fetch failed: ${err instanceof Error ? err.message : String(err)}`
       )
       this.panel.webview.postMessage({ type: "kiroQuotaUpdate", data: null })
+    }
+  }
+
+  /**
+   * Fetch the context-management telemetry counter snapshot from the
+   * bridge and forward it to the webview Diagnostics tab.  When the
+   * bridge is not running we send `null` so the UI can render a clear
+   * "telemetry unavailable" hint instead of stale numbers.
+   */
+  private async sendContextTelemetry(): Promise<void> {
+    if (this.bridge.state !== "running") {
+      this.panel.webview.postMessage({
+        type: "contextTelemetryUpdate",
+        data: null,
+      })
+      return
+    }
+    try {
+      const data = await this.callBridgeApi<Record<string, unknown>>(
+        "/api/context/telemetry",
+        "GET"
+      )
+      this.panel.webview.postMessage({
+        type: "contextTelemetryUpdate",
+        data,
+      })
+    } catch (err) {
+      logger.debug(
+        `Context telemetry fetch failed: ${err instanceof Error ? err.message : String(err)}`
+      )
+      this.panel.webview.postMessage({
+        type: "contextTelemetryUpdate",
+        data: null,
+      })
     }
   }
 

@@ -106,6 +106,59 @@ async function openJsonFile(filePath: string): Promise<void> {
 }
 
 /**
+ * Lightweight HTTPS caller for the local bridge.  Mirrors the helper
+ * used by `DashboardPanel` so command handlers can hit
+ * `/api/context/...` without taking a dependency on the panel.
+ */
+async function callBridgeApiHttp<T>(
+  config: ConfigManager,
+  apiPath: string,
+  method: "GET" | "POST",
+  body?: Record<string, unknown>
+): Promise<T | null> {
+  const fs = await import("fs")
+  const https = await import("https")
+  const caCert = config.caCertPath
+  const caData = fs.existsSync(caCert) ? fs.readFileSync(caCert) : undefined
+  const payload = body ? JSON.stringify(body) : ""
+
+  return new Promise<T | null>((resolve, reject) => {
+    const options: import("https").RequestOptions = {
+      hostname: "localhost",
+      port: config.port,
+      path: apiPath,
+      method,
+      ca: caData,
+      rejectUnauthorized: !!caData,
+      timeout: 30_000,
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(payload),
+      },
+    }
+    const req = https.request(options, (res) => {
+      let responseBody = ""
+      res.on("data", (chunk: Buffer) => {
+        responseBody += chunk.toString()
+      })
+      res.on("end", () => {
+        try {
+          resolve(responseBody ? (JSON.parse(responseBody) as T) : null)
+        } catch {
+          resolve(null)
+        }
+      })
+    })
+    req.on("error", reject)
+    req.setTimeout(30_000, () => {
+      req.destroy(new Error("Bridge API request timed out"))
+    })
+    if (payload) req.write(payload)
+    req.end()
+  })
+}
+
+/**
  * Register all extension commands.
  */
 export function registerCommands(
@@ -688,6 +741,84 @@ export function registerCommands(
   context.subscriptions.push(
     vscode.commands.registerCommand(CMD.OPEN_DASHBOARD, () => {
       DashboardPanel.createOrShow(context.extensionUri, config, bridge, network)
+    })
+  )
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(CMD.COMPACT_CURRENT_SESSION, async () => {
+      if (!bridge.isRunning) {
+        vscode.window.showWarningMessage(
+          t("compact.bridgeNotRunning") || "Agent Vibes bridge is not running."
+        )
+        return
+      }
+      try {
+        const sessions = await callBridgeApiHttp<{
+          sessions?: Array<{
+            conversationId: string
+            model?: string
+            messageCount?: number
+            transcriptRecordCount?: number
+            compactionEpoch?: number
+            activeCompactionId?: string
+            lastActivityAt?: string
+          }>
+        }>(config, "/api/context/sessions", "GET")
+        const list = sessions?.sessions ?? []
+        if (list.length === 0) {
+          vscode.window.showInformationMessage(
+            t("compact.noSessions") || "No active Cursor sessions to compact."
+          )
+          return
+        }
+        const picked = await vscode.window.showQuickPick(
+          list.map((session) => ({
+            label: session.conversationId,
+            description: session.model || "",
+            detail: `messages=${session.messageCount ?? 0} · records=${
+              session.transcriptRecordCount ?? 0
+            } · epoch=${session.compactionEpoch ?? 0}`,
+            conversationId: session.conversationId,
+          })),
+          {
+            placeHolder:
+              t("compact.pickSession") || "Select a session to compact now",
+          }
+        )
+        if (!picked) return
+        const result = await callBridgeApiHttp<{
+          applied?: boolean
+          archivedMessageCount?: number
+          summaryTokenCount?: number
+          estimatedTokens?: number
+          reason?: string
+        }>(config, "/api/context/compact", "POST", {
+          conversationId: picked.conversationId,
+        })
+        if (result?.applied) {
+          vscode.window.showInformationMessage(
+            tFmt("compact.applied", {
+              archived: String(result.archivedMessageCount ?? 0),
+              summary: String(result.summaryTokenCount ?? 0),
+            }) || `Compacted ${result.archivedMessageCount ?? 0} messages.`
+          )
+        } else {
+          vscode.window.showInformationMessage(
+            t("compact.noProgress") ||
+              "No compaction was needed for this session."
+          )
+        }
+      } catch (err) {
+        logger.error("Manual compaction failed", err)
+        vscode.window.showErrorMessage(
+          tFmt("compact.failed", {
+            error: err instanceof Error ? err.message : String(err),
+          }) ||
+            `Compaction failed: ${
+              err instanceof Error ? err.message : String(err)
+            }`
+        )
+      }
     })
   )
 

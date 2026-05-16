@@ -16,6 +16,7 @@ import {
   type ContextInvestigationMemoryEntry,
   ContextManagerService,
   type ContextUsageSnapshot,
+  detectPromptTooLong,
   extractText,
   type LooseMessageContent,
   normalizeToolProtocolMessages,
@@ -426,14 +427,45 @@ interface HandleToolResultOptions {
   dispatchNextQueuedEditOnConsume?: boolean
 }
 
+interface BackendStreamHints {
+  /**
+   * When set, callers should treat this as the upper bound for context
+   * tokens used when (re)building the request DTO.  This is how
+   * `executeBackendStreamWithFallback` injects the smaller budget produced
+   * by reactive prompt-too-long recovery without requiring callers to
+   * re-thread the parameter through every closure.
+   */
+  budgetOverride?: { maxTokens?: number }
+}
+
 interface BackendStreamOptions {
-  buildDtoForRoute?: (route: ModelRouteResult) => CreateMessageDto
-  buildCodexRequestForRoute?: (route: ModelRouteResult) => CodexExecutionRequest
+  buildDtoForRoute?: (
+    route: ModelRouteResult,
+    hints?: BackendStreamHints
+  ) => CreateMessageDto
+  buildCodexRequestForRoute?: (
+    route: ModelRouteResult,
+    hints?: BackendStreamHints
+  ) => CodexExecutionRequest
   abortSignal?: AbortSignal
   streamAbortBinding?: {
     conversationId: string
     streamId: string
   }
+  /**
+   * Stable identifier used to track consecutive prompt-too-long failures
+   * and to drive the reactive-recovery circuit breaker living on
+   * `ContextManagerService`.  Falls back to a route-based key when
+   * absent — that still prevents infinite retry but loses cross-call
+   * counting between turns.
+   */
+  recoveryKey?: string
+  /**
+   * Snapshot used by the reactive-recovery path to rebuild attachments
+   * after a prompt-too-long failure.  Optional; recovery falls back to
+   * an empty snapshot when omitted.
+   */
+  recoveryAttachmentSnapshot?: ContextAttachmentSnapshot
 }
 
 interface ExecDispatchTarget {
@@ -1559,6 +1591,7 @@ export class CursorConnectStreamService {
     // user-visible content has been streamed) do we flush & lock in.
     let emittedAny = false
     let buffer: string[] = []
+    let activeHints: BackendStreamHints | undefined
 
     const handleEvent = function* (event: string) {
       if (!emittedAny) {
@@ -1580,16 +1613,61 @@ export class CursorConnectStreamService {
       }
     }
 
+    const recoveryKey =
+      options?.recoveryKey ??
+      `cursor:routed:${route.backend}:${route.model}:${model}`
+    const reactiveAttachmentSnapshot =
+      options?.recoveryAttachmentSnapshot ??
+      this.EMPTY_CONTEXT_ATTACHMENT_SNAPSHOT
+    let reactiveRetried = false
+
     try {
-      const backendStream = this.resolveBackendStream(route, options)
-      this.logger.log(
-        `Routing to ${route.backend} backend for model: ${route.model}`
-      )
-      for await (const event of backendStream) {
-        yield* handleEvent(event)
-      }
-      if (!emittedAny) {
-        for (const b of buffer) yield b
+      while (true) {
+        try {
+          const backendStream = this.resolveBackendStream(
+            route,
+            options,
+            activeHints
+          )
+          this.logger.log(
+            `Routing to ${route.backend} backend for model: ${route.model}` +
+              (activeHints?.budgetOverride
+                ? ` (reactive recovery budget=${activeHints.budgetOverride.maxTokens})`
+                : "")
+          )
+          for await (const event of backendStream) {
+            yield* handleEvent(event)
+          }
+          if (!emittedAny) {
+            for (const b of buffer) yield b
+          }
+          this.contextManager.resetReactiveFailures(recoveryKey)
+          return
+        } catch (innerError) {
+          if (innerError instanceof UpstreamRequestAbortedError)
+            throw innerError
+          if (emittedAny || reactiveRetried) throw innerError
+          const detection = detectPromptTooLong(innerError)
+          if (!detection.matched) throw innerError
+
+          const recovery = this.computeReactiveRecoveryHints(
+            route,
+            options,
+            detection,
+            recoveryKey,
+            reactiveAttachmentSnapshot,
+            activeHints
+          )
+          if (!recovery) {
+            throw innerError
+          }
+          activeHints = recovery
+          reactiveRetried = true
+          buffer = []
+          this.logger.warn(
+            `[REACTIVE-COMPACT] retrying ${route.backend}/${route.model} after prompt-too-long with budget=${recovery.budgetOverride?.maxTokens}`
+          )
+        }
       }
     } catch (error) {
       if (error instanceof UpstreamRequestAbortedError) {
@@ -1623,6 +1701,65 @@ export class CursorConnectStreamService {
 
       throw error
     }
+  }
+
+  /**
+   * Translate an upstream prompt-too-long failure into a smaller-budget
+   * retry hint, after consulting the reactive-recovery circuit breaker.
+   * Returns `undefined` when the breaker is open or the recovery would
+   * not actually shrink the budget enough to matter.
+   */
+  private computeReactiveRecoveryHints(
+    _route: ModelRouteResult,
+    _options: BackendStreamOptions | undefined,
+    detection: { actualTokens?: number; maxTokens?: number },
+    recoveryKey: string,
+    _attachmentSnapshot: ContextAttachmentSnapshot,
+    previousHints: BackendStreamHints | undefined
+  ): BackendStreamHints | undefined {
+    const previousBudget = previousHints?.budgetOverride?.maxTokens
+    const baselineBudget = previousBudget ?? this.DEFAULT_HISTORY_MAX_TOKENS
+    const recovery =
+      this.contextManager.applyReactivePromptTooLongRecoveryFromMessages(
+        [],
+        this.EMPTY_CONTEXT_ATTACHMENT_SNAPSHOT,
+        {
+          maxTokens: baselineBudget,
+          // The bridge does not know the system-prompt token count when
+          // using the empty fallback state; pass 0 so the breaker only
+          // judges by the upstream-reported budget delta and the failure
+          // counter, not by the synthetic computation.
+          systemPromptTokens: 0,
+        },
+        {
+          actualTokens: detection.actualTokens,
+          maxTokens: detection.maxTokens,
+        },
+        recoveryKey
+      )
+
+    // applyReactivePromptTooLongRecoveryFromMessages always returns a
+    // ReactiveRecoveryOutcome.  We only need the new budget; the empty
+    // ephemeral state cannot produce useful messages here, so we ignore
+    // `recovery.result.messages` and simply rebuild the request with a
+    // tighter budget on the next iteration.
+    if (!recovery.shouldRetry) {
+      this.logger.warn(
+        `[REACTIVE-COMPACT] giving up for ${recoveryKey}: ${
+          recovery.reason ?? "unknown"
+        } (failures=${recovery.consecutiveFailures})`
+      )
+      return undefined
+    }
+
+    const nextBudget = recovery.result?.estimatedTokens
+      ? Math.min(baselineBudget, recovery.result.estimatedTokens)
+      : Math.floor(baselineBudget * 0.75)
+    if (nextBudget >= baselineBudget) {
+      return undefined
+    }
+
+    return { budgetOverride: { maxTokens: nextBudget } }
   }
 
   /**
@@ -1679,7 +1816,8 @@ export class CursorConnectStreamService {
     session: ChatSession,
     ctx: SubAgentContext,
     conversationId: string,
-    streamRoute: ModelRouteResult
+    streamRoute: ModelRouteResult,
+    hints?: BackendStreamHints
   ): CreateMessageDto {
     const dto = this.buildStreamingDtoForRoute(streamRoute, {
       model: ctx.model,
@@ -1688,6 +1826,7 @@ export class CursorConnectStreamService {
       session,
       thinkingLevel: session.thinkingLevel,
       thinkingDetailsRequested: session.thinkingDetailsRequested,
+      budgetOverride: hints?.budgetOverride,
       buildMessages: (budget) => {
         const compacted = this.contextManager.buildBackendMessagesFromMessages(
           ctx.messages.map((message) => ({
@@ -1722,6 +1861,7 @@ export class CursorConnectStreamService {
       pendingToolUseIds?: string[]
       thinkingLevel?: number
       thinkingDetailsRequested?: boolean
+      budgetOverride?: { maxTokens?: number }
       buildMessages: (budget: {
         maxTokens: number
         systemPromptTokens: number
@@ -1753,6 +1893,7 @@ export class CursorConnectStreamService {
       systemPrompt: effectiveSystemPrompt,
       toolDefinitions: options.toolDefinitions,
       model: options.model,
+      budgetOverride: options.budgetOverride,
     })
     const historyMessages = options.buildMessages(budget)
     // Cloud Code expects the official per-message transcript shape.
@@ -1836,6 +1977,7 @@ export class CursorConnectStreamService {
       pendingToolUseIds?: string[]
       thinkingLevel?: number
       thinkingDetailsRequested?: boolean
+      budgetOverride?: { maxTokens?: number }
       buildMessages: (budget: {
         maxTokens: number
         systemPromptTokens: number
@@ -1855,6 +1997,7 @@ export class CursorConnectStreamService {
       systemPrompt: effectiveSystemPrompt,
       toolDefinitions: options.toolDefinitions,
       model: options.model,
+      budgetOverride: options.budgetOverride,
     })
     const historyMessages = options.buildMessages(budget)
     const requestedReasoningEffort = this.resolveRequestedReasoningEffort(
@@ -1973,11 +2116,12 @@ export class CursorConnectStreamService {
    */
   private resolveBackendStream(
     route: ModelRouteResult,
-    options?: BackendStreamOptions
+    options?: BackendStreamOptions,
+    hints?: BackendStreamHints
   ): AsyncGenerator<string, void, unknown> {
     switch (route.backend) {
       case "codex": {
-        const codexRequest = options?.buildCodexRequestForRoute?.(route)
+        const codexRequest = options?.buildCodexRequestForRoute?.(route, hints)
         if (!codexRequest) {
           throw new Error(
             `Missing Codex request builder for backend ${route.backend} (${route.model})`
@@ -1989,7 +2133,7 @@ export class CursorConnectStreamService {
         )
       }
       case "claude-api": {
-        const routedDto = options?.buildDtoForRoute?.(route)
+        const routedDto = options?.buildDtoForRoute?.(route, hints)
         if (!routedDto) {
           throw new Error(
             `Missing DTO builder for backend ${route.backend} (${route.model})`
@@ -2002,7 +2146,7 @@ export class CursorConnectStreamService {
         )
       }
       case "kiro": {
-        const routedDto = options?.buildDtoForRoute?.(route)
+        const routedDto = options?.buildDtoForRoute?.(route, hints)
         if (!routedDto) {
           throw new Error(
             `Missing DTO builder for backend ${route.backend} (${route.model})`
@@ -2014,7 +2158,7 @@ export class CursorConnectStreamService {
         )
       }
       case "openai-compat": {
-        const routedDto = options?.buildDtoForRoute?.(route)
+        const routedDto = options?.buildDtoForRoute?.(route, hints)
         if (!routedDto) {
           throw new Error(
             `Missing DTO builder for backend ${route.backend} (${route.model})`
@@ -2027,7 +2171,7 @@ export class CursorConnectStreamService {
       }
       case "google":
       default: {
-        const routedDto = options?.buildDtoForRoute?.(route)
+        const routedDto = options?.buildDtoForRoute?.(route, hints)
         if (!routedDto) {
           throw new Error(
             `Missing DTO builder for backend ${route.backend} (${route.model})`
@@ -2160,6 +2304,7 @@ export class CursorConnectStreamService {
       systemPrompt?: string
       toolDefinitions?: unknown
       model?: string
+      budgetOverride?: { maxTokens?: number }
     }
   ): {
     maxTokens: number
@@ -2188,6 +2333,20 @@ export class CursorConnectStreamService {
         )
         maxTokens = this.CLOUD_CODE_SOFT_CONTEXT_LIMIT_TOKENS
       }
+    }
+
+    // Reactive recovery override: when an upstream request just failed
+    // with prompt-too-long, the caller asks us to honour a smaller cap on
+    // the next attempt.  Use min() so this can only shrink the budget,
+    // never expand it past the protocol/backend limits computed above.
+    const overrideMax = this.normalizePositiveInteger(
+      options?.budgetOverride?.maxTokens
+    )
+    if (overrideMax && overrideMax < maxTokens) {
+      this.logger.warn(
+        `Reactive recovery override active: clamping context budget ${maxTokens} -> ${overrideMax}`
+      )
+      maxTokens = overrideMax
     }
 
     const protectedContextTokens = options?.protectedContextTokens || 0
@@ -10543,17 +10702,20 @@ ${raw}
       )
 
       const buildSubAgentDtoForRoute = (
-        streamRoute: ModelRouteResult
+        streamRoute: ModelRouteResult,
+        hints?: BackendStreamHints
       ): CreateMessageDto =>
         this.buildSubAgentStreamingDtoForRoute(
           session,
           ctx,
           conversationId,
-          streamRoute
+          streamRoute,
+          hints
         )
 
       const buildSubAgentCodexRequestForRoute = (
-        streamRoute: ModelRouteResult
+        streamRoute: ModelRouteResult,
+        hints?: BackendStreamHints
       ): CodexExecutionRequest =>
         this.buildCodexStreamingRequestForRoute(streamRoute, {
           model: ctx.model,
@@ -10562,6 +10724,7 @@ ${raw}
           session,
           thinkingLevel: session.thinkingLevel,
           thinkingDetailsRequested: session.thinkingDetailsRequested,
+          budgetOverride: hints?.budgetOverride,
           buildMessages: (budget) => {
             const compacted =
               this.contextManager.buildBackendMessagesFromMessages(
@@ -10600,6 +10763,7 @@ ${raw}
         const stream = this.getBackendStream(streamModel, {
           buildDtoForRoute: buildSubAgentDtoForRoute,
           buildCodexRequestForRoute: buildSubAgentCodexRequestForRoute,
+          recoveryKey: `cursor:subagent:${conversationId}:${subagentId}`,
         })
 
         for await (const sseEventStr of stream) {
@@ -16298,7 +16462,10 @@ ${raw}
       }
     }
 
-    const buildChatDtoForRoute = (streamRoute: ModelRouteResult) =>
+    const buildChatDtoForRoute = (
+      streamRoute: ModelRouteResult,
+      hints?: BackendStreamHints
+    ) =>
       this.buildStreamingDtoForRoute(streamRoute, {
         model: session.model,
         promptContext: parsed,
@@ -16308,6 +16475,7 @@ ${raw}
         pendingToolUseIds,
         thinkingLevel: parsed.thinkingLevel,
         thinkingDetailsRequested: parsed.thinkingDetailsRequested,
+        budgetOverride: hints?.budgetOverride,
         buildMessages: (routeBudget) =>
           this.truncateMessagesForBackend(
             session,
@@ -16324,7 +16492,10 @@ ${raw}
           ) as CreateMessageDto["messages"],
       })
 
-    const buildChatCodexRequestForRoute = (streamRoute: ModelRouteResult) =>
+    const buildChatCodexRequestForRoute = (
+      streamRoute: ModelRouteResult,
+      hints?: BackendStreamHints
+    ) =>
       this.buildCodexStreamingRequestForRoute(streamRoute, {
         model: session.model,
         promptContext: parsed,
@@ -16334,6 +16505,7 @@ ${raw}
         pendingToolUseIds,
         thinkingLevel: parsed.thinkingLevel,
         thinkingDetailsRequested: parsed.thinkingDetailsRequested,
+        budgetOverride: hints?.budgetOverride,
         buildMessages: (routeBudget) =>
           this.truncateMessagesForBackend(
             session,
@@ -16365,6 +16537,9 @@ ${raw}
                 streamId,
               }
             : undefined,
+        recoveryKey: `cursor:chat:${conversationId}`,
+        recoveryAttachmentSnapshot:
+          this.buildContextAttachmentSnapshot(session),
       })
       const outcome = yield* this.processAssistantTurnStream({
         conversationId,
@@ -17080,7 +17255,8 @@ ${raw}
         this.sessionManager.getSession(conversationId) || activeSession
 
       const buildShellContinuationDtoForRoute = (
-        streamRoute: ModelRouteResult
+        streamRoute: ModelRouteResult,
+        hints?: BackendStreamHints
       ) =>
         this.buildStreamingDtoForRoute(streamRoute, {
           model: activeSession.model,
@@ -17091,6 +17267,7 @@ ${raw}
           pendingToolUseIds: remainingPendingToolUseIds,
           thinkingLevel: activeSession.thinkingLevel,
           thinkingDetailsRequested: activeSession.thinkingDetailsRequested,
+          budgetOverride: hints?.budgetOverride,
           buildMessages: (routeBudget) =>
             this.truncateMessagesForBackend(
               activeSession,
@@ -17108,7 +17285,8 @@ ${raw}
         })
 
       const buildShellContinuationCodexRequestForRoute = (
-        streamRoute: ModelRouteResult
+        streamRoute: ModelRouteResult,
+        hints?: BackendStreamHints
       ) =>
         this.buildCodexStreamingRequestForRoute(streamRoute, {
           model: activeSession.model,
@@ -17119,6 +17297,7 @@ ${raw}
           pendingToolUseIds: remainingPendingToolUseIds,
           thinkingLevel: activeSession.thinkingLevel,
           thinkingDetailsRequested: activeSession.thinkingDetailsRequested,
+          budgetOverride: hints?.budgetOverride,
           buildMessages: (routeBudget) =>
             this.truncateMessagesForBackend(
               activeSession,
@@ -17147,6 +17326,9 @@ ${raw}
                 streamId: pendingToolCall.streamId,
               }
             : undefined,
+          recoveryKey: `cursor:shell-continuation:${conversationId}`,
+          recoveryAttachmentSnapshot:
+            this.buildContextAttachmentSnapshot(activeSession),
         })
         const outcome = yield* this.processAssistantTurnStream({
           conversationId,
@@ -18394,7 +18576,10 @@ ${raw}
         : undefined
       const additionalSystemPrompt = synthesisAdvisoryPrompt
 
-      const buildContinuationDtoForRoute = (streamRoute: ModelRouteResult) =>
+      const buildContinuationDtoForRoute = (
+        streamRoute: ModelRouteResult,
+        hints?: BackendStreamHints
+      ) =>
         this.buildStreamingDtoForRoute(streamRoute, {
           model: activeSession.model,
           promptContext: activeSession,
@@ -18405,6 +18590,7 @@ ${raw}
           pendingToolUseIds: remainingPendingToolUseIds,
           thinkingLevel: activeSession.thinkingLevel,
           thinkingDetailsRequested: activeSession.thinkingDetailsRequested,
+          budgetOverride: hints?.budgetOverride,
           buildMessages: (routeBudget) =>
             this.truncateMessagesForBackend(
               activeSession,
@@ -18422,7 +18608,8 @@ ${raw}
         })
 
       const buildContinuationCodexRequestForRoute = (
-        streamRoute: ModelRouteResult
+        streamRoute: ModelRouteResult,
+        hints?: BackendStreamHints
       ) =>
         this.buildCodexStreamingRequestForRoute(streamRoute, {
           model: activeSession.model,
@@ -18434,6 +18621,7 @@ ${raw}
           pendingToolUseIds: remainingPendingToolUseIds,
           thinkingLevel: activeSession.thinkingLevel,
           thinkingDetailsRequested: activeSession.thinkingDetailsRequested,
+          budgetOverride: hints?.budgetOverride,
           buildMessages: (routeBudget) =>
             this.truncateMessagesForBackend(
               activeSession,
@@ -18462,6 +18650,9 @@ ${raw}
               streamId: options.streamId,
             }
           : undefined,
+        recoveryKey: `cursor:tool-continuation:${conversationId}`,
+        recoveryAttachmentSnapshot:
+          this.buildContextAttachmentSnapshot(activeSession),
       })
       const outcome = yield* this.processAssistantTurnStream({
         conversationId,
@@ -18493,6 +18684,9 @@ ${raw}
                   streamId: options.streamId,
                 }
               : undefined,
+            recoveryKey: `cursor:tool-continuation:${conversationId}`,
+            recoveryAttachmentSnapshot:
+              this.buildContextAttachmentSnapshot(activeSession),
           })
           const retryOutcome = yield* this.processAssistantTurnStream({
             conversationId,

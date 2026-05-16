@@ -130,6 +130,17 @@ const EN: Record<string, string> = {
   "dash.codex.switched": "Codex CLI: switched to {label}",
   "dash.codex.activateFailed": "Codex CLI activation failed: {message}",
 
+  // ── Manual context compaction ──
+  "compact.bridgeNotRunning":
+    "Agent Vibes bridge is not running — start it before requesting a manual compaction.",
+  "compact.noSessions": "No active Cursor sessions are loaded.",
+  "compact.pickSession": "Select a session to compact now",
+  "compact.applied":
+    "Compacted {archived} archived messages into a {summary}-token summary.",
+  "compact.noProgress":
+    "No compaction was needed — the session is already within budget.",
+  "compact.failed": "Manual compaction failed: {error}",
+
   // ── Status bar tooltips ──
   "status.tooltip.running": "Agent Vibes — Running (click to open dashboard)",
   "status.tooltip.starting": "Agent Vibes — Starting...",
@@ -250,6 +261,14 @@ const ZH: Record<string, string> = {
     "Codex CLI：此账号没有 refresh token，无法激活。",
   "dash.codex.switched": "Codex CLI：已切换到 {label}",
   "dash.codex.activateFailed": "Codex CLI 激活失败：{message}",
+
+  // ── 手动上下文压缩 ──
+  "compact.bridgeNotRunning": "Agent Vibes 桥接未启动，无法触发手动压缩。",
+  "compact.noSessions": "当前没有活跃的 Cursor 会话可以压缩。",
+  "compact.pickSession": "选择需要立即压缩的会话",
+  "compact.applied": "已压缩 {archived} 条历史消息，摘要 {summary} tokens。",
+  "compact.noProgress": "当前会话尚未达到压缩阈值，无需压缩。",
+  "compact.failed": "手动压缩失败：{error}",
 
   // ── Status bar tooltips ──
   "status.tooltip.running": "Agent Vibes — 运行中（点击打开控制台）",

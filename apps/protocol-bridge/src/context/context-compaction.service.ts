@@ -1,12 +1,6 @@
 import { Injectable } from "@nestjs/common"
-import { createHash, randomUUID } from "crypto"
-import {
-  ContextCompactionCommit,
-  ContextConversationState,
-  ContextTranscriptRecord,
-  ProjectedContextMessage,
-  UnifiedMessage,
-} from "./types"
+import { randomUUID } from "crypto"
+import { fingerprintAttachments } from "./attachment-fingerprint"
 import {
   ContextAttachmentBuilderService,
   ContextAttachmentSnapshot,
@@ -14,12 +8,23 @@ import {
 import { ContextProjectionService } from "./context-projection.service"
 import { ContextSummaryService } from "./context-summary.service"
 import {
-  ToolResultCompactionResult,
-  ToolResultCompactionService,
-} from "./tool-result-compaction.service"
+  ContextTelemetryService,
+  type ContextTelemetryEvent,
+} from "./context-telemetry.service"
 import { ContextUsageLedgerService } from "./context-usage-ledger.service"
 import { TokenCounterService } from "./token-counter.service"
 import { ToolIntegrityService } from "./tool-integrity.service"
+import {
+  ToolResultCompactionResult,
+  ToolResultCompactionService,
+} from "./tool-result-compaction.service"
+import {
+  ContextCompactionCommit,
+  ContextConversationState,
+  ContextTranscriptRecord,
+  ProjectedContextMessage,
+  UnifiedMessage,
+} from "./types"
 
 export interface ContextCompactionPlan {
   commit: ContextCompactionCommit
@@ -73,7 +78,8 @@ export class ContextCompactionService {
     private readonly summary: ContextSummaryService,
     private readonly toolResultCompaction: ToolResultCompactionService,
     private readonly attachments: ContextAttachmentBuilderService,
-    private readonly usageLedger: ContextUsageLedgerService
+    private readonly usageLedger: ContextUsageLedgerService,
+    private readonly telemetry: ContextTelemetryService
   ) {}
 
   ensureWithinBudget(
@@ -204,10 +210,73 @@ export class ContextCompactionService {
       microcompactCompaction = reactiveCompaction.result
     }
 
+    // Idle-time microcompact: even when we are still under budget, if the
+    // user has been away long enough that the upstream prompt cache is
+    // almost certainly cold, shrink old tool results before sending.  This
+    // mirrors claude-code's time-based microcompact and gives us a free win
+    // on long-running sessions where most rounds are read_file/grep results.
+    if (
+      !microcompactCompaction?.changed &&
+      this.toolResultCompaction.evaluateIdleTrigger(
+        recordsOverride || state.records
+      )
+    ) {
+      const idleCompaction = this.applyToolResultMicrocompact(
+        state,
+        snapshot,
+        attachmentTokenBudget,
+        effectiveMaxTokens,
+        "idle",
+        recordsOverride,
+        snipState
+      )
+      if (idleCompaction?.changed) {
+        recordsOverride = idleCompaction.recordsOverride
+        projected = idleCompaction.projectedMessages
+        estimated = idleCompaction.estimatedTokens
+        microcompactCompaction = idleCompaction.result
+      }
+    }
+
     const fitted = this.hardFitProjection(projected, effectiveMaxTokens, {
       integrityMode: options.integrityMode,
       pendingToolUseIds: options.pendingToolUseIds,
     })
+
+    if (snipCompaction?.changed) {
+      this.telemetry.recordEvent({
+        event: "compaction.snip_applied",
+        metadata: {
+          removedRecords: snipCompaction.removedRecords,
+          retainedRecords: snipCompaction.retainedRecords,
+          summaryTokenCount: snipCompaction.summaryTokenCount,
+        },
+      })
+    }
+    if (microcompactCompaction?.changed) {
+      const triggerEvent: ContextTelemetryEvent =
+        microcompactCompaction.trigger === "preflight"
+          ? "compaction.microcompact_preflight"
+          : microcompactCompaction.trigger === "reactive"
+            ? "compaction.microcompact_reactive"
+            : "compaction.microcompact_idle"
+      this.telemetry.recordEvent({
+        event: triggerEvent,
+        metadata: {
+          clearedToolResults: microcompactCompaction.clearedToolResults,
+          compactedRounds: microcompactCompaction.compactedRounds,
+          keptRecentRounds: microcompactCompaction.keptRecentRounds,
+        },
+      })
+    }
+    if (fitted.length < projected.length) {
+      this.telemetry.recordEvent({
+        event: "compaction.hard_fit_truncation",
+        metadata: {
+          droppedMessages: projected.length - fitted.length,
+        },
+      })
+    }
 
     return {
       messages: fitted,
@@ -319,13 +388,7 @@ export class ContextCompactionService {
     const projectionAnchorRecordId = [...projected]
       .reverse()
       .find((message) => !!message.recordId)?.recordId
-    const attachmentFingerprint = createHash("sha256")
-      .update(
-        liveAttachments
-          .map((attachment) => `${attachment.kind}:${attachment.content}`)
-          .join("\n---\n")
-      )
-      .digest("hex")
+    const attachmentFingerprint = fingerprintAttachments(liveAttachments)
     const nextEpoch = (state.compactionEpoch || 0) + 1
     const commitBase: ContextCompactionCommit = {
       id: commitId,
@@ -412,6 +475,15 @@ export class ContextCompactionService {
       compactionId: plan.commit.id,
       epoch: plan.commit.epoch ?? nextEpoch,
     }
+    this.telemetry.recordEvent({
+      event: "compaction.boundary_applied",
+      metadata: {
+        archivedMessageCount: plan.commit.archivedMessageCount,
+        sourceTokenCount: plan.commit.sourceTokenCount,
+        summaryTokenCount: plan.commit.summaryTokenCount,
+        epoch: plan.commit.epoch ?? nextEpoch,
+      },
+    })
     // Prune investigation memory entries whose evidence was fully archived
     // by this compaction commit so stale references don't accumulate.
     this.pruneArchivedInvestigationMemory(
@@ -760,7 +832,7 @@ export class ContextCompactionService {
     snapshot: ContextAttachmentSnapshot,
     attachmentTokenBudget: number,
     effectiveMaxTokens: number,
-    trigger: "preflight" | "reactive",
+    trigger: "preflight" | "reactive" | "idle",
     recordsOverride?: readonly ContextTranscriptRecord[],
     snipState?: RuntimeSnipState
   ):
@@ -798,7 +870,10 @@ export class ContextCompactionService {
       retainedRecords,
       {
         trigger,
-        targetTokens: recordBudget,
+        // Idle compaction is opportunistic — it runs without a budget so the
+        // service compacts every eligible older round in one pass.  Other
+        // triggers still target the remaining budget like before.
+        targetTokens: trigger === "idle" ? undefined : recordBudget,
       },
       state.toolResultReplacementState
     )
@@ -903,11 +978,23 @@ export class ContextCompactionService {
 
       const recordBudget = Math.max(0, maxTokens - prefixTokens + 3)
       const retainedUnified = this.toUnifiedMessages(retainedRecords)
-      const fittedRecords = this.toolIntegrity.extractWithIntegrity(
-        retainedUnified,
-        recordBudget,
-        { mode: options?.integrityMode }
-      )
+      // Round-aligned cut first to avoid slicing through a tool_use chain;
+      // the per-message walker still handles the budget refinement when a
+      // single round is too large to fit on its own.
+      const roundAlignedIndex =
+        this.toolIntegrity.findRoundAlignedTruncationPoint(
+          retainedUnified,
+          recordBudget,
+          { mode: options?.integrityMode }
+        )
+      const fittedRecords =
+        roundAlignedIndex >= retainedUnified.length
+          ? this.toolIntegrity.extractWithIntegrity(
+              retainedUnified,
+              recordBudget,
+              { mode: options?.integrityMode }
+            )
+          : retainedUnified.slice(roundAlignedIndex)
       fitted = [...fittedPrefix, ...fittedRecords]
 
       if (this.tokenCounter.countMessages(fitted) <= maxTokens) {

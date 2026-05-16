@@ -1640,9 +1640,28 @@ export class CursorRequestParser {
       thinkingLevel = requestedThinkingLevel
     }
 
+    // thinkingDetailsRequested 表示客户端希望看到详细的 thinking 内容（不仅是“启用 thinking”）。
+    //
+    // 之前只看 modelDetails.thinkingDetails，但 Cursor 通过 model variant
+    // (例如 gpt-5.5-xhigh-fast → derivedParameters.thinking=extra-high) 显式请求
+    // thinking 时不会带 thinkingDetails 字段，导致 thinkingDetails=false。
+    //
+    // 这里把 variant/参数推导出的 thinking 也视为“显式请求 thinking 详情”：
+    // - modelDetails.thinkingDetails 存在
+    // - requestedModel/modelDetails 进入 maxMode
+    // - 通过 requestedModelParameters 解析出非零 thinking level
+    const thinkingDetailsRequested =
+      hasThinkingDetails ||
+      modelMaxMode ||
+      requestedMaxMode ||
+      requestedVariantMaxMode ||
+      modelDetailsVariantMaxMode ||
+      (requestedThinkingLevel !== undefined && requestedThinkingLevel > 0)
+
     if (thinkingLevel > 0) {
       this.logger.log(
         `Thinking enabled: level=${thinkingLevel} (thinkingDetails=${hasThinkingDetails}, ` +
+          `thinkingDetailsRequested=${thinkingDetailsRequested}, ` +
           `modelMaxMode=${modelMaxMode}, requestedMaxMode=${requestedMaxMode}, requestedVariantMaxMode=${requestedVariantMaxMode}, modelDetailsVariantMaxMode=${modelDetailsVariantMaxMode}, ` +
           `requestedThinkingLevel=${requestedThinkingLevel ?? 0})`
       )
@@ -1674,7 +1693,7 @@ export class CursorRequestParser {
           newMessage: "",
           model,
           thinkingLevel,
-          thinkingDetailsRequested: hasThinkingDetails,
+          thinkingDetailsRequested,
           unifiedMode: "AGENT",
           isAgentic: true,
           supportedTools,
@@ -1729,7 +1748,7 @@ export class CursorRequestParser {
       newMessage: prompt,
       model,
       thinkingLevel,
-      thinkingDetailsRequested: hasThinkingDetails,
+      thinkingDetailsRequested,
       unifiedMode: "AGENT",
       isAgentic: true,
       supportedTools,

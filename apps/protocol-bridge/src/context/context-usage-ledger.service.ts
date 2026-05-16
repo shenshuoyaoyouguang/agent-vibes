@@ -1,15 +1,15 @@
 import { Injectable } from "@nestjs/common"
-import { createHash } from "crypto"
+import { fingerprintProjectedAttachments } from "./attachment-fingerprint"
+import { ContextAttachmentSnapshot } from "./context-attachment-builder.service"
+import { ContextProjectionService } from "./context-projection.service"
+import { TokenCounterService } from "./token-counter.service"
 import {
   ContextConversationState,
+  ContextUsageLedgerState,
   ContextUsageSnapshot,
   ProjectedContextMessage,
-  ContextUsageLedgerState,
   UnifiedMessage,
 } from "./types"
-import { TokenCounterService } from "./token-counter.service"
-import { ContextProjectionService } from "./context-projection.service"
-import { ContextAttachmentSnapshot } from "./context-attachment-builder.service"
 
 @Injectable()
 export class ContextUsageLedgerService {
@@ -60,8 +60,7 @@ export class ContextUsageLedgerService {
     return {
       projectedTokenCount: this.tokenCounter.countMessages(asUnified),
       recordedCompactionId: this.projection.getActiveCommit(state)?.id,
-      attachmentFingerprint:
-        this.buildProjectedAttachmentFingerprint(projectedMessages),
+      attachmentFingerprint: fingerprintProjectedAttachments(projectedMessages),
     }
   }
 
@@ -107,7 +106,7 @@ export class ContextUsageLedgerService {
     }
 
     const currentAttachmentFingerprint =
-      this.buildProjectedAttachmentFingerprint(projected)
+      fingerprintProjectedAttachments(projected)
     if (
       (state.usageLedger.attachmentFingerprint || "") !==
       currentAttachmentFingerprint
@@ -132,37 +131,5 @@ export class ContextUsageLedgerService {
     }
 
     return projectedTokenCount + this.tokenCounter.countMessages(suffixMessages)
-  }
-
-  private buildProjectedAttachmentFingerprint(
-    projectedMessages: ProjectedContextMessage[]
-  ): string {
-    const attachmentPayload = projectedMessages
-      .filter((message) => message.source === "attachment")
-      .map(
-        (message) =>
-          `${message.attachmentKind || "attachment"}:${this.serializeContent(message.content)}`
-      )
-      .join("\n---\n")
-
-    if (!attachmentPayload) {
-      return ""
-    }
-
-    return createHash("sha256").update(attachmentPayload).digest("hex")
-  }
-
-  private serializeContent(
-    content: ProjectedContextMessage["content"]
-  ): string {
-    if (typeof content === "string") {
-      return content
-    }
-
-    try {
-      return JSON.stringify(content)
-    } catch {
-      return "[unserializable-content]"
-    }
   }
 }

@@ -1,15 +1,15 @@
 import { Injectable, Logger } from "@nestjs/common"
+import { TokenCounterService } from "./token-counter.service"
 import {
+  ContentBlock,
   ContextToolResultReplacementState,
   ContextTranscriptRecord,
-  ContentBlock,
   ToolResultBlock,
   UnifiedMessage,
   isToolResultBlock,
   isToolUseBlock,
   normalizeContent,
 } from "./types"
-import { TokenCounterService } from "./token-counter.service"
 
 type ToolMetadata = {
   name: string
@@ -36,7 +36,7 @@ type ApiRound = {
 }
 
 export interface ToolResultCompactionOptions {
-  trigger: "reactive" | "preflight"
+  trigger: "reactive" | "preflight" | "idle"
   targetTokens?: number
   keepRecentRounds?: number
 }
@@ -59,6 +59,28 @@ export class ToolResultCompactionService {
   private readonly KEEP_RECENT_ROUNDS = 6
   private readonly MAX_OUTPUT_SUMMARY_CHARS = 420
   private readonly MAX_INPUT_SUMMARY_CHARS = 220
+  /**
+   * Default minutes between assistant turns that count as "idle".  When the
+   * caller has been idle longer than this, prompt-cache for the prior turn is
+   * almost certainly cold on the upstream provider, so we may as well shrink
+   * the request before sending it.  Mirrors claude-code's time-based
+   * microcompact heuristic with a similarly conservative default.
+   *
+   * Operators can override at process start with the
+   * `CONTEXT_IDLE_MICROCOMPACT_MINUTES` env var.  Setting the value to 0
+   * (or a negative number) disables the idle trigger entirely.
+   */
+  private readonly IDLE_GAP_MINUTES_DEFAULT =
+    this.resolveIdleGapMinutesDefault()
+
+  private resolveIdleGapMinutesDefault(): number {
+    const raw = process.env.CONTEXT_IDLE_MICROCOMPACT_MINUTES
+    if (typeof raw !== "string") return 30
+    const parsed = Number(raw)
+    if (!Number.isFinite(parsed)) return 30
+    if (parsed <= 0) return 0
+    return parsed
+  }
   private readonly COMPACTABLE_TOOLS = new Set<string>([
     "read_file",
     "read_file_v2",
@@ -76,6 +98,43 @@ export class ToolResultCompactionService {
   ])
 
   constructor(private readonly tokenCounter: TokenCounterService) {}
+
+  /**
+   * Decide whether the idle-time microcompact should run on this transcript.
+   *
+   * Returns the gap (in minutes) when the trigger should fire, or `null` when
+   * the conversation is too fresh / has no prior assistant turn.  The caller
+   * is responsible for actually invoking `compactRecords` with `trigger:
+   * "idle"` — keeping the predicate separate makes it cheap to consult from
+   * the compaction planner without pulling in the full compaction machinery.
+   */
+  evaluateIdleTrigger(
+    records: readonly ContextTranscriptRecord[],
+    options?: { now?: number; gapMinutes?: number }
+  ): { gapMinutes: number; threshold: number } | null {
+    if (records.length === 0) return null
+    const threshold = Math.max(
+      0,
+      options?.gapMinutes ?? this.IDLE_GAP_MINUTES_DEFAULT
+    )
+    if (threshold <= 0) return null
+
+    let lastAssistantTimestamp: number | undefined
+    for (let index = records.length - 1; index >= 0; index--) {
+      const record = records[index]!
+      if (record.role === "assistant") {
+        lastAssistantTimestamp = record.createdAt
+        break
+      }
+    }
+    if (typeof lastAssistantTimestamp !== "number") return null
+
+    const now = options?.now ?? Date.now()
+    const gapMinutes = (now - lastAssistantTimestamp) / 60_000
+    if (!Number.isFinite(gapMinutes) || gapMinutes < threshold) return null
+
+    return { gapMinutes, threshold }
+  }
 
   compactRecords(
     records: readonly ContextTranscriptRecord[],

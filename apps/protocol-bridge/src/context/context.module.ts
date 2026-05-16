@@ -1,13 +1,14 @@
 import { Module } from "@nestjs/common"
-import { TokenCounterService } from "./token-counter.service"
-import { ToolIntegrityService } from "./tool-integrity.service"
 import { ContextAttachmentBuilderService } from "./context-attachment-builder.service"
 import { ContextCompactionService } from "./context-compaction.service"
 import { ContextManagerService } from "./context-manager.service"
 import { ContextProjectionService } from "./context-projection.service"
 import { ContextSummaryService } from "./context-summary.service"
-import { ToolResultCompactionService } from "./tool-result-compaction.service"
+import { ContextTelemetryService } from "./context-telemetry.service"
 import { ContextUsageLedgerService } from "./context-usage-ledger.service"
+import { TokenCounterService } from "./token-counter.service"
+import { ToolIntegrityService } from "./tool-integrity.service"
+import { ToolResultCompactionService } from "./tool-result-compaction.service"
 
 /**
  * Context Module
@@ -21,6 +22,7 @@ import { ContextUsageLedgerService } from "./context-usage-ledger.service"
  * - ContextSummaryService: Structured compaction summary generation
  * - ContextCompactionService: Boundary-based compaction + final hard fit
  * - ContextManagerService: Single orchestration entry point for session and stateless requests
+ * - ContextTelemetryService: Lightweight in-memory event counters for diagnostics
  *
  * Design:
  * - Maintain a canonical transcript or ephemeral transcript state
@@ -35,6 +37,7 @@ import { ContextUsageLedgerService } from "./context-usage-ledger.service"
     ContextAttachmentBuilderService,
     ContextProjectionService,
     ContextSummaryService,
+    ContextTelemetryService,
     ContextUsageLedgerService,
     ContextCompactionService,
     ContextManagerService,
@@ -46,6 +49,7 @@ import { ContextUsageLedgerService } from "./context-usage-ledger.service"
     ContextAttachmentBuilderService,
     ContextProjectionService,
     ContextSummaryService,
+    ContextTelemetryService,
     ContextUsageLedgerService,
     ContextCompactionService,
     ContextManagerService,

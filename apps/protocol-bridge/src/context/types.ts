@@ -134,6 +134,7 @@ export interface ContextProjectionAttachment {
     | "sub_agent"
     | "read_paths"
     | "file_states"
+    | "file_snapshots"
     | "todos"
     | "investigation_memory"
   label: string
