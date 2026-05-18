@@ -112,6 +112,17 @@ function isOpaqueTypeName(typeName) {
   if (SCALAR_TYPES.has(typeName)) return false
   if (typeName.startsWith("map<")) return false
   if (typeName.startsWith("google.")) return false
+  // Minified residue from cursor IDE bundle: types like "d.ho" / "l.C"
+  // where the package segment is a single short identifier (≤ 2 chars).
+  // Real proto packages are multi-segment dotted names like "agent.v1"
+  // or "aiserver.v1.foo"; a top-level segment that short can't be a
+  // legit proto package and is almost certainly a leaked module token
+  // from the IDE's webpack output. Treat as opaque so we don't emit
+  // a phantom `import "d.proto";` line.
+  const firstSegment = typeName.split(".")[0]
+  if (firstSegment && firstSegment.length <= 2) {
+    return true
+  }
   if (/^[a-z]+\.[a-z0-9]+(\.|$)/.test(typeName)) return false
   if (
     /^[A-Za-z_$][\w$]*\.[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)*$/.test(typeName)
