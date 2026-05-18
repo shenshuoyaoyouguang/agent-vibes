@@ -15,6 +15,10 @@ export type {
 } from "./context-attachment-builder.service"
 export { ContextCompactionService } from "./context-compaction.service"
 export type { ContextCompactionResult } from "./context-compaction.service"
+export {
+  ContextHookExecutorService,
+  type PreCompactHookPayload,
+} from "./context-hook-executor.service"
 export { ContextManagerService } from "./context-manager.service"
 export type {
   ReactiveRecoveryOutcome,

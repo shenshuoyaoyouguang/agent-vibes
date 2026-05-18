@@ -77,6 +77,8 @@ import {
   ComputerUseToolCallSchema,
   // ConversationStateStructure
   ConversationStateStructureSchema,
+  ConversationSummaryArchiveSchema,
+  ConversationSummarySchema,
   ConversationTokenDetailsSchema,
   CreatePlanArgsSchema,
   CreatePlanErrorSchema,
@@ -7949,6 +7951,31 @@ export class CursorGrpcService {
         updatedAt: number
         dependencies: string[]
       }>
+      /**
+       * Active conversation-level summary (the most recent committed
+       * boundary). Optional; when absent the IDE falls back to its
+       * own no-summary rendering. Surfaces as
+       * `ConversationStateStructure.summary` (bytes — a serialized
+       * `ConversationSummary{summary}`) and as
+       * `ConversationStateStructure.summary_archive` for legacy
+       * single-archive readers.
+       */
+      activeSummary?: string
+      /**
+       * Full bridge-side compaction history (oldest → newest). Each
+       * entry maps to a serialized `ConversationSummaryArchive` and is
+       * placed into `ConversationStateStructure.summary_archives` so
+       * the IDE chat view can render the entire compaction trail when
+       * the user scrolls back. The bridge does not retain the
+       * pre-compaction message bytes (`summarized_messages` /
+       * `summary_message`) — those fields are intentionally left
+       * empty; the IDE only needs `summary` + `window_tail` for its
+       * "compacted N messages" UI affordance.
+       */
+      compactionHistory?: Array<{
+        summary: string
+        archivedMessageCount: number
+      }>
     }
   ): Buffer {
     // 构建 file_states_v2 (map<string, FileStateStructure>)
@@ -7975,6 +8002,49 @@ export class CursorGrpcService {
       new TextEncoder().encode(t)
     )
 
+    // 构建 summary_archives (repeated bytes) — 把 bridge 自己的
+    // compactionHistory 转成 cursor 协议要求的 ConversationSummaryArchive
+    // 序列化字节。每条 commit 一个 archive 条目；按时间正序（最旧 → 最新）
+    // 推给 IDE，让 IDE 可以按顺序渲染历次压缩。
+    //
+    // window_tail 字段在 cursor 协议里指向"压缩窗口末位的消息序号"——bridge
+    // 端的等价物是 `archivedMessageCount`，两者语义一致：被这个 archive
+    // 吞掉的消息数量。`summarized_messages` 与 `summary_message` 字段
+    // bridge 不保留原始 bytes，按协议留空即可（IDE 端只读时把它们当成
+    // "未持久化原文"，UI 上仍能正常显示 summary 文本）。
+    const compactionHistory = checkpoint.compactionHistory || []
+    const summaryArchivesBytes = compactionHistory.map((entry) => {
+      const archive = create(ConversationSummaryArchiveSchema, {
+        summary: entry.summary,
+        windowTail: Math.max(0, Math.floor(entry.archivedMessageCount || 0)),
+        summarizedMessages: [],
+        summaryMessage: new Uint8Array(),
+      })
+      return toBinary(ConversationSummaryArchiveSchema, archive)
+    })
+
+    // 构建 summary (optional bytes) — 当前 active summary。Cursor 把它
+    // 渲染在 chat 顶部"已压缩 X 条消息"的 banner 上。bridge 没有显式的
+    // active summary 概念，落到最近一次 commit 的 summary 即可（与
+    // ConversationState.summary 字段对齐）。
+    const activeSummaryText = (
+      checkpoint.activeSummary ||
+      compactionHistory[compactionHistory.length - 1]?.summary ||
+      ""
+    ).trim()
+    const summaryBytes = activeSummaryText
+      ? toBinary(
+          ConversationSummarySchema,
+          create(ConversationSummarySchema, { summary: activeSummaryText })
+        )
+      : undefined
+
+    // 同步填 summary_archive (legacy single-archive 字段) ——
+    // 一些旧版 IDE 客户端只读这一个字段，新版读 summary_archives 数组。
+    // 双填保证向后兼容。
+    const latestArchiveBytes =
+      summaryArchivesBytes[summaryArchivesBytes.length - 1] || undefined
+
     // 构建 ConversationStateStructure 并正确填充字段
     const stateStructure = create(ConversationStateStructureSchema, {
       // Token 统计
@@ -8000,6 +8070,13 @@ export class CursorGrpcService {
       turnTimings: turnTimings,
       // self_summary_count
       selfSummaryCount: checkpoint.selfSummaryCount || 0,
+      // summary (active conversation summary, optional bytes)
+      ...(summaryBytes ? { summary: summaryBytes } : {}),
+      // summary_archive (latest archive only — legacy single-archive
+      // field for older IDE clients; new clients read summary_archives)
+      ...(latestArchiveBytes ? { summaryArchive: latestArchiveBytes } : {}),
+      // summary_archives (full compaction trail, oldest → newest)
+      summaryArchives: summaryArchivesBytes,
       // todos (serialized as bytes[])
       todos: (checkpoint.todos || []).map((todo) => {
         const item = create(TodoItemSchema, {

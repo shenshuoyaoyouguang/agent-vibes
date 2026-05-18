@@ -262,18 +262,136 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
 
   CLIENT_SIDE_TOOL_V2_CREATE_PLAN: {
     name: "create_plan",
-    description: "Create an implementation plan for a task",
+    description:
+      "Create an implementation plan for a task. Maps to Cursor's " +
+      "`agent.v1.CreatePlanArgs` proto message. The plan can be a " +
+      "simple linear list (use `steps`) or a richer document with a " +
+      "narrative body (`plan`), an `overview`, scoped `todos`, and " +
+      "named `phases` that group related todos. The IDE persists the " +
+      "result to a `plan_uri` in `~/.cursor/`.",
     input_schema: {
       type: "object",
       properties: {
-        title: { type: "string", description: "Plan title" },
+        title: {
+          type: "string",
+          description:
+            "Plan title (also used as the proto `name` field — it is " +
+            "what the IDE shows in the plan sidebar and uses to name " +
+            "the persisted plan file).",
+        },
+        name: {
+          type: "string",
+          description:
+            "Optional explicit plan name. Falls back to `title` when " +
+            "omitted; usually you only want to set one of them.",
+        },
         steps: {
           type: "array",
-          description: "List of steps",
+          description:
+            "Linear list of step strings. The bridge converts each " +
+            "string into a TodoItem with status=pending. Use `todos` " +
+            "instead when you need explicit ids, dependencies, or " +
+            "non-pending initial status.",
           items: { type: "string" },
         },
+        plan: {
+          type: "string",
+          description:
+            "Optional plan body in Markdown. Renders as the main plan " +
+            "document the user reads in the IDE. Leave empty to fall " +
+            "back to `overview` or `title`.",
+        },
+        overview: {
+          type: "string",
+          description:
+            "Short one-paragraph plan overview surfaced near the top " +
+            "of the plan view.",
+        },
+        is_project: {
+          type: "boolean",
+          description:
+            "When true, the plan is registered as a project-level " +
+            "plan (persisted to the workspace's plan registry). " +
+            "Default false (ephemeral / smoke / tooling plans).",
+        },
+        todos: {
+          type: "array",
+          description:
+            "Optional explicit TodoItem list. Each item supports the " +
+            "same shape as `update_todos` (id / content / status / " +
+            "dependencies / createdAt / updatedAt). When provided, " +
+            "this fully replaces what would have been generated from " +
+            "`steps`. Status enum: pending / in_progress / completed " +
+            "/ cancelled.",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string", description: "Stable todo id." },
+              content: {
+                type: "string",
+                description: "Human-readable todo text.",
+              },
+              status: {
+                type: "string",
+                description:
+                  "Todo status enum (pending / in_progress / " +
+                  "completed / cancelled).",
+              },
+              dependencies: {
+                type: "array",
+                description: "Optional upstream todo ids this depends on.",
+                items: { type: "string" },
+              },
+              createdAt: {
+                type: "string",
+                description: "Optional creation timestamp (unix ms).",
+              },
+              updatedAt: {
+                type: "string",
+                description: "Optional update timestamp (unix ms).",
+              },
+            },
+            required: ["id", "content", "status"],
+          },
+        },
+        phases: {
+          type: "array",
+          description:
+            "Optional list of phases. Each phase has a `name` and " +
+            "its own scoped `todos[]` (same TodoItem shape as the " +
+            "top-level `todos`). Use phases when the plan splits " +
+            "into clear stages (e.g. `Discovery` / `Implementation` " +
+            "/ `Verification`); the IDE renders each phase as a " +
+            "separate section.",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string", description: "Phase name." },
+              todos: {
+                type: "array",
+                description: "Todos scoped to this phase.",
+                items: {
+                  type: "object",
+                  properties: {
+                    id: { type: "string" },
+                    content: { type: "string" },
+                    status: { type: "string" },
+                    dependencies: {
+                      type: "array",
+                      items: { type: "string" },
+                    },
+                    createdAt: { type: "string" },
+                    updatedAt: { type: "string" },
+                  },
+                  required: ["id", "content", "status"],
+                },
+              },
+            },
+            required: ["name"],
+          },
+        },
       },
-      required: ["title", "steps"],
+      required: ["title"],
     },
   },
 
@@ -798,6 +916,16 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
             required: ["prompt"],
           },
         },
+        run_async: {
+          type: "boolean",
+          description:
+            "When true, the IDE returns an async placeholder " +
+            "(`AskQuestionResult.async`) immediately and the agent " +
+            "turn ends; the user's actual answer is delivered later " +
+            "as an `AsyncAskQuestionCompletionAction` ConversationAction. " +
+            "When false (default), the tool call blocks until the " +
+            "user answers and returns `AskQuestionResult.success`.",
+        },
       },
       required: [],
     },
@@ -841,7 +969,13 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
         },
         run_async: {
           type: "boolean",
-          description: "Whether to run asynchronously",
+          description:
+            "When true, the IDE returns an async placeholder " +
+            "(`AskQuestionResult.async`) immediately and the agent " +
+            "turn ends; the user's actual answer is delivered later " +
+            "as an `AsyncAskQuestionCompletionAction` ConversationAction. " +
+            "When false (default), the tool call blocks until the " +
+            "user answers and returns `AskQuestionResult.success`.",
         },
       },
       required: [],

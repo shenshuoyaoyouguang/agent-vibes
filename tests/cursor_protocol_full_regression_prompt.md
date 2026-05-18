@@ -55,7 +55,7 @@ trace 文件不允许出现在仓库工作树内。如果在 `apps/**/.log/`、`
 
 ## 完整覆盖清单（不得删减）
 
-执行任务时必须覆盖或判定以下清单。状态只能是 `pass | failed | unavailable | not_directly_invokable`。如果某项没有被真实触发，必须写清楚原因，不能因为任务分组里没有单独步骤就遗漏。
+执行任务时必须覆盖或判定以下清单。状态使用 5 态：`pass | failed | unavailable | not_directly_invokable | not_observed`。如果某项没有被真实触发，必须在 gap 列写清楚原因，不能因为任务分组里没有单独步骤就遗漏。
 
 ### A. AgentClientMessage / AgentServerMessage
 
@@ -81,31 +81,36 @@ trace 文件不允许出现在仓库工作树内。如果在 `apps/**/.log/`、`
 9. `generateImageRequestQuery` ↔ `generateImageRequestResponse`
 10. `replaceEnvArgs` ↔ `replaceEnvResult`
 
-### D. ToolCall.tool（当前 45 项）
+### D. 工具家族总表（ToolCall.tool 45 项 + Mapper user-facing 名）
 
-必须逐项触发或判定：
+每一个 mapper 暴露的工具名都映射到 `agent.v1.ToolCall.tool` 的某个 proto oneof case。
+不再要求逐项独立列；按下表分组覆盖即可，每组只需要：
+**该家族的工具是否真被调用过 + 对应 proto case 是否在 trace 中观察到**。
 
-- `shellToolCall`、`deleteToolCall`、`globToolCall`、`grepToolCall`、`readToolCall`、`updateTodosToolCall`、`readTodosToolCall`、`editToolCall`
-- `lsToolCall`、`readLintsToolCall`、`mcpToolCall`、`semSearchToolCall`、`createPlanToolCall`、`webSearchToolCall`、`taskToolCall`
-- `listMcpResourcesToolCall`、`readMcpResourceToolCall`、`applyAgentDiffToolCall`、`askQuestionToolCall`、`fetchToolCall`、`switchModeToolCall`
-- `generateImageToolCall`、`recordScreenToolCall`、`computerUseToolCall`、`writeShellStdinToolCall`、`reflectToolCall`、`setupVmEnvironmentToolCall`
-- `truncatedToolCall`、`startGrindExecutionToolCall`、`startGrindPlanningToolCall`、`webFetchToolCall`、`reportBugfixResultsToolCall`
-- `aiAttributionToolCall`、`prManagementToolCall`、`mcpAuthToolCall`、`awaitToolCall`、`blameByFilePathToolCall`、`getMcpToolsToolCall`
-- `reportBugToolCall`、`setActiveBranchToolCall`、`communicateUpdateToolCall`、`sendFinalSummaryToolCall`、`updatePrCodeTourToolCall`
-- `replaceEnvToolCall`、`editPrLabelsToolCall`。
+| Family                 | ToolCall.tool proto case                                                                                                                                                                                             | User-facing 工具名                                                                                                                                            |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| filesystem.read        | `readToolCall`、`lsToolCall`、`globToolCall`                                                                                                                                                                         | `read_file`、`read_file_v2`、`list_directory`、`list_dir`、`glob_search`、`file_search`、`view_image`                                                         |
+| filesystem.write       | `editToolCall`、`deleteToolCall`                                                                                                                                                                                     | `edit_file`、`edit_file_v2`、`delete_file`、`apply_patch`、`reapply`                                                                                          |
+| shell                  | `shellToolCall`、`writeShellStdinToolCall`                                                                                                                                                                           | `run_terminal_command`、`run_terminal_command_v2`、`background_shell_spawn`、`write_shell_stdin`                                                              |
+| search.code            | `grepToolCall`、`semSearchToolCall`                                                                                                                                                                                  | `grep_search`、`semantic_search`、`deep_search`、`read_semsearch_files`、`search_symbols`、`go_to_definition`                                                 |
+| diagnostics            | `readLintsToolCall`                                                                                                                                                                                                  | `read_lints`、`fix_lints`                                                                                                                                     |
+| planning + todos       | `createPlanToolCall`、`updateTodosToolCall`、`readTodosToolCall`                                                                                                                                                     | `create_plan`、`create_diagram`、`update_todos`、`read_todos`                                                                                                 |
+| network                | `webSearchToolCall`、`webFetchToolCall`、`fetchToolCall`                                                                                                                                                             | `web_search`、`web_fetch`、`fetch`、`exa_search`、`exa_fetch`、`knowledge_base`                                                                               |
+| mcp                    | `mcpToolCall`、`listMcpResourcesToolCall`、`readMcpResourceToolCall`、`getMcpToolsToolCall`、`mcpAuthToolCall`                                                                                                       | `mcp_tool`、`list_mcp_resources`、`read_mcp_resource`、`get_mcp_tools`、`mcp_auth`                                                                            |
+| sub-agent + background | `taskToolCall`、`awaitToolCall`                                                                                                                                                                                      | `task`、`await_task`、`await`、`wait_agent`、`kill_agent`、`spawn_agent`、`resume_agent`、`close_agent`、`send_input`、`background_composer_followup`         |
+| IDE-integration        | `askQuestionToolCall`、`switchModeToolCall`、`applyAgentDiffToolCall`、`generateImageToolCall`、`recordScreenToolCall`、`computerUseToolCall`、`reflectToolCall`、`setupVmEnvironmentToolCall`、`replaceEnvToolCall` | `ask_question`、`switch_mode`、`apply_agent_diff`、`generate_image`、`record_screen`、`computer_use`、`reflect`、`setup_vm_environment`、`request_user_input` |
+| project + rules        | —                                                                                                                                                                                                                    | `read_project`、`update_project`、`fetch_rules`                                                                                                               |
+| PR / VCS               | `prManagementToolCall`、`blameByFilePathToolCall`、`setActiveBranchToolCall`、`updatePrCodeTourToolCall`、`editPrLabelsToolCall`                                                                                     | `fetch_pull_request`、`ai_attribution`                                                                                                                        |
+| reporting              | `reportBugfixResultsToolCall`、`reportBugToolCall`、`communicateUpdateToolCall`、`sendFinalSummaryToolCall`                                                                                                          | `report_bugfix_results`                                                                                                                                       |
+| grind                  | `startGrindExecutionToolCall`、`startGrindPlanningToolCall`                                                                                                                                                          | `start_grind_execution`、`start_grind_planning`                                                                                                               |
+| 协议占位               | `truncatedToolCall`                                                                                                                                                                                                  | — （仅作为 size-guard 兜底；trace 里看到即视为 gap）                                                                                                          |
 
-### E. Mapper 暴露的 user-facing 工具名
+要求：
 
-除了 proto case，还要尽量覆盖或判定当前 mapper 暴露的工具名：
-
-- `read_file`、`list_directory`、`edit_file`、`edit_file_v2`、`file_search`、`glob_search`、`grep_search`、`semantic_search`
-- `deep_search`、`read_semsearch_files`、`run_terminal_command`、`delete_file`、`web_search`、`web_fetch`、`fetch`、`create_plan`
-- `task`、`read_todos`、`update_todos`、`reapply`、`fetch_rules`、`search_symbols`、`go_to_definition`、`background_composer_followup`
-- `knowledge_base`、`fetch_pull_request`、`create_diagram`、`fix_lints`、`await_task`、`read_project`、`update_project`、`mcp_tool`
-- `read_lints`、`ask_question`、`switch_mode`、`list_mcp_resources`、`read_mcp_resource`、`get_mcp_tools`、`exa_search`、`exa_fetch`
-- `setup_vm_environment`、`apply_agent_diff`、`generate_image`、`report_bugfix_results`、`background_shell_spawn`、`write_shell_stdin`
-- `record_screen`、`reflect`、`ai_attribution`、`await`、`mcp_auth`、`start_grind_execution`、`start_grind_planning`、`computer_use`
-- `request_user_input`、`apply_patch`、`view_image`、`spawn_agent`、`send_input`、`resume_agent`、`wait_agent`、`close_agent`。
+- 每个 family 至少有一项工具被真实调用过，对应 proto case 在 trace 中可被观察。
+- 没暴露的工具记 `not_directly_invokable`；暴露但本轮未调用记 `not_observed`。
+- 出现 `truncatedToolCall` 即视为 inner tool 镜像或 size-guard 异常，记为 gap。
+- 任何 user-facing 工具与 proto case 之间的具体映射，由 trace 的 `topCase/nestedCase` 事实决定，**不要靠脑补**。
 
 ### F. ConversationAction / background 状态机
 
@@ -164,29 +169,86 @@ trace 文件不允许出现在仓库工作树内。如果在 `apps/**/.log/`、`
 
 ### 任务 4：任务状态与计划
 
-调用客户端可见工具完成以下目标：
+`agent.v1` 协议里 `create_plan` 与 `update_todos` / `read_todos` 是两个独立子系统，
+但在用户 surface 上经常被混用，必须分别覆盖各自完整 schema，不要只跑一对最小调用。
 
-1. 用 `update_todos` 初始化一个 todo 列表，包含两类条目：
-   - 协议覆盖项：保留 `proto-smoke-todo-1`、`proto-smoke-todo-2` 两条固定 id（用于覆盖 `update_todos` / `read_todos` / `updateTodosToolCall` / `readTodosToolCall`），状态可任意；
-   - 执行追踪项：为剩余任务 5..10 各创建一条独立 todo（建议 id `task-5` ... `task-10`，content 写明任务名），初始 status 全部 `pending`。
-2. 用 `read_todos` 读回完整列表，确认两类条目都在。
-3. 用 `create_plan` 创建一份计划，标题包含 `Cursor Protocol Smoke Regression`，
-   `steps` 至少 6 条，与任务 5..10 一一对应，**不要把多个任务合并成一条**；
-   `create_plan` 协议层不支持后续状态回写，这里只承担"全景概要 + 协议闭环"职责。
-4. 之后每完成一个任务（或确认失败、不可用），立即用 `update_todos` 把对应 `task-N`
-   的 status 改为 `completed` / `failed` / `cancelled`，必要时更新 `content` 写入失败原因。
-5. 任务 10 输出最终报告时，附上 todo 终态摘要（每条 id + 终态）。
+#### 4a. `update_todos` / `read_todos` —— Todo 子系统完整覆盖
 
-验收：
+`UpdateTodosArgs` 协议字段：
 
-- `create_plan` 调用成功，至少观察到一对 `createPlanRequestQuery` / `createPlanRequestResponse`；
-- `update_todos` 至少被调用 2 次（初始化 + 至少 1 次状态回写）；不允许只写一次后再不更新；
-- 最终 todo 列表能准确反映任务 5..10 的真实结果，包含 hard failure；
-- 计划创建后必须继续执行后续任务，不能提前结束。
+- `todos: TodoItem[]` —— 每个 TodoItem 有 `id`、`content`、`status`
+  (`pending`/`in_progress`/`completed`/`cancelled`)、`created_at`、`updated_at`、
+  **`dependencies: string[]`**（依赖的其它 todo id 列表）。
+- `merge: bool` —— **关键 flag**：`false` 时整列覆盖（替换全部 todos），`true` 时按 id 增量合并（已有 id 更新、新 id 追加、未提及的保留）。
 
-注意：`create_plan` 在 `agent.v1` 协议中只有 `CreatePlanArgs`（title + steps）和
-`CreatePlanResult`（success/error 二选一），**没有任何状态回写字段**。
-不要试图通过反复调用 `create_plan` 来"更新"计划状态；状态机职责完全由 `update_todos` 承担。
+`ReadTodosArgs` 协议字段：
+
+- `status_filter: TodoStatus[]` —— 只返回这些状态的 todo（空数组 = 全部）。
+- `id_filter: string[]` —— 只返回这些 id 的 todo（空数组 = 全部）。
+
+执行步骤：
+
+1. **初始化（merge=false）**：用 `update_todos` 一次性写入完整列表。包含两类条目：
+   - 协议覆盖项：`proto-smoke-todo-1`、`proto-smoke-todo-2` 两条固定 id；
+   - 执行追踪项：为任务 5..10 各创建一条 todo，id 用 `task-5` ... `task-10`，初始 status 全部 `pending`。
+   - 至少**一条 todo 设置非空 `dependencies`**（例如 `task-10` 依赖 `task-5..task-9`），覆盖该字段。
+2. **read_todos 全量读回**：不传 filter，确认 8 条 todo 都在。
+3. **read_todos with `status_filter=[pending]`**：覆盖 status_filter；返回的 todos 都应是 pending。
+4. **read_todos with `id_filter=["proto-smoke-todo-1", "task-5"]`**：覆盖 id_filter；返回 2 条。
+5. **增量合并写入（merge=true）**：用 `update_todos(merge=true, todos=[{id:"task-5", status:"in_progress"}])`
+   把 `task-5` 改 `in_progress`，**只传一条**而不是整列。验收返回的 `UpdateTodosSuccess.was_merge=true`，
+   且 read_todos 全量读回时其它 7 条 todo 仍然在。
+6. **任务执行期间**：每完成一个任务（或确认 failed / unavailable），立即用 `update_todos(merge=true)`
+   更新对应 `task-N` 的 status 与（必要时）content（写入失败原因）。
+
+#### 4b. `create_plan` —— Plan 子系统完整覆盖
+
+`CreatePlanArgs` 协议字段：
+
+- `plan: string` —— plan 主体文本（Markdown），**不是简单的 title**。
+- `todos: TodoItem[]` —— plan 关联的 flat todo 列表（与 `update_todos` 共用 schema，但作用域是 plan 内）。
+- `overview: string` —— plan 概述。
+- `name: string` —— plan 名称（IDE 用于侧栏 / `plan_uri` 命名）。
+- `is_project: bool` —— 是否项目级 plan（影响 IDE 持久化范围）。
+- `phases: Phase[]` —— **嵌套**：每个 Phase 有 `name` + 自己的 `todos[]`；用于把 plan 分成阶段。
+
+`CreatePlanResult` 字段：
+
+- `success` / `error` 二选一；
+- 顶层 `plan_uri: string` —— IDE 持久化后的 plan 文件 URI（即使 success=空也会回这个）。
+
+执行步骤：
+
+1. 调一次 `create_plan`，**必须**填齐：
+   - `name="Cursor Protocol Smoke Regression"`；
+   - `overview` 至少一句话描述本轮任务范围；
+   - `plan` 用 Markdown，体现任务 5..10 的实际范围；
+   - `phases` 至少 2 个（例如 `Read-only checks` / `Write & integration`），每个 phase 各嵌至少 2 条 todo；
+   - `todos` 顶层至少 6 条，与任务 5..10 一一对应，**不要把多个任务合并成一条**；
+   - `is_project=false`（smoke 测试，不要污染项目级 plan 注册表）。
+2. 验收：
+   - 至少观察到一对 `createPlanRequestQuery` / `createPlanRequestResponse`；
+   - response 里 `result.success` 命中 + `plan_uri` 非空；
+   - `plan_uri` 指向的文件**不在仓库工作树内**（应该在 `~/.cursor/` 或 IDE 临时目录）。
+
+注意：`create_plan` 协议层**没有**状态回写字段（只能 create 一次）。
+状态机职责完全由 `update_todos(merge=true)` 承担。**禁止**反复调 `create_plan` 假装在更新。
+
+#### 4c. 验收（汇总）
+
+- `update_todos` 至少被调用 4 次：1 次初始化（merge=false）+ 1 次 merge=true 试探 + 至少 2 次任务进度回写；
+- `read_todos` 至少被调用 3 次（无 filter / status_filter / id_filter 各一次）；
+- `create_plan` 调一次，response 含非空 `plan_uri`；
+- 最终 todo 列表准确反映任务 5..10 真实结果（含 hard failure），任务 10 输出 todo 终态摘要；
+- trace 中能看到 `updateTodosToolCall`、`readTodosToolCall`、`createPlanToolCall` 三个 proto case；
+- trace 中至少观察到一对 `createPlanRequestQuery` / `createPlanRequestResponse` interaction。
+
+#### 4d. 可选 `StartPlanAction` / `ExecutePlanAction`（仅观察，不主动触发）
+
+`StartPlanAction` 与 `ExecutePlanAction` 是 IDE 端从 plan 模式 kickoff agent 的状态机，
+**不是 user-facing 工具**——agent 自己派发不到。如果 trace 中观察到（例如用户从 IDE plan 模式启动了本次会话），
+在 Coverage Checklist Summary 里记录为 pass；否则记 `not_observed: not user-invokable from this surface`，
+不算 gap。
 
 ### 任务 5：诊断、项目与规则类只读能力
 
@@ -224,10 +286,46 @@ trace 文件不允许出现在仓库工作树内。如果在 `apps/**/.log/`、`
 
 ### 任务 8：子代理 / 后台 / stdin 能力
 
-调用客户端可见工具完成以下目标：如果暴露了 `task` 或子代理工具，就委托一个最小子任务概括 `<SMOKE>` 当前状态，
-并在返回 task id 时用 `await_task` 或 `await` 等当前可见等待工具等待完成；
-再用 `background_shell_spawn` 或可见后台命令能力运行一个**长寿命**命令观察是否进入 background；
-推荐用 `read -r line; echo "got: $line"` 或 `sleep 60` 这种会**阻塞等待**的脚本，
+子代理（`task`）和后台 shell + stdin 是两个独立子系统，分两段执行。
+
+#### 任务 8a：子代理生命周期
+
+只要客户端 surface 上有 `task` 工具就必须执行，**不能因为"概要任务"听上去随意就跳过**。
+
+子代理覆盖清单（按"最小自洽"原则各跑一次，能合并就合并，不要为了凑覆盖反复 spawn）：
+
+1. **Foreground sub-agent — 4 个内置类型**：`general-purpose` / `explore` / `browser` / `bash` 各派发**一个**最小调用。建议任务都很轻：
+   - general-purpose：用 `grep_search` 在某个仓库内文件搜某个字面量，返回命中数；
+   - explore：用 `read_file` 读某个仓库内文件的若干行；
+   - browser：用 `web_fetch` 抓 Cursor 官方文档/定价页（**禁止 example.\* 域名**），返回 title；
+   - bash：用 `run_terminal_command` 跑 `pwd && date`，原样贴回 stdout。
+     验收 sub-agent 在父任务气泡内**渲染了 inner tool 调用**（IDE 气泡里能看到 nested tool name，**不是 `[Tool: truncatedToolCall]`**），sub-agent 拿到的 brief 是 `prompt` 字段而不是 UI label `description`。
+2. **Background sub-agent**：`task(run_in_background=true, subagent_type=...)` 派发一个最小任务，立即拿到 `agentId`。
+   - 用 `await_task` 真实阻塞等到完成，确认终态 `status=completed`、`turnCount/toolCallCount/durationMs` 都有数；
+   - 检查 transcript / metadata / result 三件套落盘到 `~/.cursor/subagents/<agentId>/`，
+     确认 `metadata.json` 里 `conversationSteps[]` 持续累积、proto oneof 渲染为具体 case
+     （如 `grepToolCall`、`shellToolCall`），而不是 `truncatedToolCall`。
+3. **Kill 路径**：再 spawn 一个**会跑很久**的 background sub-agent（多步真实工具调用，
+   禁止靠"无意义循环"骗时间——sub-agent 系统级 prompt 会拒绝），等它进入 `running` 后调
+   `kill_agent` / `wait_agent` 等可见 kill 工具。验收 worker 在 abort checkpoint 停下，
+   `metadata.status="killed"`、`errorMessage="aborted by registry"`，**不是 `failed`**。
+4. **Custom agent**（可选）：如果项目根 `.cursor/agents/*.md` 有自定义 agent 定义，至少派发一次确认 `SubagentRegistryService` 能挂上来；没有则记 `not_observed`。
+
+验收要点（汇总）：
+
+- parent task tool 不重复结算；没有 pending 泄漏；inner tool 调用 case 都正确渲染；
+- transcript JSONL / metadata JSON 文件都在预期路径下，不污染仓库工作树；
+- BigInt 字段（`conversationSteps[]` 内嵌的 ToolCall envelope）**不抛 `Do not know how to serialize a BigInt`**；
+- Sub-agent 内 `run_terminal_command` 通过 bridge 进程内 `child_process.spawn` 直跑，
+  **不是**通过 `ExecServerMessage{shellArgs}` 走 IDE（这是当前临时方案；trace 里相应 toolCall
+  的 family 是 `shellToolCall` 但**没有对应 ExecServerMessage**——这是预期，不是 gap）。
+
+如果 surface 上没有 `task` 工具，记 `unavailable: task tool not exposed in this client surface`，不要伪造调用。
+
+#### 任务 8b：后台 shell + stdin
+
+用 `background_shell_spawn` 或可见后台命令能力运行一个**长寿命**命令观察是否进入 background；
+推荐 `read -r line; echo "got: $line"` 或 `sleep 60` 这种会**阻塞等待**的脚本，
 确保后续 `write_shell_stdin` 探测到达时进程还活着。
 
 只有当真实返回可用 shellId 时，才用 `write_shell_stdin` 向该 shell 写入 stdin；不要为了覆盖而伪造 shellId 或重复调用。
@@ -238,7 +336,52 @@ trace 文件不允许出现在仓库工作树内。如果在 `apps/**/.log/`、`
 
 ### 任务 9：可选 IDE/外部集成能力
 
-根据当前客户端可见工具面做最小安全调用或判定：如果暴露了 `ask_question`、`switch_mode`、`apply_agent_diff`、`generate_image`、
+`ask_question` 协议复杂度（多种 result 形态、run_async 异步路径）跟其它 IDE 集成工具不是一个量级，
+分两段执行。
+
+#### 9a. `ask_question` —— 用户交互完整覆盖
+
+`AskQuestionArgs` 协议字段：
+
+- `title: string` —— 整个对话框标题；
+- `questions: Question[]` —— 可以**一次问多个问题**，每个 Question 有：
+  - `id` —— 用于答案回写时关联；
+  - `prompt` —— 问题文本；
+  - `options: Option[]` —— 预设选项列表，每个 Option 有 `id` + `label`；
+  - `allow_multiple: bool` —— 是否允许多选；
+- `run_async: bool` —— **关键 flag**：true 时 IDE 立即回 `AskQuestionResult.async`，agent turn 结束；
+  用户后续回答通过 `AsyncAskQuestionCompletionAction` 异步回送，不在原 tool call 同步 result 里；
+- `async_original_tool_call_id: string` —— 异步路径的关联 id。
+
+`AskQuestionResult` 4 态 oneof：
+
+- `success: AskQuestionSuccess` —— 包含 `Answer[]`，每个 Answer 有 `question_id` + `selected_option_ids[]` + `freeform_text`；
+- `error: AskQuestionError` —— 协议错（不要把用户拒答记成 error）；
+- `rejected: AskQuestionRejected` —— **用户主动拒答**（关闭对话框 / 跳过），有 `reason` 字段；
+- `async: AskQuestionAsync` —— `run_async=true` 时 IDE 占位返回，等 `asyncAskQuestionCompletionAction`。
+
+执行步骤（按可见 surface 的 ask 工具实参格式调整 — 协议形状不变）：
+
+1. **同步单选 + 预设选项**：调一次 `ask_question`，1 个 question，3 个 option，`allow_multiple=false`，`run_async=false`。
+   验收 `AskQuestionResult.success`，answers[0].selected_option_ids 长度 = 1。
+2. **同步多选 + 自由文本**：再调一次，`allow_multiple=true`，引导用户多选并填 freeform_text。
+   验收 `selected_option_ids.length >= 2` 且 `freeform_text` 非空。
+3. **多 question 一次性问**：再调一次，questions 至少 2 个，覆盖 IDE 同时渲染多个问题的能力。
+   验收 answers 数组长度等于 questions 数量。
+4. **`run_async=true` 异步路径**（如果 surface 暴露这个 flag）：调一次 `run_async=true`，
+   验收：
+   - 原 tool call 同步 result 是 `AskQuestionResult.async`（**不是 success**），agent turn 立即结束；
+   - trace 中后续观察到一个 `ConversationAction.asyncAskQuestionCompletionAction`，里面带 `original_tool_call_id`、`original_args`、`result`；
+   - `result` 命中 `success` / `rejected` 之一，**不是再嵌套 async**。
+5. **`rejected` 路径**（可选，依赖用户配合）：调一次后由用户**主动关闭/跳过对话框**。
+   验收 result 是 `rejected`，且 `reason` 非空。
+
+如果 surface 上 `ask_question` 不暴露 `run_async` / 多 question / freeform_text 等高级字段，
+分别记 `not_directly_invokable: <字段名>` 并继续测试其它字段；不要硬凑参数让 surface 校验报错。
+
+#### 9b. 其它 IDE / 外部集成能力
+
+根据当前客户端可见工具面做最小安全调用或判定：如果暴露了 `switch_mode`、`apply_agent_diff`、`generate_image`、
 `record_screen`、`computer_use`、`fetch_pull_request`、`report_bugfix_results`、`ai_attribution`、`setup_vm_environment`、`mcp_auth` 等工具，
 则各尝试一次最小安全用例；写入类能力只能作用于 `<SMOKE>` 或安全占位。
 不要为了覆盖而硬造 PR、图片、VM、shellId 或外部状态；未暴露的工具记为 `not_directly_invokable`。
@@ -249,7 +392,7 @@ trace 文件不允许出现在仓库工作树内。如果在 `apps/**/.log/`、`
 - `report_bugfix_results`：必须传至少 1 项 dummy result（例如 `[{ "id": "smoke-probe", "status": "nop" }]`），传空数组会被入参校验拒绝。
 - `setup_vm_environment`：当前桥已经从 user-facing surface 移除该工具（mapper 不再暴露）。如果客户端 surface 上看不到它，记 `not_directly_invokable`，**不要硬调**；如果意外能调到，按实际后端响应记录。
 
-验收：每项记录 `pass/unavailable/not_directly_invokable/failed` 与原因。
+验收：每项记录 `pass / unavailable / not_directly_invokable / failed` 与原因。
 
 ### 任务 10：收集证据并输出报告
 
@@ -269,10 +412,10 @@ trace 文件不允许出现在仓库工作树内。如果在 `apps/**/.log/`、`
 
 ### Task Results
 
-用 Markdown 列表或表格概述 10 个任务。每项至少包含：
+用 Markdown 列表或表格概述 10 个任务（任务 8 拆为 8a / 8b 共 11 行）。每项至少包含：
 
 - 任务编号和任务名称
-- 状态：`pass | failed | unavailable | not_directly_invokable`
+- 状态：`pass | pass_with_gaps | failed | unavailable | not_directly_invokable`
 - 任务意图
 - 期望使用的客户端可见工具
 - 实际触发的客户端工具
@@ -285,10 +428,10 @@ trace 文件不允许出现在仓库工作树内。如果在 `apps/**/.log/`、`
 
 ### Tool Call Log
 
-用 Markdown 列表或表格按实际调用顺序列出关键工具，不需要 45 行全量矩阵。这里的工具名必须来自客户端实际发起的调用或 trace，不要补写未真实调用的工具。每项至少包含：
+用 Markdown 列表或表格按实际调用顺序列出本轮真实发起过的工具调用。**不要补写未真实调用的工具**——那些项目在 Coverage Checklist Summary 里以 `not_observed` / `unavailable` / `not_directly_invokable` 体现即可。每项至少包含：
 
 - 工具名
-- 状态：`pass | failed | unavailable | not_directly_invokable`
+- 状态：`pass | failed`（实际调过的工具只可能这两态）
 - 可见结果摘要
 - trace 关联信息：`callId`、`id`、`execId` 或 `not_observed`
 
@@ -313,21 +456,28 @@ trace 文件不允许出现在仓库工作树内。如果在 `apps/**/.log/`、`
 
 按完整覆盖清单 A-H 分组列出所有项目状态。覆盖状态必须来自真实调用客户端可见工具后的 trace、可见副作用或明确不可用原因；禁止为了让某项变成 pass 而事后硬调用 proto oneof、Exec/Interaction case、mapper 内部别名或未暴露工具名。
 
-用标准 Markdown 列表、嵌套列表或表格组织覆盖结果。每个覆盖项至少包含：
+判定状态使用 5 态：
 
-- 分组名称
-- 项目名称
-- 状态：`pass | failed | unavailable | not_directly_invokable`
-- 证据来源：trace、工具返回、可见副作用或 `not_observed`
-- gap；没有则写 `none`
+- `pass` —— 真实触发并在 trace / 副作用中观察到
+- `failed` —— 真实触发但返回错误或行为不符预期
+- `unavailable` —— 客户端 surface 未暴露、外部依赖（MCP/PR/VM/网络）缺失或环境受限
+- `not_directly_invokable` —— 协议级 case，没有对应 user-facing 工具入口（如 `truncatedToolCall` size-guard）
+- `not_observed` —— 工具存在且 surface 暴露，但本轮任务没派发到（必须在 gap 列说明原因）
+
+为了避免 60 行散点列表，每个分组用**单张表格**组织，表头固定为：`项目 | 状态 | 证据 | gap`。
+不允许用一行 "all pass" 蒙混过关——分组内若存在非 pass 项，必须逐项列出。
 
 要求：
 
-- ToolCall.tool 必须 45 项全列出。
-- InteractionQuery/Response 必须 10 对全列出。
-- ExecServerMessage、ExecClientMessage、Exec control 必须全列出。
-- ConversationAction、InteractionUpdate、AgentClientMessage、AgentServerMessage、aiserver RPC 必须全列出。
-- Mapper user-facing 工具名必须全列出或归并到对应 proto case，但归并时必须写 `mapped_to=<proto/tool case>`，不能静默省略。
+- A (AgentClientMessage / AgentServerMessage)：14 个 case 全列出。
+- B (InteractionUpdate)：21 个 case 全列出。
+- C (InteractionQuery / Response)：10 对全列出。
+- D (工具家族总表)：14 个 family 全列出，每行附 `proto cases pass / 总数`、`user-facing tools pass / 总数`、聚合状态；gap 列必须写明本 family 内未 pass 的具体项目。**禁止**用单行 "all pass" 蒙混过关。
+- F (ConversationAction)：13 个 case 全列出。
+- G (ExecServerMessage 24 项 / ExecClientMessage 24 项 / Exec control 4 项)：分 3 张表全列出。
+- H (aiserver RPC)：8 个 RPC 全列出。
+
+任何 user-facing 工具与 proto case 之间的具体映射，由 trace 的 `topCase/nestedCase` 事实决定，**不要靠脑补**；不确定的项标 `not_observed`，并在 gap 列写为何没观察到（如"工具未暴露"、"任务未派发"）。
 
 ### Gaps / Unavailable
 

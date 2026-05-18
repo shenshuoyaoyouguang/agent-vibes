@@ -14,6 +14,8 @@ import * as path from "path"
 import * as os from "os"
 import {
   type ContextAttachmentSnapshot,
+  type ContextCompactionResult,
+  ContextHookExecutorService,
   type ContextInvestigationMemoryEntry,
   ContextManagerService,
   type ContextUsageSnapshot,
@@ -21,6 +23,7 @@ import {
   extractText,
   type LooseMessageContent,
   normalizeToolProtocolMessages,
+  type PreCompactHookPayload,
   TokenCounterService,
   ToolIntegrityService,
   UnifiedMessage,
@@ -893,7 +896,8 @@ export class CursorConnectStreamService {
     private readonly subagentExecBridge: SubagentExecBridgeService,
     private readonly subagentBackgroundWorker: SubagentBackgroundWorker,
     private readonly subagentTaskRegistry: SubagentTaskRegistry,
-    private readonly subagentTranscriptStore: SubagentTranscriptStore
+    private readonly subagentTranscriptStore: SubagentTranscriptStore,
+    private readonly contextHookExecutor: ContextHookExecutorService
   ) {
     // Register provider adapter cleanup on session expiry/deletion.
     // This ensures provider resources (Codex WS connections, warmup caches) are released.
@@ -1562,6 +1566,161 @@ export class CursorConnectStreamService {
     this.logger.log(
       `Cancel action finalized ${pendingIds.length} pending tool call(s) on current stream`
     )
+    return true
+  }
+
+  /**
+   * Handle a `ConversationAction.summarizeAction` from the IDE.
+   *
+   * The IDE fires this when the user explicitly asks to summarise the
+   * conversation (Composer's "Summarise Conversation" command-palette
+   * entry). The proto message itself is empty — it is purely a control
+   * signal. The bridge owns the actual compaction algorithm
+   * (`ContextManagerService.manualCompact` → `ContextCompactionService`),
+   * so the IDE has no state to send; it just delegates the trigger.
+   *
+   * Pipeline:
+   *   1. Resolve the session and its compaction-relevant state.
+   *   2. Run the bridge's manual compaction with a tight synthetic
+   *      budget so the planner always commits a boundary even when
+   *      the transcript is comfortably below the model's context cap.
+   *      This matches what the dashboard `Post /api/context/compact`
+   *      does for the Diagnostics tab.
+   *   3. If a commit lands, queue the summary into
+   *      `pendingContextSummaryUiUpdate` so the next outbound frame
+   *      window streams summaryStarted → summaryUpdate(text) →
+   *      summaryCompleted to the IDE. We yield those three frames
+   *      eagerly here too so the user sees the summary appear without
+   *      waiting for the next user turn.
+   *   4. If the planner returned no progress (transcript too small to
+   *      compact), we silently bail — the user will see nothing change
+   *      in the IDE, which matches the dashboard endpoint's behaviour.
+   *
+   * Returns `true` to mean "this control message ended the BiDi window";
+   * the parent dispatcher will close the response stream after we
+   * return.
+   *
+   * Architectural note: cursor IDE itself has its own `summarizeAction`
+   * handler that runs in `cursor-agent-exec` (the official agent
+   * runtime). When that runtime is in charge it does its own compaction
+   * and emits its own summary lifecycle. In the agent-vibes deployment
+   * cursor-agent-exec is bypassed (the bridge is the agent runtime),
+   * so we own the entire compaction pipeline here. This is the
+   * "client-has-it-bridge-skips, client-doesnt-bridge-handles" rule
+   * applied to compaction: the bridge only fires when nobody else owns
+   * the conversation's transcript.
+   */
+  private async *handleConversationSummarizeAction(
+    conversationId: string
+  ): AsyncGenerator<Buffer, boolean> {
+    const session = this.sessionManager.getSession(conversationId)
+    if (!session) {
+      this.logger.warn(
+        `Summarize action received for unknown conversation: ${conversationId}`
+      )
+      return true
+    }
+
+    // The IDE-driven "summarise now" flow expects a fresh boundary
+    // commit even when the transcript is well within budget. A tight
+    // 4 000-token synthetic budget guarantees the planner picks up the
+    // squeeze; operators wanting different behaviour can use the
+    // dashboard endpoint with a custom `maxTokens`. Mirrors
+    // `ContextController.manualCompact` defaults so both entry points
+    // produce the same shape of commit.
+    const MANUAL_SUMMARIZE_BUDGET = 4_000
+
+    // Run the user's project-scoped `.cursor/hooks/preCompact` script
+    // (if any) before we commit a boundary. This is the bridge half of
+    // the dual-track design — the cursor IDE runs the same hook
+    // through `cursor-agent-exec` when *it* owns the conversation;
+    // when the bridge owns the conversation we run it ourselves so
+    // the user sees identical hook semantics either way. The hook's
+    // stdout becomes a `user_message` we splice onto the front of the
+    // generated summary, mirroring the proto
+    // `PreCompactRequestResponse.user_message` field.
+    const messageCount = session.contextState.records.length
+    const hookPayload: PreCompactHookPayload = {
+      trigger: "manual",
+      context_usage_percent: 0,
+      context_tokens: 0,
+      context_window_size: 0,
+      message_count: messageCount,
+      messages_to_compact: messageCount,
+      is_first_compaction: session.contextState.compactionHistory.length === 0,
+      conversation_id: conversationId,
+      generation_id: undefined,
+      model: session.lastAssistantBackend || undefined,
+    }
+    const hookUserMessage = await this.contextHookExecutor.runPreCompactHook(
+      session.projectContext?.rootPath,
+      hookPayload
+    )
+
+    let result: ContextCompactionResult
+    try {
+      result = this.contextManager.manualCompact(
+        session.contextState,
+        // Empty attachment snapshot: the same trade-off the dashboard
+        // entry point makes. The streaming path that has a live
+        // attachment snapshot would not normally reach this handler —
+        // summarizeAction comes from the IDE, not from inside an
+        // assistant turn — so we don't try to materialise one. The
+        // planner falls back to transcript-only compaction when the
+        // snapshot is empty.
+        { readPaths: [], fileStates: [], todos: [] },
+        {
+          maxTokens: MANUAL_SUMMARIZE_BUDGET,
+          systemPromptTokens: 0,
+        }
+      )
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.logger.error(
+        `Summarize action failed for ${conversationId}: ${message}`
+      )
+      return true
+    }
+
+    const applied = result.appliedCompaction
+    if (!applied) {
+      this.logger.log(
+        `Summarize action: no_progress for ${conversationId} ` +
+          `(estimatedTokens=${result.estimatedTokens})`
+      )
+      return true
+    }
+
+    this.sessionManager.markContextStateDirty(conversationId)
+    this.logger.warn(
+      `Summarize action applied for ${conversationId}: ` +
+        `commit=${applied.commit.id} ` +
+        `archived=${applied.commit.archivedMessageCount} ` +
+        `summary=${applied.commit.summaryTokenCount} tokens` +
+        (hookUserMessage ? " (with preCompact hook)" : "")
+    )
+
+    // Splice the hook's user_message onto the front of the summary so
+    // the IDE chat view shows it. We do not write the augmented text
+    // back into `applied.commit.summary` itself — the commit lives in
+    // the projection ledger and bridges multiple downstream consumers,
+    // so we keep its summary canonical and only override the UI-bound
+    // text here.
+    const renderedSummary = hookUserMessage
+      ? `${hookUserMessage}\n\n${applied.commit.summary}`
+      : applied.commit.summary
+
+    // Queue the summary lifecycle so any later turn that runs through
+    // `emitPendingContextSummaryUiUpdate` will pick it up. We also
+    // yield the three frames eagerly right here so the IDE updates its
+    // chat view immediately rather than waiting for the next user
+    // message to start.
+    this.queuePendingContextSummaryUiUpdate(session, conversationId, {
+      compactionId: applied.commit.id,
+      summary: renderedSummary,
+      epoch: session.contextState.compactionEpoch || 0,
+    })
+    yield* this.emitPendingContextSummaryUiUpdate(conversationId)
     return true
   }
 
@@ -4254,6 +4413,7 @@ ${raw}
         fileStates: Object.fromEntries(session.fileStates),
         turns: session.turns,
         todos: session.todos,
+        compactionHistory: this.extractCompactionHistoryForCheckpoint(session),
       }
     )
   }
@@ -4603,11 +4763,12 @@ ${raw}
         fileStates: Object.fromEntries(completedSession.fileStates),
         turns: completedSession.turns,
         todos: completedSession.todos,
+        compactionHistory:
+          this.extractCompactionHistoryForCheckpoint(completedSession),
       }
     )
     yield checkpoint
     this.logger.log("Sent conversationCheckpointUpdate")
-
     yield this.grpcService.createServerHeartbeatResponse()
     yield this.grpcService.createAgentTurnEndedResponse()
     this.logger.log("Turn ended, returning to handleBidiStream to close stream")
@@ -5096,6 +5257,8 @@ ${raw}
         fileStates: Object.fromEntries(completedSession.fileStates),
         turns: completedSession.turns,
         todos: completedSession.todos,
+        compactionHistory:
+          this.extractCompactionHistoryForCheckpoint(completedSession),
       }
     )
     yield checkpoint
@@ -17988,6 +18151,7 @@ ${raw}
       fileStates: Object.fromEntries(session.fileStates),
       turns: session.turns,
       todos: session.todos,
+      compactionHistory: this.extractCompactionHistoryForCheckpoint(session),
     }
 
     return this.grpcService.createConversationCheckpointResponse(
@@ -17995,6 +18159,28 @@ ${raw}
       checkpointModel,
       checkpointData
     )
+  }
+
+  /**
+   * Extract the bridge-side compaction trail in the shape the proto
+   * `ConversationStateStructure.summary_archives` field expects.
+   *
+   * Bridge keeps richer metadata on each commit
+   * (`ContextCompactionCommit{strategy, epoch, ...}`), but the proto
+   * archive only exposes `summary` + `window_tail`-equivalent
+   * (`archivedMessageCount`). Other fields (`summarized_messages`,
+   * `summary_message`) require pre-compaction message bytes the
+   * bridge does not retain — see comment in
+   * `cursor-grpc.service.ts.createConversationCheckpointResponse` for
+   * why that's intentional.
+   */
+  private extractCompactionHistoryForCheckpoint(
+    session: ChatSession
+  ): Array<{ summary: string; archivedMessageCount: number }> {
+    return session.contextState.compactionHistory.map((commit) => ({
+      summary: commit.summary,
+      archivedMessageCount: commit.archivedMessageCount,
+    }))
   }
 
   private *registerPreparedToolInvocation(
@@ -18731,6 +18917,11 @@ ${raw}
             conversationId
           ) {
             this.logger.log(`ConversationAction.summarize: ${conversationId}`)
+            const shouldEndStream =
+              yield* this.handleConversationSummarizeAction(conversationId)
+            if (shouldEndStream) {
+              return
+            }
           } else if (
             parsed.agentControlType === "shellCommandAction" &&
             conversationId
@@ -19746,6 +19937,8 @@ ${raw}
           fileStates: Object.fromEntries(completedSession.fileStates),
           turns: completedSession.turns,
           todos: completedSession.todos,
+          compactionHistory:
+            this.extractCompactionHistoryForCheckpoint(completedSession),
         }
       )
       yield checkpoint

@@ -1,6 +1,7 @@
 import { Module } from "@nestjs/common"
 import { ContextAttachmentBuilderService } from "./context-attachment-builder.service"
 import { ContextCompactionService } from "./context-compaction.service"
+import { ContextHookExecutorService } from "./context-hook-executor.service"
 import { ContextManagerService } from "./context-manager.service"
 import { ContextProjectionService } from "./context-projection.service"
 import { ContextSummaryService } from "./context-summary.service"
@@ -40,6 +41,7 @@ import { ToolResultCompactionService } from "./tool-result-compaction.service"
     ContextTelemetryService,
     ContextUsageLedgerService,
     ContextCompactionService,
+    ContextHookExecutorService,
     ContextManagerService,
   ],
   exports: [
@@ -52,6 +54,7 @@ import { ToolResultCompactionService } from "./tool-result-compaction.service"
     ContextTelemetryService,
     ContextUsageLedgerService,
     ContextCompactionService,
+    ContextHookExecutorService,
     ContextManagerService,
   ],
 })
