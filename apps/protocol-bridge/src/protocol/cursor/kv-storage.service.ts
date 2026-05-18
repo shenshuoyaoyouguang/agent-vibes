@@ -10,7 +10,7 @@ export interface KvServerMessage {
   id?: number
   setBlobArgs?: {
     blobId: string
-    blobData: string
+    blobData: string | Uint8Array
   }
   getBlobArgs?: {
     blobId: string
@@ -77,6 +77,40 @@ export class KvStorageService {
 
     this.logger.debug(
       `Created setBlobArgs: id=${message.id}, blobId=${blobId.substring(0, 20)}...`
+    )
+
+    return message
+  }
+
+  /**
+   * Store raw protobuf bytes and create a setBlobArgs message that sends
+   * those exact bytes to Cursor's blob store.
+   */
+  createSetBinaryBlobMessage(
+    blobId: string,
+    blobBytes: Uint8Array,
+    traceId?: string,
+    includeId: boolean = true
+  ): KvServerMessage {
+    this.storeBinaryBlob(blobId, blobBytes)
+
+    const message: KvServerMessage = {
+      setBlobArgs: {
+        blobId,
+        blobData: blobBytes,
+      },
+    }
+
+    if (includeId) {
+      message.id = this.getNextId()
+    }
+
+    if (traceId) {
+      message.spanContext = createSpanContext(traceId)
+    }
+
+    this.logger.debug(
+      `Created binary setBlobArgs: id=${message.id}, blobId=${blobId.substring(0, 20)}..., bytes=${blobBytes.length}`
     )
 
     return message

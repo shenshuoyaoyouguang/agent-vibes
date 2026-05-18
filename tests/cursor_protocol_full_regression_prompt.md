@@ -164,10 +164,29 @@ trace 文件不允许出现在仓库工作树内。如果在 `apps/**/.log/`、`
 
 ### 任务 4：任务状态与计划
 
-调用客户端可见工具完成以下目标：用 `update_todos` 记录两项待办 `proto-smoke-todo-1`、`proto-smoke-todo-2`，
-再用 `read_todos` 确认它们内容不为空；然后用 `create_plan` 创建一个 2-3 步的剩余测试计划，并继续执行后续任务。
+调用客户端可见工具完成以下目标：
 
-验收：todo 内容不丢失；计划创建后必须继续执行后续任务，不能提前结束。
+1. 用 `update_todos` 初始化一个 todo 列表，包含两类条目：
+   - 协议覆盖项：保留 `proto-smoke-todo-1`、`proto-smoke-todo-2` 两条固定 id（用于覆盖 `update_todos` / `read_todos` / `updateTodosToolCall` / `readTodosToolCall`），状态可任意；
+   - 执行追踪项：为剩余任务 5..10 各创建一条独立 todo（建议 id `task-5` ... `task-10`，content 写明任务名），初始 status 全部 `pending`。
+2. 用 `read_todos` 读回完整列表，确认两类条目都在。
+3. 用 `create_plan` 创建一份计划，标题包含 `Cursor Protocol Smoke Regression`，
+   `steps` 至少 6 条，与任务 5..10 一一对应，**不要把多个任务合并成一条**；
+   `create_plan` 协议层不支持后续状态回写，这里只承担"全景概要 + 协议闭环"职责。
+4. 之后每完成一个任务（或确认失败、不可用），立即用 `update_todos` 把对应 `task-N`
+   的 status 改为 `completed` / `failed` / `cancelled`，必要时更新 `content` 写入失败原因。
+5. 任务 10 输出最终报告时，附上 todo 终态摘要（每条 id + 终态）。
+
+验收：
+
+- `create_plan` 调用成功，至少观察到一对 `createPlanRequestQuery` / `createPlanRequestResponse`；
+- `update_todos` 至少被调用 2 次（初始化 + 至少 1 次状态回写）；不允许只写一次后再不更新；
+- 最终 todo 列表能准确反映任务 5..10 的真实结果，包含 hard failure；
+- 计划创建后必须继续执行后续任务，不能提前结束。
+
+注意：`create_plan` 在 `agent.v1` 协议中只有 `CreatePlanArgs`（title + steps）和
+`CreatePlanResult`（success/error 二选一），**没有任何状态回写字段**。
+不要试图通过反复调用 `create_plan` 来"更新"计划状态；状态机职责完全由 `update_todos` 承担。
 
 ### 任务 5：诊断、项目与规则类只读能力
 
@@ -259,6 +278,10 @@ trace 文件不允许出现在仓库工作树内。如果在 `apps/**/.log/`、`
 - 实际触发的客户端工具
 - 短证据
 - gap；没有则写 `none`
+
+任务 4 的 todo 终态摘要必须随 Task Results 一起给出（每条 todo 的 id + 最终 status，
+覆盖 `proto-smoke-todo-1/2` 与 `task-5` ... `task-10`）。如有 hard failure，
+对应 todo 必须落到 `failed` 或 `cancelled`，禁止保留为 `pending` / `in_progress`。
 
 ### Tool Call Log
 

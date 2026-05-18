@@ -18,6 +18,12 @@ import { KvStorageService } from "./kv-storage.service"
 import { SemanticSearchProviderService } from "./semantic-search-provider.service"
 import { ChatSessionManager } from "./session/chat-session.service"
 import { CursorSkillsManager } from "./skills"
+import { SubagentLoaderService } from "./subagents/subagent-loader.service"
+import { SubagentRegistryService } from "./subagents/subagent-registry.service"
+import { SubagentExecBridgeService } from "./subagents/subagent-exec-bridge.service"
+import { SubagentTranscriptStore } from "./subagents/subagent-transcript-store.service"
+import { SubagentTaskRegistry } from "./subagents/subagent-task-registry.service"
+import { SubagentBackgroundWorker } from "./subagents/subagent-background-worker.service"
 import { ClientSideToolV2ExecutorService } from "./tools/client-side-tool-v2-executor.service"
 
 @Module({
@@ -46,7 +52,21 @@ import { ClientSideToolV2ExecutorService } from "./tools/client-side-tool-v2-exe
     KvStorageService,
     SemanticSearchProviderService,
     KnowledgeBaseService,
+    SubagentLoaderService,
+    SubagentRegistryService,
+    SubagentExecBridgeService,
+    SubagentTranscriptStore,
+    SubagentTaskRegistry,
+    SubagentBackgroundWorker,
   ],
-  exports: [CursorAuthService, CursorConnectStreamService, ChatSessionManager],
+  exports: [
+    CursorAuthService,
+    CursorConnectStreamService,
+    ChatSessionManager,
+    SubagentRegistryService,
+    SubagentExecBridgeService,
+    SubagentTaskRegistry,
+    SubagentTranscriptStore,
+  ],
 })
 export class CursorModule {}

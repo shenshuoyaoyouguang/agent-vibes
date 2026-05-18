@@ -1,6 +1,6 @@
-import { fromBinary } from "@bufbuild/protobuf"
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf"
 import { Injectable, Logger } from "@nestjs/common"
-import { spawnSync } from "child_process"
+import { spawn, spawnSync } from "child_process"
 import * as crypto from "crypto"
 import {
   closeSync,
@@ -31,6 +31,11 @@ import {
   CursorRuleSource,
   type DeleteResult,
   type DiagnosticsResult,
+  AgentConversationTurnStructureSchema,
+  AgentMode,
+  ConversationStepSchema,
+  type ConversationStep,
+  ConversationTurnStructureSchema,
   ExecClientMessageSchema,
   type GrepResult,
   type ListMcpResourcesExecResult,
@@ -40,6 +45,7 @@ import {
   type ReadResult,
   type ShellResult,
   ShellStream,
+  UserMessageSchema,
   type WriteResult,
 } from "../../gen/agent/v1_pb"
 import {
@@ -91,7 +97,20 @@ import {
   SubAgentContext,
 } from "./session/chat-session.service"
 import { type CursorSkillMetadata, CursorSkillsManager } from "./skills"
-import { generateTraceId } from "./tools/agent-helpers"
+import {
+  SubagentExecBridgeService,
+  type SubagentExecResult,
+} from "./subagents/subagent-exec-bridge.service"
+import { SubagentRegistryService } from "./subagents/subagent-registry.service"
+import { SubagentBackgroundWorker } from "./subagents/subagent-background-worker.service"
+import { SubagentTaskRegistry } from "./subagents/subagent-task-registry.service"
+import { SubagentTranscriptStore } from "./subagents/subagent-transcript-store.service"
+import { resolveSubagentToolSurface } from "./subagents/subagent-tool-resolver"
+import {
+  getSubagentSystemPrompt,
+  type SubagentDefinition,
+} from "./subagents/types"
+import { generateBlobId, generateTraceId } from "./tools/agent-helpers"
 import { normalizeBugfixResultItems as normalizeBugfixResultItemsFromContract } from "./tools/bugfix-result-normalizer"
 import { ClientSideToolV2ExecutorService } from "./tools/client-side-tool-v2-executor.service"
 import {
@@ -340,6 +359,7 @@ type DeferredToolFamily =
   | "await_task"
   | "ai_attribution"
   | "await"
+  | "kill_agent"
   | "mcp_auth"
   | "read_project"
   | "update_project"
@@ -712,6 +732,23 @@ interface ToolCompletedExtraData {
   }
 }
 
+interface MaterializedConversationTurnForCheckpoint {
+  userText: string
+  userMessageId: string
+  steps: ConversationStep[]
+}
+
+interface TranscriptToolResultForCheckpoint {
+  content: string
+  structuredContent?: Record<string, unknown>
+  isError?: boolean
+}
+
+interface CompletedTurnCheckpointState {
+  session: ChatSession
+  blobMessages: Buffer[]
+}
+
 /**
  * JSON Schema property definition
  */
@@ -806,6 +843,7 @@ export class CursorConnectStreamService {
   private readonly TOP_LEVEL_AGENT_CONTINUATION_COMPLETION_THRESHOLD = 0.9
   private readonly TOP_LEVEL_AGENT_SUMMARY_MEMORY_LIMIT = 8
   private readonly TOOL_BATCH_SUMMARY_DETAILS_LIMIT = 6
+  private readonly PENDING_TOOL_RESUME_GRACE_MS = 15_000
   private readonly LEGACY_WEB_DOCUMENT_CHUNK_SIZE = 4_000
   private readonly MAX_LEGACY_WEB_DOCUMENTS_PER_CONVERSATION = 12
   private readonly EMPTY_CONTEXT_ATTACHMENT_SNAPSHOT: ContextAttachmentSnapshot =
@@ -850,7 +888,12 @@ export class CursorConnectStreamService {
     private readonly toolIntegrity: ToolIntegrityService,
     private readonly knowledgeBaseService: KnowledgeBaseService,
     private readonly kiroService: KiroService,
-    private readonly cursorSkillsManager: CursorSkillsManager
+    private readonly cursorSkillsManager: CursorSkillsManager,
+    private readonly subagentRegistry: SubagentRegistryService,
+    private readonly subagentExecBridge: SubagentExecBridgeService,
+    private readonly subagentBackgroundWorker: SubagentBackgroundWorker,
+    private readonly subagentTaskRegistry: SubagentTaskRegistry,
+    private readonly subagentTranscriptStore: SubagentTranscriptStore
   ) {
     // Register provider adapter cleanup on session expiry/deletion.
     // This ensures provider resources (Codex WS connections, warmup caches) are released.
@@ -1099,6 +1142,32 @@ export class CursorConnectStreamService {
           toolCallCount: session.subAgentContext.toolCallCount,
         }
       }
+      if (
+        pendingToolCall.subagentOwner &&
+        session.subAgentContext?.subagentId === pendingToolCall.subagentOwner
+      ) {
+        interruptedSubAgent = {
+          subagentId: session.subAgentContext.subagentId,
+          parentToolCallId: session.subAgentContext.parentToolCallId,
+          turnCount: session.subAgentContext.turnCount,
+          toolCallCount: session.subAgentContext.toolCallCount,
+        }
+      }
+
+      // Sub-agent ExecServerMessage waiter: when this pending tool call
+      // belongs to a sub-agent's LLM turn, the sub-agent worker is
+      // currently `await`ing SubagentExecBridge.awaitResult. Reject that
+      // promise NOW so the sub-agent loop unwinds and stops emitting
+      // heartbeats forever. Without this, the heartbeat ticker
+      // re-entered the await every 10s even after the BiDi stream that
+      // could deliver the result was closed (see bash sub-agent timing
+      // analysis from 2026-05-17 trace).
+      if (pendingToolCall.subagentOwner) {
+        this.subagentExecBridge.rejectToolCall(
+          toolCallId,
+          new Error(`sub-agent exec aborted: ${reason}`)
+        )
+      }
 
       this.sessionManager.clearPendingToolCall(
         conversationId,
@@ -1132,6 +1201,59 @@ export class CursorConnectStreamService {
         `${interruptedToolCalls.map((toolCall) => toolCall.toolName || toolCall.toolCallId).join(", ")}`
     )
     return interruptedToolCalls.length
+  }
+
+  private isSubAgentAbortError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error)
+    return /sub-agent (exec )?(aborted|cancelled)|conversation cancelled|new user turn arrived/i.test(
+      message
+    )
+  }
+
+  private cancelActiveForegroundSubAgent(
+    conversationId: string,
+    reason: string,
+    options?: {
+      targetSubagentId?: string
+      includeBackground?: boolean
+    }
+  ): number {
+    const session = this.sessionManager.getSession(conversationId)
+    const ctx = session?.subAgentContext
+    if (!session || !ctx) return 0
+    if (
+      options?.targetSubagentId &&
+      ctx.subagentId !== options.targetSubagentId
+    ) {
+      return 0
+    }
+    if (ctx.isBackground && !options?.includeBackground) return 0
+
+    const ownedPendingIds = Array.from(session.pendingToolCalls.values())
+      .filter(
+        (pending) =>
+          pending.subagentOwner === ctx.subagentId ||
+          pending.toolCallId === ctx.parentToolCallId
+      )
+      .map((pending) => pending.toolCallId)
+
+    this.subagentExecBridge.rejectConversation(
+      conversationId,
+      `sub-agent cancelled: ${reason}`
+    )
+
+    for (const toolCallId of ownedPendingIds) {
+      this.sessionManager.clearPendingToolCall(
+        conversationId,
+        toolCallId,
+        `sub-agent cancelled: ${reason}`
+      )
+    }
+    this.sessionManager.clearSubAgentContext(conversationId)
+    this.logger.warn(
+      `Cancelled sub-agent ${ctx.subagentId}: cleared ${ownedPendingIds.length} pending tool call(s)`
+    )
+    return ownedPendingIds.length
   }
 
   private async *abortPendingToolCallsOnStream(
@@ -1413,13 +1535,18 @@ export class CursorConnectStreamService {
     const safeReason = rawReason
       ? rawReason.slice(0, 800)
       : "conversation cancelled by client"
+    const cancelledSubAgentPendingCount = this.cancelActiveForegroundSubAgent(
+      conversationId,
+      safeReason
+    )
     const pendingIds = this.sessionManager.getPendingToolCallIdsByStream(
       conversationId,
       session.currentStreamId
     )
 
     this.logger.warn(
-      `Cancel action received for conversation ${conversationId}: reason=${safeReason}, pendingCurrentStream=${pendingIds.length}`
+      `Cancel action received for conversation ${conversationId}: reason=${safeReason}, ` +
+        `pendingCurrentStream=${pendingIds.length}, cancelledSubAgentPending=${cancelledSubAgentPendingCount}`
     )
 
     if (pendingIds.length === 0) {
@@ -1842,8 +1969,10 @@ export class CursorConnectStreamService {
       .filter((value): value is string => typeof value === "string")
     const subAgentSystemAddendum =
       "You are a sub-agent. Operate strictly within the tool surface " +
-      "below; never invent tools, never call shell/edit/filesystem tools " +
-      "(they are unavailable in sub-agent context). " +
+      "below; never invent tools. Use read-only workspace tools such as " +
+      "grep_search, read_file, and list_directory only when they are listed. " +
+      "Use shell/edit/delete only when those tools are explicitly listed " +
+      "for this agent. " +
       (availableToolNames.length > 0
         ? `Available tools: ${availableToolNames.join(", ")}. `
         : "No tools are available in this sub-agent. ") +
@@ -4129,11 +4258,286 @@ ${raw}
     )
   }
 
+  private encodeBlobId(blobId: string): Uint8Array {
+    return new TextEncoder().encode(blobId)
+  }
+
+  private createProtocolBlobSetMessage(
+    schema: unknown,
+    value: unknown
+  ): { blobId: string; buffer: Buffer } {
+    const bytes = toBinary(schema as never, value as never)
+    const blobId = generateBlobId(Buffer.from(bytes))
+    const kvMessage = this.kvStorageService.createSetBinaryBlobMessage(
+      blobId,
+      bytes
+    )
+    return {
+      blobId,
+      buffer: this.grpcService.createKvServerMessageResponse(kvMessage),
+    }
+  }
+
+  private materializeConversationTurnBlobs(session: ChatSession): {
+    turns: string[]
+    blobMessages: Buffer[]
+  } {
+    const materializedTurns =
+      this.buildMaterializedConversationTurnsForCheckpoint(session)
+    const blobMessages: Buffer[] = []
+    const turns: string[] = []
+
+    for (const turn of materializedTurns) {
+      const userMessage = create(UserMessageSchema, {
+        text: turn.userText,
+        messageId: turn.userMessageId,
+        mode: AgentMode.AGENT,
+        conversationStateBlobId: new Uint8Array(),
+      })
+      const userBlob = this.createProtocolBlobSetMessage(
+        UserMessageSchema,
+        userMessage
+      )
+      blobMessages.push(userBlob.buffer)
+
+      const stepBlobIds = turn.steps.map((step) => {
+        const stepBlob = this.createProtocolBlobSetMessage(
+          ConversationStepSchema,
+          step
+        )
+        blobMessages.push(stepBlob.buffer)
+        return stepBlob.blobId
+      })
+
+      const agentTurn = create(AgentConversationTurnStructureSchema, {
+        userMessage: this.encodeBlobId(userBlob.blobId),
+        steps: stepBlobIds.map((blobId) => this.encodeBlobId(blobId)),
+      })
+      const turnStructure = create(ConversationTurnStructureSchema, {
+        turn: {
+          case: "agentConversationTurn" as const,
+          value: agentTurn,
+        },
+      })
+      const turnBlob = this.createProtocolBlobSetMessage(
+        ConversationTurnStructureSchema,
+        turnStructure
+      )
+      blobMessages.push(turnBlob.buffer)
+      turns.push(turnBlob.blobId)
+    }
+
+    return { turns, blobMessages }
+  }
+
+  private buildMaterializedConversationTurnsForCheckpoint(
+    session: ChatSession
+  ): MaterializedConversationTurnForCheckpoint[] {
+    const toolResults = this.buildTranscriptToolResultIndex(
+      session.messageRecords
+    )
+    const turns: MaterializedConversationTurnForCheckpoint[] = []
+    let currentTurn: MaterializedConversationTurnForCheckpoint | undefined
+
+    const flushTurn = () => {
+      if (!currentTurn) return
+      if (currentTurn.userText.trim() || currentTurn.steps.length > 0) {
+        turns.push(currentTurn)
+      }
+      currentTurn = undefined
+    }
+
+    for (const record of session.messageRecords) {
+      if (record.role === "user") {
+        if (this.isToolResultOnlyTranscriptContent(record.content)) {
+          continue
+        }
+        flushTurn()
+        currentTurn = {
+          userText: extractText(record.content),
+          userMessageId: record.id,
+          steps: [],
+        }
+        continue
+      }
+
+      if (record.role !== "assistant") {
+        continue
+      }
+
+      if (!currentTurn) {
+        currentTurn = {
+          userText: "",
+          userMessageId: record.id,
+          steps: [],
+        }
+      }
+      currentTurn.steps.push(
+        ...this.buildConversationStepsFromAssistantTranscriptRecord(
+          record.content,
+          toolResults
+        )
+      )
+    }
+
+    flushTurn()
+    return turns
+  }
+
+  private buildTranscriptToolResultIndex(
+    records: ChatSession["messageRecords"]
+  ): Map<string, TranscriptToolResultForCheckpoint> {
+    const results = new Map<string, TranscriptToolResultForCheckpoint>()
+    for (const record of records) {
+      if (record.role !== "user" || !Array.isArray(record.content)) {
+        continue
+      }
+      for (const block of record.content) {
+        if (!this.isLooseRecord(block) || block.type !== "tool_result") {
+          continue
+        }
+        const toolUseId =
+          typeof block.tool_use_id === "string" ? block.tool_use_id : ""
+        if (!toolUseId) continue
+        results.set(toolUseId, {
+          content: this.stringifyToolResultContent(block.content),
+          structuredContent: this.isLooseRecord(block.structuredContent)
+            ? block.structuredContent
+            : undefined,
+          isError: block.is_error === true,
+        })
+      }
+    }
+    return results
+  }
+
+  private buildConversationStepsFromAssistantTranscriptRecord(
+    content: LooseMessageContent,
+    toolResults: Map<string, TranscriptToolResultForCheckpoint>
+  ): ConversationStep[] {
+    if (typeof content === "string") {
+      const text = content.trim()
+      return text ? [this.grpcService.buildAssistantConversationStep(text)] : []
+    }
+
+    if (!Array.isArray(content)) {
+      return []
+    }
+
+    const steps: ConversationStep[] = []
+    for (const block of content) {
+      if (!this.isLooseRecord(block)) continue
+      if (block.type === "text" && typeof block.text === "string") {
+        const text = block.text.trim()
+        if (text) {
+          steps.push(this.grpcService.buildAssistantConversationStep(text))
+        }
+        continue
+      }
+      if (block.type === "tool_use") {
+        const toolCallId = typeof block.id === "string" ? block.id : ""
+        const toolName = typeof block.name === "string" ? block.name : ""
+        if (!toolCallId || !toolName) continue
+        const input = this.isLooseRecord(block.input) ? block.input : {}
+        const result = toolResults.get(toolCallId)
+        const extraData = this.buildToolCompletionExtraDataForCheckpoint(
+          toolName,
+          result?.structuredContent
+        )
+        steps.push(
+          this.grpcService.buildToolCallConversationStep(
+            toolName,
+            toolCallId,
+            input,
+            result?.content || "",
+            extraData,
+            undefined
+          )
+        )
+      }
+    }
+    return steps
+  }
+
+  private buildToolCompletionExtraDataForCheckpoint(
+    toolName: string,
+    structuredContent: Record<string, unknown> | undefined
+  ): ToolCompletedExtraData | undefined {
+    if (
+      toolName.trim().toLowerCase() === "task" &&
+      this.isLooseRecord(structuredContent?.taskSuccess)
+    ) {
+      return {
+        taskSuccess:
+          structuredContent.taskSuccess as ToolCompletedExtraData["taskSuccess"],
+      }
+    }
+    return undefined
+  }
+
+  private isLooseRecord(value: unknown): value is Record<string, unknown> {
+    return !!value && typeof value === "object" && !Array.isArray(value)
+  }
+
+  private isToolResultOnlyTranscriptContent(
+    content: LooseMessageContent
+  ): boolean {
+    return (
+      Array.isArray(content) &&
+      content.length > 0 &&
+      content.every(
+        (block) => this.isLooseRecord(block) && block.type === "tool_result"
+      )
+    )
+  }
+
+  private stringifyToolResultContent(content: unknown): string {
+    if (typeof content === "string") return content
+    if (Array.isArray(content)) {
+      return content
+        .map((entry) => {
+          if (this.isLooseRecord(entry) && typeof entry.text === "string") {
+            return entry.text
+          }
+          return JSON.stringify(this.toJsonSafe(entry))
+        })
+        .filter(Boolean)
+        .join("\n")
+    }
+    if (content == null) return ""
+    return JSON.stringify(this.toJsonSafe(content))
+  }
+
+  private toJsonSafe(value: unknown): unknown {
+    if (typeof value === "bigint") {
+      return value <= BigInt(Number.MAX_SAFE_INTEGER)
+        ? Number(value)
+        : value.toString()
+    }
+    if (value instanceof Uint8Array) {
+      return Array.from(value)
+    }
+    if (Array.isArray(value)) {
+      return value.map((item) => this.toJsonSafe(item))
+    }
+    if (value && typeof value === "object") {
+      const result: Record<string, unknown> = {}
+      for (const [key, nested] of Object.entries(value)) {
+        if (typeof nested === "undefined" || typeof nested === "function") {
+          continue
+        }
+        result[key] = this.toJsonSafe(nested)
+      }
+      return result
+    }
+    return value
+  }
+
   private recordCompletedTurnIfNeeded(
     session: ChatSession,
     shouldRecordTurn: boolean,
     contextLabel: string
-  ): ChatSession {
+  ): CompletedTurnCheckpointState {
     const activeSession =
       this.sessionManager.getSession(session.conversationId) || session
 
@@ -4141,18 +4545,17 @@ ${raw}
       this.logger.debug(
         `Skipping turn append for ${activeSession.conversationId} (${contextLabel}): no durable assistant response was persisted`
       )
-      return activeSession
+      return { session: activeSession, blobMessages: [] }
     }
 
-    const turnId = this.generateTurnId(
-      activeSession.conversationId,
-      activeSession.turns.length
+    const { turns, blobMessages } =
+      this.materializeConversationTurnBlobs(activeSession)
+    activeSession.turns = turns
+    this.sessionManager.markSessionDirty(activeSession.conversationId)
+    this.logger.debug(
+      `Materialized ${turns.length} checkpoint turn blob(s) for ${activeSession.conversationId} (${contextLabel})`
     )
-    this.sessionManager.addTurn(activeSession.conversationId, turnId)
-    return (
-      this.sessionManager.getSession(activeSession.conversationId) ||
-      activeSession
-    )
+    return { session: activeSession, blobMessages }
   }
 
   private *finalizeInitialAssistantTurn(
@@ -4176,11 +4579,15 @@ ${raw}
       this.commitAssistantUsageLedger(session, assistantRecordId, usage, text)
     }
 
-    const completedSession = this.recordCompletedTurnIfNeeded(
+    const completedTurn = this.recordCompletedTurnIfNeeded(
       session,
       !!assistantRecordId,
       `message_stop: ${conversationId}`
     )
+    for (const blobMessage of completedTurn.blobMessages) {
+      yield blobMessage
+    }
+    const completedSession = completedTurn.session
 
     const checkpoint = this.grpcService.createConversationCheckpointResponse(
       completedSession.conversationId,
@@ -4608,11 +5015,15 @@ ${raw}
       )
     }
 
-    const completedSession = this.recordCompletedTurnIfNeeded(
+    const completedTurn = this.recordCompletedTurnIfNeeded(
       activeSession,
       !!assistantRecordId,
       `continuation finalization: ${conversationId}`
     )
+    for (const blobMessage of completedTurn.blobMessages) {
+      yield blobMessage
+    }
+    const completedSession = completedTurn.session
 
     yield this.buildConversationCheckpoint(
       completedSession,
@@ -4661,11 +5072,15 @@ ${raw}
       )
     }
 
-    const completedSession = this.recordCompletedTurnIfNeeded(
+    const completedTurn = this.recordCompletedTurnIfNeeded(
       activeSession,
       shouldPersist,
       `final text response: ${activeSession.conversationId}`
     )
+    for (const blobMessage of completedTurn.blobMessages) {
+      yield blobMessage
+    }
+    const completedSession = completedTurn.session
 
     const checkpoint = this.grpcService.createConversationCheckpointResponse(
       completedSession.conversationId,
@@ -6611,6 +7026,12 @@ ${raw}
       )
     }
 
+    if (historyToolName === "task" && extraData?.taskSuccess) {
+      return {
+        taskSuccess: this.toJsonSafe(extraData.taskSuccess),
+      }
+    }
+
     if (
       historyToolName === "replace_file_content" ||
       historyToolName === "multi_replace_file_content" ||
@@ -6840,7 +7261,16 @@ ${raw}
       ) ?? undefined
     const allowMultiple = this.pickFirstBoolean(
       toolInput as Record<string, unknown>,
-      ["allow_multiple", "allowMultiple", "AllowMultiple"]
+      [
+        // claude-code-aligned public field — preferred name in the
+        // edit_file_v2 schema, mirrors FileEditTool.replace_all.
+        "replace_all",
+        "replaceAll",
+        // Bridge-historical aliases kept for tolerant parsing.
+        "allow_multiple",
+        "allowMultiple",
+        "AllowMultiple",
+      ]
     )
     const startLine = this.pickFirstNumber(
       toolInput as Record<string, unknown>,
@@ -8216,6 +8646,17 @@ ${raw}
     }
     if (snake.includes("await_task") || compact.includes("awaittask")) {
       return "await_task"
+    }
+    // wait_agent is the friendlier alias the dynamic task tool prompt
+    // suggests for "wait until the background sub-agent finishes" — it
+    // routes to exactly the same registry-aware await flow as
+    // await_task. Keep this above the read_project arm so the path
+    // pattern wait_*_agent doesn't accidentally catch project lookups.
+    if (snake.includes("wait_agent") || compact.includes("waitagent")) {
+      return "await_task"
+    }
+    if (snake.includes("kill_agent") || compact.includes("killagent")) {
+      return "kill_agent"
     }
     if (snake.includes("read_project") || compact.includes("readproject")) {
       return "read_project"
@@ -10806,9 +11247,162 @@ ${raw}
   // ────────────────────────────────────────────────────────────────────
 
   /**
+   * Resolve which model the sub-agent should run on, applying the same
+   * precedence claude-code uses:
+   *
+   *   1. agent.model === "inherit" → use the parent session model
+   *   2. agent.model is a specific model id → use that
+   *   3. agent.model undefined → use the parent session model (matches
+   *      claude-code's getDefaultSubagentModel fallback for built-ins)
+   *
+   * Special-cases the bridge's "gemini-2.5-flash" fallback only when the
+   * parent session itself has no model recorded.
+   */
+  private resolveSubAgentModel(
+    agent: SubagentDefinition,
+    session: ChatSession
+  ): string {
+    const parentModel = session.model || "gemini-2.5-flash"
+    if (!agent.model || agent.model === "inherit") return parentModel
+    return agent.model
+  }
+
+  /**
+   * Map an Exec-dispatchable user-facing tool name to the
+   * `toolFamilyHint` field on PendingToolCall. Mirrors the cases in
+   * cursor-grpc.service.ts::detectToolFamily but only for the families
+   * the bridge actually allow-lists for sub-agent dispatch.
+   *
+   * Returning undefined is fine — the hint is a hint, not a contract;
+   * handleToolResult derives the real family from `toolName` when the
+   * hint is missing.
+   */
+  private classifyExecToolFamilyHint(
+    toolName: string
+  ): "mcp" | "web_fetch" | undefined {
+    const normalized = toolName
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, "")
+    if (normalized.includes("mcp")) return "mcp"
+    if (normalized.includes("webfetch")) return "web_fetch"
+    return undefined
+  }
+
+  /**
+   * Format an ExecClientMessage payload returned to a sub-agent into
+   * the human-readable text that goes into the sub-agent's tool_result
+   * message. Re-uses the parent agent's formatToolResult by building a
+   * minimal ParsedToolResult shim so all the existing per-case
+   * formatters (shell / read / grep / ls / write / delete / diagnostics)
+   * apply unchanged.
+   */
+  private formatSubAgentExecResultAsText(
+    toolName: string,
+    execResult: SubagentExecResult
+  ): string {
+    // Streamed shellStream path: synthesise a human-readable shell
+    // result block from the buffered stdout/stderr/exitCode rather
+    // than running the parsed-result formatter (which expects a real
+    // proto-encoded payload). This keeps the formatting consistent
+    // with formatShellResultAsText for the synchronous path so the
+    // sub-agent's LLM sees the same shape no matter which path the
+    // IDE chose.
+    if (
+      execResult.resultCase === "shellResult" &&
+      execResult.resultData === undefined &&
+      (execResult.streamedStdout !== undefined ||
+        execResult.streamedStderr !== undefined ||
+        execResult.streamedExitCode !== undefined ||
+        execResult.streamedStatus !== undefined)
+    ) {
+      const parts: string[] = []
+      const status = execResult.streamedStatus || "success"
+      const code = execResult.streamedExitCode ?? 0
+      parts.push(`[shell ${status}] exit_code=${code}`)
+      const stdout = execResult.streamedStdout || ""
+      if (stdout.length > 0) {
+        parts.push(`--- stdout ---`)
+        parts.push(stdout.trimEnd())
+      }
+      const stderr = execResult.streamedStderr || ""
+      if (stderr.length > 0) {
+        parts.push(`--- stderr ---`)
+        parts.push(stderr.trimEnd())
+      }
+      if (stdout.length === 0 && stderr.length === 0) {
+        parts.push("(no output)")
+      }
+      return parts.join("\n")
+    }
+
+    if (execResult.resultData === undefined) {
+      this.logger.warn(
+        `[SubAgent] formatSubAgentExecResultAsText got result without ` +
+          `resultData and not a streamed shell result: ` +
+          `tool=${toolName}, case=${execResult.resultCase}`
+      )
+      return `[tool result for ${toolName}: ${execResult.resultCase}]`
+    }
+    const synthetic: ParsedToolResult = {
+      toolCallId: "",
+      toolType: 0,
+      resultCase: execResult.resultCase,
+      resultData: execResult.resultData,
+    }
+    try {
+      return this.formatToolResult(synthetic)
+    } catch (error) {
+      this.logger.warn(
+        `[SubAgent] Failed to format exec result for ${toolName}: ${String(error)}`
+      )
+      return `[tool result for ${toolName}: ${execResult.resultCase}]`
+    }
+  }
+
+  /**
+   * Build the SubagentDefinitions array passed to buildToolsForApi so the
+   * top-level agent's `task` tool description enumerates available
+   * sub-agents (mirrors claude-code's getPrompt(agentDefinitions)).
+   *
+   * Returns undefined when the registry has no sub-agents available, so
+   * the static description is preserved instead of generating a misleading
+   * "no sub-agents" listing.
+   */
+  private buildSubagentDefinitionsForToolPrompt(
+    session: ChatSession
+  ): NonNullable<
+    Parameters<typeof buildToolsForApi>[1]
+  >["subagentDefinitions"] {
+    const projectCwd = session.projectContext?.rootPath || process.cwd()
+    const subagents = this.subagentRegistry.getAll(projectCwd)
+    if (subagents.length === 0) return undefined
+    return subagents.map((agent) => {
+      const surface = resolveSubagentToolSurface(agent)
+      return {
+        agentType: agent.agentType,
+        whenToUse: agent.whenToUse,
+        toolNames: surface.toolNames,
+      }
+    })
+  }
+
+  /**
    * Execute a sub-agent for the "task" tool.
+   *
+   * Honours `subagent_type` from the model — looks up the matching
+   * SubagentDefinition (built-in or `.cursor/agents/*.md` custom), uses
+   * its `getSystemPrompt()` / `systemPrompt` body as the sub-agent's
+   * system message, and resolves its tool surface via the same
+   * resolveSubagentToolSurface() the parent agent's `task` tool prompt
+   * uses. This mirrors claude-code's runAgent() + resolveAgentTools()
+   * design where every sub-agent gets exactly the prompt + tools its
+   * definition declared, instead of the legacy hard-coded inline list.
+   *
    * Runs LLM turns in a loop, dispatches tool calls inline, and yields
-   * protocol buffers throughout.
+   * protocol buffers throughout. All sub-agent-produced events are
+   * mirrored to the parent task bubble through taskToolCallDelta so the
+   * IDE renders them in real time inside the parent's task tool card.
    */
   private async *executeSubAgentTask(
     conversationId: string,
@@ -10826,74 +11420,91 @@ ${raw}
       return
     }
 
+    // claude-code TaskCreateTool field semantics:
+    //   - `prompt`  : the actual brief the sub-agent should act on.
+    //   - `description` : 3-5 word UI label shown in the parent task
+    //     bubble while the sub-agent runs.
+    // We prefer `prompt` so the sub-agent receives the real task body.
+    // `description` and the legacy `task` alias are fallbacks for older
+    // callers that only set the UI label.
     const description =
-      this.pickFirstString(input, ["description", "prompt", "task"]) || ""
+      this.pickFirstString(input, ["prompt", "task", "description"]) || ""
     if (!description) {
       yield* this.emitInlineToolResult(
         conversationId,
         parentToolCallId,
-        "[task error] Missing required description/prompt",
-        { status: "error", message: "missing description" }
+        "[task error] Missing required prompt (or fallback description)",
+        { status: "error", message: "missing prompt" }
       )
       return
     }
 
-    // Sub-agent tool surface.
-    //
-    // The sub-agent does NOT have a private ExecServerMessage channel back
-    // to the IDE, so it cannot run read_file / list_directory / grep_search
-    // / edit_file_v2 / run_terminal_command directly. We therefore restrict
-    // the sub-agent surface to tools that are fully serviceable by the
-    // proxy's inline executors. This still gives the sub-agent enough power
-    // to do useful research-style work (web search, web fetch, semantic
-    // search, todo / plan, MCP tool dispatch, reflection, fetch_rules,
-    // search_symbols, ...). Anything outside this list will be reported
-    // to the model with a clear "use one of the tools below" message so it
-    // can re-plan instead of looping on a non-existent tool.
-    const SUB_AGENT_INLINE_TOOL_KEYS = [
-      "CLIENT_SIDE_TOOL_V2_WEB_SEARCH",
-      "CLIENT_SIDE_TOOL_V2_WEB_FETCH",
-      "CLIENT_SIDE_TOOL_V2_FETCH",
-      "CLIENT_SIDE_TOOL_V2_FILE_SEARCH",
-      "CLIENT_SIDE_TOOL_V2_GLOB_FILE_SEARCH",
-      "CLIENT_SIDE_TOOL_V2_SEMANTIC_SEARCH_FULL",
-      "CLIENT_SIDE_TOOL_V2_DEEP_SEARCH",
-      "CLIENT_SIDE_TOOL_V2_READ_SEMSEARCH_FILES",
-      "CLIENT_SIDE_TOOL_V2_TODO_READ",
-      "CLIENT_SIDE_TOOL_V2_TODO_WRITE",
-      "CLIENT_SIDE_TOOL_V2_FETCH_RULES",
-      "CLIENT_SIDE_TOOL_V2_SEARCH_SYMBOLS",
-      "CLIENT_SIDE_TOOL_V2_GO_TO_DEFINITION",
-      "CLIENT_SIDE_TOOL_V2_KNOWLEDGE_BASE",
-      "CLIENT_SIDE_TOOL_V2_FETCH_PULL_REQUEST",
-      "CLIENT_SIDE_TOOL_V2_REFLECT",
-      "CLIENT_SIDE_TOOL_V2_GET_MCP_TOOLS",
-      "CLIENT_SIDE_TOOL_V2_CALL_MCP_TOOL",
-      "CLIENT_SIDE_TOOL_V2_LIST_MCP_RESOURCES",
-      "CLIENT_SIDE_TOOL_V2_READ_MCP_RESOURCE",
-      "CLIENT_SIDE_TOOL_V2_READ_LINTS",
-      "CLIENT_SIDE_TOOL_V2_READ_PROJECT",
-    ]
-    const subAgentTools = buildToolsForApi(SUB_AGENT_INLINE_TOOL_KEYS, {
+    // Resolve the requested sub-agent definition. The model passes
+    // `subagent_type` to pick a specific agent. Unknown / missing types
+    // fall back to general-purpose, matching claude-code's behaviour.
+    const requestedAgentType =
+      this.pickFirstString(input, ["subagent_type", "subagentType", "type"]) ||
+      ""
+    const projectCwd = session.projectContext?.rootPath || process.cwd()
+    const allSubagents = this.subagentRegistry.getAll(projectCwd)
+    const agentDefinition: SubagentDefinition | undefined = requestedAgentType
+      ? this.subagentRegistry.findByType(requestedAgentType, projectCwd)
+      : undefined
+    const effectiveAgent: SubagentDefinition =
+      agentDefinition ||
+      allSubagents.find((agent) => agent.agentType === "general-purpose") ||
+      allSubagents[0]!
+    if (!agentDefinition && requestedAgentType) {
+      this.logger.warn(
+        `[SubAgent] Unknown subagent_type '${requestedAgentType}'; falling back to '${effectiveAgent.agentType}'.`
+      )
+    }
+
+    // Resolve the agent's effective tool surface. This is the single
+    // source of truth — both the dynamic `task` tool description (so the
+    // parent model picks the right agentType) and the sub-agent's actual
+    // LLM turn use this same resolver, preventing drift.
+    const surface = resolveSubagentToolSurface(effectiveAgent)
+    if (surface.ignoredAllowlistEntries.length > 0) {
+      this.logger.warn(
+        `[SubAgent] '${effectiveAgent.agentType}' frontmatter declared ` +
+          `tools that aren't sub-agent-safe: ` +
+          `${surface.ignoredAllowlistEntries.join(", ")}; ignored.`
+      )
+    }
+    const subAgentTools = buildToolsForApi(surface.toolNames, {
       mcpToolDefs: session.mcpToolDefs,
       backend: this.modelRouter.resolveModel(
-        session.model || "gemini-2.5-flash"
+        this.resolveSubAgentModel(effectiveAgent, session)
       ).backend,
+      forSubAgent: true,
     })
 
     // Create sub-agent context
     const subagentId = `subagent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    const parentPendingToolCall = session.pendingToolCalls.get(parentToolCallId)
+    const parentTaskModelCallId = parentPendingToolCall?.modelCallId || ""
+
+    const systemPrompt = getSubagentSystemPrompt(effectiveAgent)
+    const subAgentModel = this.resolveSubAgentModel(effectiveAgent, session)
+
     const ctx: SubAgentContext = {
       subagentId,
       parentToolCallId,
-      parentModelCallId: "",
+      parentModelCallId: parentTaskModelCallId,
       messages: [
+        // System prompt slot. The bridge LLM router treats the first
+        // message with role 'user' that begins with `system:` as a system
+        // prompt for backends that don't have a dedicated system field;
+        // for backends that do (Anthropic, Codex), the upstream DTO
+        // builder unwraps it. The agent definition's prompt becomes the
+        // system message verbatim — claude-code does the same.
         {
           role: "user" as const,
-          content: `You are a sub-agent. Complete the following task:\n\n${description}`,
+          content: `${systemPrompt}\n\n--- TASK ---\n\n${description}`,
         },
       ],
-      model: session.model || "gemini-2.5-flash",
+      model: subAgentModel,
       tools: subAgentTools,
       accumulatedText: "",
       pendingToolCallIds: new Set(),
@@ -10904,14 +11515,36 @@ ${raw}
       currentTurnToolCalls: [],
       pendingToolResults: new Map(),
       expectedToolCallIds: new Set(),
+      conversationSteps: [],
     }
 
     this.sessionManager.setSubAgentContext(conversationId, ctx)
     this.logger.log(
-      `[SubAgent] Created ${subagentId} for parent tool call ${parentToolCallId}`
+      `[SubAgent] Created ${subagentId} (agentType=${effectiveAgent.agentType}, ` +
+        `source=${effectiveAgent.source}, tools=${surface.toolNames.length}, ` +
+        `model=${subAgentModel}) for parent tool call ${parentToolCallId}`
     )
 
-    const MAX_TURNS = 20
+    // Helper: wrap an inner sub-agent InteractionUpdate as a
+    // ToolCallDeltaUpdate(taskToolCallDelta) anchored to the parent task
+    // tool call. This is the official protocol channel that lets the
+    // IDE render sub-agent activity inside the parent task bubble in real
+    // time instead of waiting for the final inline_tool_result.
+    const yieldSubAgentUpdate = (
+      innerUpdate: ReturnType<
+        typeof this.grpcService.buildInnerTextDeltaInteractionUpdate
+      >
+    ): Buffer =>
+      this.grpcService.wrapAsTaskToolCallDelta(
+        parentToolCallId,
+        parentTaskModelCallId,
+        innerUpdate
+      )
+
+    // Per-agent maxTurns honours the frontmatter override
+    // (`maxTurns: <int>`) the same way claude-code's loadAgentsDir does;
+    // 20 is the bridge default carried over from the previous fixed cap.
+    const MAX_TURNS = effectiveAgent.maxTurns ?? 20
 
     // ── Main LLM turn loop ──
     for (let turn = 0; turn < MAX_TURNS; turn++) {
@@ -10919,6 +11552,16 @@ ${raw}
       this.logger.log(
         `[SubAgent] ${subagentId} turn ${ctx.turnCount}/${MAX_TURNS}`
       )
+
+      // Keep the outer BiDi stream alive while this sub-agent turn is in
+      // flight. The sub-agent consumes its inner LLM stream silently
+      // (events accumulate into ctx.messages, no buffers are yielded out
+      // until tool dispatch / completion), so without an explicit beat
+      // the IDE NAL stall detector aborts the parent BiDi stream after
+      // ~60s with a misleading "proxy restarted" error. One beat per
+      // turn boundary covers the gap between LLM stream end and the
+      // tool dispatch loop starting on the next iteration.
+      yield this.grpcService.createHeartbeatResponse()
 
       const buildSubAgentDtoForRoute = (
         streamRoute: ModelRouteResult,
@@ -10985,8 +11628,18 @@ ${raw}
           recoveryKey: `cursor:subagent:${conversationId}:${subagentId}`,
         })
 
-        for await (const sseEventStr of stream) {
-          const event = this.parseSseEvent(sseEventStr)
+        // Wrap the inner LLM stream in streamWithHeartbeat so quiet
+        // backend stretches (Kiro / Codex / Google can pause 30s+
+        // before the first token on long prompts) still produce
+        // outbound heartbeats on the parent BiDi stream.
+        const heartbeatStream = this.streamWithHeartbeat(stream)
+        for await (const item of heartbeatStream) {
+          if (item.type === "heartbeat") {
+            yield this.grpcService.createHeartbeatResponse()
+            continue
+          }
+
+          const event = this.parseSseEvent(item.value)
           if (!event) continue
 
           if (event.type === "content_block_start") {
@@ -11002,6 +11655,25 @@ ${raw}
             const delta = event.data.delta
             if (delta?.type === "text_delta" && delta.text) {
               fullText += delta.text
+              // Mirror sub-agent assistant text to the IDE in real time
+              // through the parent task tool call's ToolCallDeltaUpdate
+              // envelope so the parent task bubble streams sub-agent
+              // output instead of staying silent until completion.
+              yield yieldSubAgentUpdate(
+                this.grpcService.buildInnerTextDeltaInteractionUpdate(
+                  delta.text
+                )
+              )
+            } else if (delta?.type === "thinking_delta" && delta.thinking) {
+              // Mirror sub-agent thinking deltas through the same channel
+              // so the IDE renders them in the dedicated thinking section
+              // of the parent task bubble.
+              yield yieldSubAgentUpdate(
+                this.grpcService.buildInnerThinkingDeltaInteractionUpdate(
+                  delta.thinking,
+                  ctx.model
+                )
+              )
             } else if (delta?.type === "input_json_delta" && currentToolCall) {
               currentToolCall.inputJson += delta.partial_json || ""
             }
@@ -11027,6 +11699,12 @@ ${raw}
       const assistantContentParts: Array<Record<string, unknown>> = []
       if (fullText) {
         assistantContentParts.push({ type: "text", text: fullText })
+        // ConversationStep accumulation: push the assistant text so the
+        // parent task bubble's expandable detail panel can render this
+        // turn's reply.
+        ctx.conversationSteps.push(
+          this.grpcService.buildAssistantConversationStep(fullText)
+        )
       }
       for (const tc of toolCalls) {
         let parsedInput: Record<string, unknown> = {}
@@ -11071,9 +11749,228 @@ ${raw}
           parsedInput = { _raw: tc.inputJson }
         }
 
-        // Try to dispatch as a deferred tool
+        // Beat between tools so individual long deferred tools
+        // (web_fetch / deep_search / read_semsearch_files / fetch) cannot
+        // collectively starve the parent BiDi stream past the IDE NAL
+        // stall window even when they each finish under that window.
+        yield this.grpcService.createHeartbeatResponse()
+
+        // Mirror the sub-agent's tool lifecycle (started -> completed)
+        // to the IDE through the parent task tool call's taskToolCallDelta
+        // channel. The IDE renders these as nested tool-call bubbles
+        // inside the parent task bubble so the user can see exactly which
+        // tool the sub-agent is using right now, with the same UX as the
+        // top-level agent's own tool calls.
+        //
+        // IMPORTANT: do NOT pass our internal `classifyDeferredToolFamily`
+        // result here. That classifier returns the bridge's *deferred*
+        // family namespace (e.g. "file_search", "semantic_search",
+        // "read_semsearch_files") which the grpc-service `familyToCase`
+        // map does not understand — those names fall through to the
+        // truncatedToolCall placeholder and the IDE renders them as
+        // `[Tool: truncatedToolCall]`. Letting grpc-service derive the
+        // family itself from the tool name routes through `detectToolFamily`,
+        // which maps `glob_search` -> "glob", `semantic_search` -> "sem_search",
+        // `search_symbols` -> "sem_search", etc. — all of which DO have a
+        // proto oneof case and render correctly.
+        yield yieldSubAgentUpdate(
+          this.grpcService.buildInnerToolCallStartedInteractionUpdate(
+            tc.id,
+            tc.name,
+            parsedInput,
+            undefined,
+            ctx.subagentId
+          )
+        )
+
+        // Dispatch sub-agent tool calls along one of four paths:
+        //   1. Bridge-local read-only tools — grep/read/list are executed
+        //      inside the bridge. Cursor renders nested sub-agent tool UI
+        //      through taskToolCallDelta, but the matching ExecClientMessage
+        //      is not guaranteed to return through the parent stream.
+        //   2. ExecServerMessage round-trip — when the tool name maps to
+        //      an Exec-dispatchable family (run_terminal_command,
+        //      edit_file_v2, delete_file, ...).
+        //   3. Inline deferred — for tools that can be serviced entirely
+        //      inside the bridge (web search/fetch, semantic search,
+        //      todo/plan, MCP, reflect, ...).
+        //   4. Hard error — tool is in neither category. Tell the model
+        //      what is available so it stops looping on a non-existent
+        //      tool.
         const family = this.classifyDeferredToolFamily(tc.name)
-        if (family) {
+        const isExecDispatchable =
+          !family && this.grpcService.isExecDispatchableTool(tc.name)
+        let toolResultContent: string
+        let toolResultStatus: "success" | "error" = "success"
+        let toolCompletedExtraData: ToolCompletedExtraData | undefined
+        const bridgeInlineResult = await this.executeSubAgentBridgeInlineTool(
+          conversationId,
+          tc.name,
+          parsedInput
+        )
+        if (bridgeInlineResult) {
+          this.logger.log(
+            `[SubAgent] Bridge-inline tool: ${tc.name} (${tc.id})`
+          )
+          toolResultContent = bridgeInlineResult.content
+          if (bridgeInlineResult.state.status === "error") {
+            toolResultStatus = "error"
+          }
+          toolCompletedExtraData = bridgeInlineResult.extraData
+          toolResults.push({
+            type: "tool_result",
+            tool_use_id: tc.id,
+            content: toolResultContent,
+          })
+        } else if (isExecDispatchable) {
+          this.logger.log(
+            `[SubAgent] Exec-dispatch tool: ${tc.name} (${tc.id})`
+          )
+          // Register pending tool call BEFORE yielding so handleToolResult
+          // can resolve it when the IDE replies. The `subagentOwner`
+          // field is what tells handleToolResult to bypass the parent
+          // continuation pipeline.
+          this.sessionManager.addPendingToolCall(
+            conversationId,
+            tc.id,
+            tc.name,
+            parsedInput,
+            this.classifyExecToolFamilyHint(tc.name),
+            ctx.subagentId,
+            undefined,
+            undefined,
+            undefined,
+            ctx.subagentId
+          )
+          const execIdNumber = this.sessionManager.nextExecId(conversationId)
+          this.sessionManager.registerPendingToolExecId(
+            conversationId,
+            tc.id,
+            execIdNumber
+          )
+          const waitPromise = this.subagentExecBridge.awaitResult(
+            conversationId,
+            ctx.subagentId,
+            tc.id
+          )
+          try {
+            // Yield the ExecServerMessage on the parent BiDi stream so the
+            // IDE actually executes the tool. We use the same encoder the
+            // top-level agent uses — sub-agent and parent share the same
+            // proto envelope shape.
+            //
+            // For run_terminal_command specifically: force the IDE into
+            // the synchronous shellArgs path (single shellResult) rather
+            // than the default streaming shellStreamArgs path (multiple
+            // shellStream chunks then a shellResult). Empirically, the
+            // IDE side does NOT execute shellStreamArgs envelopes for
+            // sub-agent-owned tool calls — the `Mapped execId=...` log
+            // shows on dispatch, but no ExecClientMessage of any kind
+            // ever returns. Other Exec-dispatchable tools (grep_search,
+            // read_file, etc.) work normally for sub-agents because
+            // their envelopes are non-streaming. shellArgs IS supported
+            // for sub-agents and yields a single shellResult that flows
+            // back through SubagentExecBridge.deliverResult. The bridge
+            // ALSO has stream-aware support
+            // (deliverShellStreamChunk) for defensive completeness, in
+            // case future IDE builds enable streaming shell for
+            // sub-agents — but the dispatch path keeps the synchronous
+            // hint so we never depend on that capability here.
+            const subAgentToolInput =
+              tc.name === "run_terminal_command" ||
+              tc.name === "run_terminal_command_v2"
+                ? { ...parsedInput, synchronous: true }
+                : parsedInput
+            yield this.grpcService.createAgentToolCallResponse(
+              tc.name,
+              tc.id,
+              subAgentToolInput as never,
+              execIdNumber
+            )
+            // Keep the parent BiDi stream alive while we wait for the IDE
+            // to return the ExecClientMessage. The IDE sometimes takes
+            // 30-90s before the first byte (file system slow, prompt
+            // approval dialog, etc.); without an explicit beat the NAL
+            // stall detector aborts the parent stream with a misleading
+            // "proxy restarted" error, even though bridge-side processing
+            // is healthy.
+            //
+            // Implementation: Promise.race the bridge waiter against a
+            // timeout token; on timeout yield a heartbeat and re-race
+            // until the real waiter wins.
+            let execResult: SubagentExecResult | undefined
+            const HEARTBEAT_MS = this.KEEPALIVE_INTERVAL
+            while (true) {
+              type RaceWinner =
+                | { kind: "result"; value: SubagentExecResult }
+                | { kind: "heartbeat" }
+              let timeoutHandle: NodeJS.Timeout | undefined
+              const heartbeatToken = new Promise<RaceWinner>((resolve) => {
+                timeoutHandle = setTimeout(
+                  () => resolve({ kind: "heartbeat" as const }),
+                  HEARTBEAT_MS
+                )
+              })
+              const winner: RaceWinner = await Promise.race([
+                waitPromise.then((value) => ({
+                  kind: "result" as const,
+                  value,
+                })),
+                heartbeatToken,
+              ])
+              if (timeoutHandle) {
+                clearTimeout(timeoutHandle)
+              }
+              if (winner.kind === "result") {
+                execResult = winner.value
+                break
+              }
+              this.logger.debug(
+                `[SubAgent] Heartbeat while waiting for exec result ` +
+                  `${tc.id} (${tc.name}, subagent=${ctx.subagentId})`
+              )
+              yield this.grpcService.createHeartbeatResponse()
+            }
+            toolResultContent = this.formatSubAgentExecResultAsText(
+              tc.name,
+              execResult
+            )
+            // Tool was consumed by the bridge — clear pending entry so
+            // it does not leak past the sub-agent's lifetime.
+            this.sessionManager.consumePendingToolCall(conversationId, tc.id)
+            toolResults.push({
+              type: "tool_result",
+              tool_use_id: tc.id,
+              content: toolResultContent,
+            })
+          } catch (err) {
+            if (this.isSubAgentAbortError(err)) {
+              const message = err instanceof Error ? err.message : String(err)
+              this.sessionManager.consumePendingToolCall(conversationId, tc.id)
+              if (
+                this.sessionManager.getSubAgentContext(conversationId)
+                  ?.subagentId === ctx.subagentId
+              ) {
+                this.sessionManager.clearSubAgentContext(conversationId)
+              }
+              this.logger.warn(
+                `[SubAgent] Aborted ${ctx.subagentId} while waiting for ` +
+                  `${tc.name} (${tc.id}): ${message}`
+              )
+              return
+            }
+            toolResultStatus = "error"
+            toolResultContent = `[tool error] ${String(err)}`
+            // Pending tool call may have been consumed already by an
+            // abort path; consume defensively.
+            this.sessionManager.consumePendingToolCall(conversationId, tc.id)
+            toolResults.push({
+              type: "tool_result",
+              tool_use_id: tc.id,
+              content: toolResultContent,
+            })
+          }
+        } else if (family) {
           this.logger.log(
             `[SubAgent] Inline deferred tool: ${tc.name} (${tc.id})`
           )
@@ -11084,26 +11981,30 @@ ${raw}
               tc.name,
               parsedInput
             )
+            toolResultContent = result.content
+            if (result.state?.status === "error") {
+              toolResultStatus = "error"
+            }
             toolResults.push({
               type: "tool_result",
               tool_use_id: tc.id,
               content: result.content,
             })
           } catch (err) {
+            toolResultStatus = "error"
+            toolResultContent = `[tool error] ${String(err)}`
             toolResults.push({
               type: "tool_result",
               tool_use_id: tc.id,
-              content: `[tool error] ${String(err)}`,
+              content: toolResultContent,
             })
           }
         } else {
-          // Not a deferred tool – the sub-agent has no ExecServerMessage
-          // channel back to the IDE, so file/shell/edit tools cannot run
-          // here. Tell the model exactly which tools ARE available so it
-          // can re-plan instead of looping on a non-existent tool.
-          this.logger.warn(
-            `[SubAgent] Unsupported exec tool: ${tc.name} (${tc.id})`
-          )
+          // Tool maps to neither an inline deferred family nor an
+          // Exec-dispatchable family. Tell the model exactly which
+          // tools ARE available so it can re-plan instead of looping on
+          // a non-existent tool.
+          this.logger.warn(`[SubAgent] Unsupported tool: ${tc.name} (${tc.id})`)
           const availableToolNames = (
             (ctx.tools as unknown as ToolDefinition[]) || []
           )
@@ -11113,17 +12014,55 @@ ${raw}
             availableToolNames.length > 0
               ? `Available tools in this sub-agent: ${availableToolNames.join(", ")}.`
               : "No tools are available in this sub-agent."
+          toolResultStatus = "error"
+          toolResultContent =
+            `[tool error] Tool "${tc.name}" is not available in this ` +
+            `sub-agent. ` +
+            availableHint +
+            " Please complete the task using only those tools, or " +
+            "summarize what you have so far if you cannot continue."
           toolResults.push({
             type: "tool_result",
             tool_use_id: tc.id,
-            content:
-              `[tool error] Tool "${tc.name}" is not available in sub-agent ` +
-              `context (sub-agents cannot run shell, edit, or filesystem ` +
-              `tools because they have no ExecServerMessage channel). ` +
-              availableHint +
-              " Please complete the task using only those tools, or " +
-              "summarize what you have so far if you cannot continue.",
+            content: toolResultContent,
           })
+        }
+
+        // Emit the matching toolCallCompleted into the parent task bubble.
+        // Note we always send the lifecycle pair even when the tool failed,
+        // so the IDE never leaves a "started but never completed" stub.
+        // Same family-hint caveat as toolCallStarted — pass undefined so
+        // grpc-service derives the proto family via detectToolFamily.
+        yield yieldSubAgentUpdate(
+          this.grpcService.buildInnerToolCallCompletedInteractionUpdate(
+            tc.id,
+            tc.name,
+            parsedInput,
+            toolResultContent,
+            undefined,
+            ctx.subagentId,
+            toolCompletedExtraData
+          )
+        )
+        // ConversationStep accumulation: push a toolCall step so the
+        // parent task bubble's detail panel renders the per-tool
+        // breakdown (which tools the sub-agent used + their results).
+        ctx.conversationSteps.push(
+          this.grpcService.buildToolCallConversationStep(
+            tc.name,
+            tc.id,
+            parsedInput,
+            toolResultContent,
+            toolCompletedExtraData,
+            undefined
+          )
+        )
+        // Surface success/failure via log so trace audits can correlate
+        // sub-agent tool result statuses without re-reading payloads.
+        if (toolResultStatus === "error") {
+          this.logger.warn(
+            `[SubAgent] Tool ${tc.name} (${tc.id}) returned error to sub-agent`
+          )
         }
       }
 
@@ -11138,6 +12077,425 @@ ${raw}
     yield* this.completeSubAgent(
       conversationId,
       ctx.accumulatedText || "[sub-agent reached max turns]"
+    )
+  }
+
+  // ────────────────────────────────────────────────────────────────────
+  // Background sub-agent host hooks
+  // ────────────────────────────────────────────────────────────────────
+  //
+  // These two methods are the surface SubagentBackgroundWorker calls
+  // into. They re-use the bridge's existing LLM routing + inline tool
+  // executors, just packaged as plain async functions instead of the
+  // foreground generator that yields BiDi buffers.
+  //
+  // Why public methods on this service rather than a separate class:
+  // - getBackendStream / streamWithHeartbeat / executeDeferredTool /
+  //   buildSubAgentStreamingDtoForRoute / buildCodexStreamingRequestForRoute
+  //   all live here as private members and depend on a bunch of other
+  //   private state. Re-implementing them in a worker would either
+  //   duplicate a lot of code or require exposing a sprawling DI surface.
+  // - Keeping them here lets the worker stay a thin loop that focuses on
+  //   transcript / metadata bookkeeping.
+
+  /** Run a single sub-agent LLM turn for a background worker. Drives the
+   * existing backend stream, parses SSE events, accumulates text +
+   * thinking + tool_use blocks, and returns the aggregated turn result.
+   * Does NOT yield buffers — background workers have no live BiDi stream
+   * to write to. */
+  async runBackgroundSubAgentLlmTurn(
+    conversationId: string,
+    args: {
+      subagentId: string
+      messages: Array<{ role: "user" | "assistant"; content: unknown }>
+      model: string
+      toolNames: string[]
+      abortSignal: AbortSignal
+    }
+  ): Promise<{
+    fullText: string
+    toolCalls: Array<{ id: string; name: string; inputJson: string }>
+    error?: string
+  }> {
+    const session = this.sessionManager.getSession(conversationId)
+    if (!session) {
+      return {
+        fullText: "",
+        toolCalls: [],
+        error: "session not found",
+      }
+    }
+
+    // Expand tool NAMES into proper ToolDefinition[] using the same
+    // builder the foreground sub-agent / parent agent use. Worker passes
+    // names only because it has no access to per-session MCP defs nor to
+    // the backend-specific tool encoder. Without this expansion the
+    // backend gets `[{ name: "semantic_search" }]`-style stubs and
+    // schema validation fails silently inside the SSE generator,
+    // leaving the worker's await stuck forever.
+    const route = this.modelRouter.resolveModel(args.model)
+    const toolDefinitions = buildToolsForApi(args.toolNames, {
+      mcpToolDefs: session.mcpToolDefs,
+      backend: route.backend,
+      forSubAgent: true,
+    })
+
+    // Construct a minimal SubAgentContext for the existing
+    // buildSubAgentStreamingDtoForRoute helper. The worker owns the
+    // canonical message history; this ctx is throwaway scaffolding.
+    const tempCtx: SubAgentContext = {
+      subagentId: args.subagentId,
+      parentToolCallId: "",
+      parentModelCallId: "",
+      messages: args.messages.map((m) => ({
+        role: m.role,
+        content: m.content as MessageContent,
+      })),
+      model: args.model,
+      tools: toolDefinitions,
+      accumulatedText: "",
+      pendingToolCallIds: new Set(),
+      startTime: Date.now(),
+      turnCount: 0,
+      toolCallCount: 0,
+      modifiedFiles: [],
+      currentTurnToolCalls: [],
+      pendingToolResults: new Map(),
+      expectedToolCallIds: new Set(),
+      conversationSteps: [],
+    }
+
+    const buildDtoForRoute = (
+      streamRoute: ModelRouteResult,
+      hints?: BackendStreamHints
+    ): CreateMessageDto =>
+      this.buildSubAgentStreamingDtoForRoute(
+        session,
+        tempCtx,
+        conversationId,
+        streamRoute,
+        hints
+      )
+
+    const buildCodexRequestForRoute = (
+      streamRoute: ModelRouteResult,
+      hints?: BackendStreamHints
+    ): CodexExecutionRequest =>
+      this.buildCodexStreamingRequestForRoute(streamRoute, {
+        model: args.model,
+        promptContext: this.buildPromptContextFromSession(session),
+        conversationId,
+        session,
+        thinkingLevel: session.thinkingLevel,
+        thinkingDetailsRequested: session.thinkingDetailsRequested,
+        budgetOverride: hints?.budgetOverride,
+        buildMessages: (budget) => {
+          const compacted =
+            this.contextManager.buildBackendMessagesFromMessages(
+              tempCtx.messages.map((message) => ({
+                role: message.role,
+                content: message.content as UnifiedMessage["content"],
+              })) as UnifiedMessage[],
+              this.EMPTY_CONTEXT_ATTACHMENT_SNAPSHOT,
+              {
+                maxTokens: budget.maxTokens,
+                systemPromptTokens: budget.systemPromptTokens,
+                strategy: "auto",
+              }
+            )
+          return compacted.messages as CodexExecutionRequest["messages"]
+        },
+      })
+
+    const streamModel = route.model
+
+    let fullText = ""
+    const toolCalls: Array<{ id: string; name: string; inputJson: string }> = []
+    let currentToolCall: {
+      id: string
+      name: string
+      inputJson: string
+    } | null = null
+
+    try {
+      const stream = this.getBackendStream(streamModel, {
+        buildDtoForRoute,
+        buildCodexRequestForRoute,
+        recoveryKey: `cursor:subagent:bg:${conversationId}:${args.subagentId}`,
+        // Plumb the worker's AbortController signal all the way down
+        // into the backend SSE stream so kill_agent / registry.kill()
+        // can short-circuit the upstream HTTP request, not just the
+        // for-await loop below. Without this the SSE source keeps
+        // streaming and the loop just races between an event arriving
+        // and the abortSignal flipping — fine when events are
+        // frequent, but the LLM may hold the stream open between
+        // turns, leaving kill signals stranded.
+        abortSignal: args.abortSignal,
+      })
+
+      // No outer BiDi stream to keep alive, so we don't need
+      // streamWithHeartbeat. We DO honour the abortSignal so the
+      // registry's kill() can short-circuit the SSE loop.
+      for await (const sseEventStr of stream) {
+        if (args.abortSignal.aborted) {
+          return {
+            fullText,
+            toolCalls,
+            error: "aborted",
+          }
+        }
+        const event = this.parseSseEvent(sseEventStr)
+        if (!event) continue
+
+        if (event.type === "content_block_start") {
+          const cb = event.data.content_block
+          if (cb?.type === "tool_use" && cb.id && cb.name) {
+            currentToolCall = {
+              id: cb.id,
+              name: cb.name,
+              inputJson: "",
+            }
+          }
+        } else if (event.type === "content_block_delta") {
+          const delta = event.data.delta
+          if (delta?.type === "text_delta" && delta.text) {
+            fullText += delta.text
+          } else if (delta?.type === "input_json_delta" && currentToolCall) {
+            currentToolCall.inputJson += delta.partial_json || ""
+          }
+        } else if (event.type === "content_block_stop") {
+          if (currentToolCall) {
+            toolCalls.push(currentToolCall)
+            currentToolCall = null
+          }
+        }
+      }
+    } catch (error) {
+      return {
+        fullText,
+        toolCalls,
+        error: String(error),
+      }
+    }
+
+    return { fullText, toolCalls }
+  }
+
+  /** Run a single bridge-local / inline tool for a background worker.
+   * Re-uses the same dispatcher as foreground sub-agents so read-only
+   * workspace tools and service-backed tools share one semantic path. */
+  async runBackgroundInlineDeferredTool(
+    conversationId: string,
+    toolName: string,
+    parsedInput: Record<string, unknown>
+  ): Promise<{ content: string; status: "success" | "error" }> {
+    const bridgeInline = await this.executeSubAgentBridgeInlineTool(
+      conversationId,
+      toolName,
+      parsedInput
+    )
+    if (bridgeInline) {
+      return {
+        content: bridgeInline.content,
+        status: bridgeInline.state.status === "error" ? "error" : "success",
+      }
+    }
+
+    const family = this.classifyDeferredToolFamily(toolName)
+    if (!family) {
+      return {
+        content:
+          `[tool error] '${toolName}' is not a known bridge-local or ` +
+          `inline tool family — background sub-agents only support ` +
+          `bridge-local / inline tools.`,
+        status: "error",
+      }
+    }
+    try {
+      const result = await this.executeDeferredTool(
+        conversationId,
+        family,
+        toolName,
+        parsedInput
+      )
+      return {
+        content: result.content,
+        status: result.state?.status === "error" ? "error" : "success",
+      }
+    } catch (err) {
+      return {
+        content: `[tool error] ${String(err)}`,
+        status: "error",
+      }
+    }
+  }
+
+  /**
+   * Parse the `run_in_background` flag from a `task` tool call's input.
+   * Accepts boolean true / "true" / 1 (claude-code's tolerant parse).
+   * Anything else falls back to false (foreground).
+   */
+  private parseRunInBackgroundFlag(input: Record<string, unknown>): boolean {
+    const raw =
+      input.run_in_background ??
+      input.runInBackground ??
+      input.background ??
+      input.is_background
+    if (typeof raw === "boolean") return raw
+    if (typeof raw === "number") return raw === 1
+    if (typeof raw === "string") {
+      const normalized = raw.trim().toLowerCase()
+      return normalized === "true" || normalized === "1" || normalized === "yes"
+    }
+    return false
+  }
+
+  /**
+   * Background sub-agent spawn path.
+   *
+   * 1. Resolve sub-agent definition + model the same way the foreground
+   *    path does (so subagent_type and inheritance stay symmetric).
+   * 2. Spawn the worker. The worker runs entirely off-stream — no
+   *    BiDi yields — and persists progress to
+   *    ~/.cursor/subagents/<agentId>/{transcript.jsonl, metadata.json,
+   *    result.txt}.
+   * 3. Register the runtime handle in SubagentTaskRegistry so the
+   *    parent agent can later query / kill the task across BiDi
+   *    streams.
+   * 4. IMMEDIATELY settle the parent task tool with a
+   *    `taskSuccess { agentId, isBackground: true, transcriptPath }`
+   *    projection. The parent agent receives the agentId in its tool
+   *    result and can use `read_file` on the transcript / result paths
+   *    to follow up.
+   */
+  private async *spawnBackgroundSubAgent(
+    conversationId: string,
+    parentToolCallId: string,
+    input: Record<string, unknown>
+  ): AsyncGenerator<Buffer> {
+    const session = this.sessionManager.getSession(conversationId)
+    if (!session) {
+      yield* this.emitInlineToolResult(
+        conversationId,
+        parentToolCallId,
+        "[task error] session not found",
+        { status: "error", message: "session not found" }
+      )
+      return
+    }
+    // claude-code TaskCreateTool field semantics:
+    //   - `prompt`  : the actual brief the sub-agent should act on.
+    //   - `description` : 3-5 word UI label shown in the parent task
+    //     bubble while the sub-agent runs.
+    // We prefer `prompt` so the sub-agent receives the real task body.
+    // `description` and the legacy `task` alias are fallbacks for older
+    // callers that only set the UI label.
+    const description =
+      this.pickFirstString(input, ["prompt", "task", "description"]) || ""
+    if (!description) {
+      yield* this.emitInlineToolResult(
+        conversationId,
+        parentToolCallId,
+        "[task error] Missing required prompt (or fallback description)",
+        { status: "error", message: "missing prompt" }
+      )
+      return
+    }
+
+    const requestedAgentType =
+      this.pickFirstString(input, ["subagent_type", "subagentType", "type"]) ||
+      ""
+    const projectCwd = session.projectContext?.rootPath || process.cwd()
+    const allSubagents = this.subagentRegistry.getAll(projectCwd)
+    const agentDefinition: SubagentDefinition | undefined = requestedAgentType
+      ? this.subagentRegistry.findByType(requestedAgentType, projectCwd)
+      : undefined
+    const effectiveAgent: SubagentDefinition =
+      agentDefinition ||
+      allSubagents.find((agent) => agent.agentType === "general-purpose") ||
+      allSubagents[0]!
+    if (!agentDefinition && requestedAgentType) {
+      this.logger.warn(
+        `[BackgroundSubAgent] Unknown subagent_type '${requestedAgentType}'; ` +
+          `falling back to '${effectiveAgent.agentType}'.`
+      )
+    }
+    const subAgentModel = this.resolveSubAgentModel(effectiveAgent, session)
+
+    // Spawn the worker. donePromise resolves when the worker terminates
+    // (regardless of success / failure / kill); we don't await it here
+    // — the parent task tool settles immediately so the BiDi stream can
+    // close.
+    const spawn = this.subagentBackgroundWorker.spawn({
+      parentConversationId: conversationId,
+      parentToolCallId,
+      description,
+      agent: effectiveAgent,
+      model: subAgentModel,
+      host: {
+        logger: this.logger,
+        runInlineDeferredTool: (
+          convId: string,
+          toolName: string,
+          parsedInput: Record<string, unknown>
+        ) =>
+          this.runBackgroundInlineDeferredTool(convId, toolName, parsedInput),
+        runSubAgentLlmTurn: (convId, llmArgs) =>
+          this.runBackgroundSubAgentLlmTurn(convId, llmArgs),
+        // ConversationStep builders — wrap the grpc service helpers so
+        // the worker stays decoupled from the proto schema and only
+        // sees opaque step blobs.
+        buildAssistantStep: (text: string) =>
+          this.grpcService.buildAssistantConversationStep(text),
+        buildToolCallStep: ({ toolName, callId, parsedInput, resultContent }) =>
+          this.grpcService.buildToolCallConversationStep(
+            toolName,
+            callId,
+            parsedInput,
+            resultContent
+          ),
+      },
+    })
+
+    this.subagentTaskRegistry.register(
+      {
+        agentId: spawn.agentId,
+        parentConversationId: conversationId,
+        abortController: spawn.abortController,
+        donePromise: spawn.donePromise,
+        startedAt: spawn.metadata.startedAt,
+      },
+      spawn.metadata
+    )
+
+    const transcriptPath = this.subagentTranscriptStore.getTranscriptPath(
+      spawn.agentId
+    )
+    const resultPath = this.subagentTranscriptStore.getResultPath(spawn.agentId)
+    const ackContent =
+      `Background sub-agent spawned.\n` +
+      `agentId: ${spawn.agentId}\n` +
+      `agentType: ${effectiveAgent.agentType}\n` +
+      `model: ${subAgentModel}\n` +
+      `transcript: ${transcriptPath}\n` +
+      `result: ${resultPath}\n\n` +
+      `The sub-agent is now running asynchronously. To check progress, ` +
+      `use read_file on the transcript path. To read the final answer ` +
+      `once the task is complete, use read_file on the result path.`
+
+    yield* this.emitInlineToolResult(
+      conversationId,
+      parentToolCallId,
+      ackContent,
+      { status: "success" },
+      {
+        taskSuccess: {
+          agentId: spawn.agentId,
+          isBackground: true,
+          durationMs: 0,
+          transcriptPath,
+        },
+      }
     )
   }
 
@@ -11168,6 +12526,15 @@ ${raw}
             agentId: subAgentCtx.subagentId,
             isBackground: false,
             durationMs,
+            // Project the per-turn ConversationStep[] we accumulated so
+            // the IDE renders the parent task bubble's expandable detail
+            // panel (assistant text + tool calls per turn). Without this
+            // the bubble shows just "Completed" with no breakdown — see
+            // grpc service buildAssistantConversationStep /
+            // buildToolCallConversationStep helpers.
+            conversationSteps: subAgentCtx.conversationSteps as Array<
+              Record<string, unknown>
+            >,
           },
         }
       )
@@ -11234,6 +12601,12 @@ ${raw}
       ai_attribution: "ai_attribution",
       await: "await_task",
       await_task: "await_task",
+      // wait_agent / kill_agent — friendlier surface for the
+      // run_in_background sub-agent lifecycle. wait_agent shares the
+      // same registry-aware await flow as await_task; kill_agent is a
+      // bridge-defined inline tool that calls SubagentTaskRegistry.kill.
+      wait_agent: "await_task",
+      kill_agent: "kill_agent",
       reapply: "reapply",
       apply_agent_diff: "apply_agent_diff",
       apply_patch: "apply_patch",
@@ -11662,6 +13035,751 @@ ${raw}
       relative === "" ||
       (!relative.startsWith("..") && !path.isAbsolute(relative))
     )
+  }
+
+  private async executeSubAgentBridgeInlineTool(
+    conversationId: string,
+    toolName: string,
+    input: Record<string, unknown>
+  ): Promise<{
+    content: string
+    state: { status: ToolResultStatus; message?: string }
+    extraData?: ToolCompletedExtraData
+  } | null> {
+    switch (toolName) {
+      case "grep_search":
+        return this.executeInlineSubAgentGrepSearch(conversationId, input)
+      case "read_file":
+      case "read_file_v2":
+        return this.executeInlineSubAgentReadFile(conversationId, input)
+      case "list_directory":
+      case "list_dir":
+        return this.executeInlineSubAgentListDirectory(conversationId, input)
+      case "run_terminal_command":
+      case "run_terminal_command_v2":
+        // Cursor IDE's ExecServerMessage shell path does not respond to
+        // sub-agent owned tool calls (the IDE drops both shellArgs and
+        // shellStreamArgs envelopes silently when the parent ownership
+        // routes through SubagentExecBridge). Until we migrate to the
+        // first-class subagentArgs / subagentResult protocol path
+        // (which IDE-side cursor-agent-exec already implements — the
+        // exec runs the whole sub-agent in-IDE so shell is just one of
+        // its native tools), we execute run_terminal_command directly
+        // inside the bridge process via child_process.spawn. This
+        // mirrors claude-code's built-in BashTool: shell runs locally
+        // in the agent runtime, not over an external IDE protocol.
+        return this.executeInlineSubAgentRunTerminalCommand(
+          conversationId,
+          input
+        )
+      default:
+        return null
+    }
+  }
+
+  private buildSubAgentWorkspaceTarget(
+    conversationId: string,
+    requestedPath: string | undefined,
+    fallbackToRoot: boolean
+  ):
+    | { rootPath: string; absPath: string; displayPath: string }
+    | { error: string; message: string } {
+    const rootPath = this.resolveWorkspaceRoot(conversationId)
+    const rawPath = requestedPath?.trim()
+    if (!rawPath && !fallbackToRoot) {
+      return { error: "missing path", message: "Missing required path" }
+    }
+
+    const absPath = rawPath
+      ? this.resolveWorkspaceFilePath(conversationId, rawPath)
+      : rootPath
+    if (!this.isPathWithinWorkspaceRoot(conversationId, absPath)) {
+      return {
+        error: "path outside workspace",
+        message: `Path must stay within the active workspace: ${rawPath || absPath}`,
+      }
+    }
+
+    const relPath = path
+      .relative(path.resolve(rootPath), path.resolve(absPath))
+      .replace(/\\/g, "/")
+    return {
+      rootPath,
+      absPath,
+      displayPath: relPath.length > 0 ? relPath : ".",
+    }
+  }
+
+  private executeInlineSubAgentGrepSearch(
+    conversationId: string,
+    input: Record<string, unknown>
+  ): {
+    content: string
+    state: { status: ToolResultStatus; message?: string }
+    extraData?: ToolCompletedExtraData
+  } {
+    const query =
+      this.pickFirstString(input, [
+        "query",
+        "Query",
+        "pattern",
+        "searchTerm",
+        "search_term",
+      ]) || ""
+    if (!query) {
+      return {
+        content: "[grep_search error] Missing required query",
+        state: { status: "error", message: "missing query" },
+      }
+    }
+
+    const target = this.buildSubAgentWorkspaceTarget(
+      conversationId,
+      this.pickToolPath(input) || undefined,
+      true
+    )
+    if ("error" in target) {
+      return {
+        content: `[grep_search error] ${target.message}`,
+        state: { status: "error", message: target.error },
+      }
+    }
+
+    const caseSensitive = this.pickFirstBoolean(input, [
+      "case_sensitive",
+      "caseSensitive",
+    ])
+    const targetArg =
+      target.displayPath === "." ? "." : target.displayPath.replace(/\\/g, "/")
+    const args = [
+      "--line-number",
+      "--column",
+      "--no-heading",
+      "--color",
+      "never",
+      "--hidden",
+      "--max-columns",
+      "240",
+      "--max-count",
+      "200",
+      "--glob",
+      "!.git/**",
+      "--glob",
+      "!node_modules/**",
+      "--glob",
+      "!dist/**",
+      "--glob",
+      "!build/**",
+      "--glob",
+      "!.next/**",
+    ]
+    if (caseSensitive === false) {
+      args.push("--ignore-case")
+    }
+    args.push("--", query, targetArg)
+
+    const result = spawnSync("rg", args, {
+      cwd: target.rootPath,
+      encoding: "utf8",
+      maxBuffer: 2 * 1024 * 1024,
+      timeout: 30_000,
+    })
+    if (result.error) {
+      const message = result.error.message || "failed to execute ripgrep"
+      return {
+        content: `[grep_search error] ${message}`,
+        state: { status: "error", message },
+      }
+    }
+
+    const stdout = typeof result.stdout === "string" ? result.stdout : ""
+    const stderr = typeof result.stderr === "string" ? result.stderr.trim() : ""
+    if (result.status !== 0 && result.status !== 1) {
+      const message = stderr || `ripgrep exited with ${result.status}`
+      return {
+        content: `[grep_search error] ${message}`,
+        state: { status: "error", message },
+      }
+    }
+
+    const lines = stdout.trimEnd() ? stdout.trimEnd().split(/\r?\n/) : []
+    const previewLines = lines.slice(0, 120)
+    const omitted = Math.max(0, lines.length - previewLines.length)
+    input.query = query
+    input.path = target.displayPath
+    input.case_sensitive = caseSensitive
+    input.matches = previewLines
+    input.total_matches = lines.length
+    input.totalMatches = lines.length
+    input.truncated = omitted > 0
+
+    const preview =
+      previewLines.length > 0 ? previewLines.join("\n") : "- (no matches)"
+    const omittedLine = omitted > 0 ? `\nomitted=${omitted}` : ""
+    const workspaceResults = this.buildInlineSubAgentGrepWorkspaceResults(
+      target.rootPath,
+      previewLines
+    )
+    return {
+      content:
+        `[grep_search success] query=${query} path=${target.displayPath} ` +
+        `total=${lines.length}${omittedLine}\n${preview}`,
+      state: { status: "success" },
+      extraData: {
+        grepSuccess: {
+          pattern: query,
+          path: target.displayPath,
+          outputMode: "content",
+          workspaceResults,
+        },
+      },
+    }
+  }
+
+  private buildInlineSubAgentGrepWorkspaceResults(
+    workspaceKey: string,
+    lines: string[]
+  ): Record<string, unknown> {
+    const resultsByFile = new Map<string, Array<Record<string, unknown>>>()
+    for (const line of lines) {
+      const match = /^(.+?):(\d+):(\d+):(.*)$/.exec(line)
+      if (!match) continue
+      const filePath = match[1] || ""
+      if (!filePath) continue
+      const lineNumber = Number(match[2] || 0)
+      const content = match[4] || ""
+      const matches = resultsByFile.get(filePath) || []
+      matches.push({
+        lineNumber,
+        content,
+        contentTruncated: false,
+        isContextLine: false,
+      })
+      resultsByFile.set(filePath, matches)
+    }
+
+    return {
+      [workspaceKey || "workspace"]: {
+        result: {
+          case: "content",
+          value: {
+            totalMatchedLines: lines.length,
+            totalLines: lines.length,
+            clientTruncated: false,
+            ripgrepTruncated: false,
+            matches: Array.from(resultsByFile.entries()).map(
+              ([filePath, matches]) => ({
+                file: filePath,
+                matches,
+              })
+            ),
+          },
+        },
+      },
+    }
+  }
+
+  private executeInlineSubAgentReadFile(
+    conversationId: string,
+    input: Record<string, unknown>
+  ): {
+    content: string
+    state: { status: ToolResultStatus; message?: string }
+    extraData?: ToolCompletedExtraData
+  } {
+    const target = this.buildSubAgentWorkspaceTarget(
+      conversationId,
+      this.pickToolPath(input) || undefined,
+      false
+    )
+    if ("error" in target) {
+      return {
+        content: `[read_file error] ${target.message}`,
+        state: { status: "error", message: target.error },
+      }
+    }
+
+    try {
+      const stat = statSync(target.absPath)
+      if (!stat.isFile()) {
+        return {
+          content: `[read_file error] Path is not a file: ${target.displayPath}`,
+          state: { status: "error", message: "path is not a file" },
+        }
+      }
+      const content = readFileSync(target.absPath, "utf8")
+      const lines = content.length > 0 ? content.split(/\r?\n/) : []
+      const startLine = Math.max(
+        1,
+        this.pickFirstNumber(input, ["start_line", "startLine"]) || 1
+      )
+      const requestedEnd = this.pickFirstNumber(input, ["end_line", "endLine"])
+      const endLine = Math.min(
+        lines.length,
+        requestedEnd || Math.min(lines.length, startLine + 399)
+      )
+      if (lines.length > 0 && endLine < startLine) {
+        return {
+          content: `[read_file error] Invalid line range: ${startLine}-${endLine}`,
+          state: { status: "error", message: "invalid line range" },
+        }
+      }
+
+      const selected = lines.slice(startLine - 1, endLine)
+      const numbered = selected
+        .map((line, index) => `${startLine + index}: ${line}`)
+        .join("\n")
+      input.path = target.displayPath
+      input.start_line = startLine
+      input.end_line = endLine
+      input.total_lines = lines.length
+      input.truncated =
+        !requestedEnd && lines.length > 0 && endLine < lines.length
+
+      const truncatedLine = input.truncated
+        ? `\ntruncated=true next_start_line=${endLine + 1}`
+        : ""
+      return {
+        content:
+          `[read_file success] path=${target.displayPath} ` +
+          `lines=${lines.length > 0 ? `${startLine}-${endLine}` : "0-0"} ` +
+          `total_lines=${lines.length}${truncatedLine}\n` +
+          (numbered || "- (empty file)"),
+        state: { status: "success" },
+        extraData: {
+          readSuccess: {
+            path: target.displayPath,
+            content: selected.join("\n"),
+            totalLines: lines.length,
+            fileSize: stat.size,
+            truncated: !!input.truncated,
+            rangeApplied: startLine > 1 || requestedEnd != null,
+          },
+        },
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return {
+        content: `[read_file error] ${message}`,
+        state: { status: "error", message },
+      }
+    }
+  }
+
+  private async executeInlineSubAgentListDirectory(
+    conversationId: string,
+    input: Record<string, unknown>
+  ): Promise<{
+    content: string
+    state: { status: ToolResultStatus; message?: string }
+    extraData?: ToolCompletedExtraData
+  }> {
+    const target = this.buildSubAgentWorkspaceTarget(
+      conversationId,
+      this.pickToolPath(input) || ".",
+      true
+    )
+    if ("error" in target) {
+      return {
+        content: `[list_directory error] ${target.message}`,
+        state: { status: "error", message: target.error },
+      }
+    }
+
+    try {
+      const stat = statSync(target.absPath)
+      if (!stat.isDirectory()) {
+        return {
+          content: `[list_directory error] Path is not a directory: ${target.displayPath}`,
+          state: { status: "error", message: "path is not a directory" },
+        }
+      }
+
+      const fs = await import("fs/promises")
+      const recursive =
+        this.pickFirstBoolean(input, ["recursive", "Recursive"]) || false
+      const maxEntries = 200
+      const skipDirs = new Set([
+        ".git",
+        "node_modules",
+        "dist",
+        "build",
+        ".next",
+      ])
+      const entries: string[] = []
+      const visit = async (
+        absDir: string,
+        relPrefix: string,
+        depth: number
+      ): Promise<void> => {
+        if (entries.length >= maxEntries) return
+        const dirEntries = await fs.readdir(absDir, { withFileTypes: true })
+        dirEntries.sort((a, b) => a.name.localeCompare(b.name))
+        for (const entry of dirEntries) {
+          if (entries.length >= maxEntries) return
+          const rel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name
+          if (entry.isDirectory()) {
+            entries.push(`${rel}/`)
+            if (recursive && depth < 3 && !skipDirs.has(entry.name)) {
+              await visit(path.join(absDir, entry.name), rel, depth + 1)
+            }
+          } else {
+            entries.push(rel)
+          }
+        }
+      }
+      await visit(target.absPath, "", 0)
+
+      input.path = target.displayPath
+      input.recursive = recursive
+      input.entries = entries
+      input.total_entries = entries.length
+      input.totalEntries = entries.length
+      input.truncated = entries.length >= maxEntries
+
+      const preview =
+        entries.length > 0
+          ? entries.map((entry) => `- ${entry}`).join("\n")
+          : "- (empty directory)"
+      const truncatedLine = input.truncated ? "\ntruncated=true" : ""
+      return {
+        content:
+          `[list_directory success] path=${target.displayPath} ` +
+          `recursive=${recursive} entries=${entries.length}${truncatedLine}\n` +
+          preview,
+        state: { status: "success" },
+        extraData: {
+          lsDirectoryTreeRoot: this.buildInlineSubAgentLsDirectoryTreeRoot(
+            target.absPath,
+            entries
+          ),
+        },
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return {
+        content: `[list_directory error] ${message}`,
+        state: { status: "error", message },
+      }
+    }
+  }
+
+  /**
+   * Sub-agent's `run_terminal_command` runs in-process via
+   * child_process.spawn. We do this because Cursor IDE's
+   * ExecServerMessage shell path silently drops sub-agent owned tool
+   * calls (see comment at the dispatch site for the protocol-level
+   * reason). Once we migrate sub-agent dispatch to the first-class
+   * `subagentArgs` / `subagentResult` ExecServerMessage path the IDE
+   * already implements, the entire sub-agent (LLM + tools, including
+   * shell) will run in-IDE and this method becomes dead code.
+   *
+   * Behaviour matches what a top-level `run_terminal_command` user
+   * expects:
+   *   - command runs through `bash -c` so pipes / && / quoting work
+   *   - cwd defaults to the workspace root, can be overridden by args
+   *   - hard timeout (60s) so a runaway command does not pin the
+   *     sub-agent indefinitely
+   *   - stdout/stderr captured separately, truncated at 256KB each
+   *   - exit code reported in the tool_result text the LLM sees
+   *
+   * Safety:
+   *   - cwd is constrained to within the workspace root (no `cd ..`
+   *     escape hatch via args), matching grep / read / list policy
+   *   - PATH inherited from the bridge process so the sub-agent has
+   *     access to the same binaries the user invoked the IDE with
+   *   - no shell expansion of args beyond what `bash -c` itself does
+   *     (the LLM owns the command string verbatim)
+   */
+  private async executeInlineSubAgentRunTerminalCommand(
+    conversationId: string,
+    input: Record<string, unknown>
+  ): Promise<{
+    content: string
+    state: { status: ToolResultStatus; message?: string }
+    extraData?: ToolCompletedExtraData
+  }> {
+    const command = this.pickFirstString(input, ["command", "cmd"]) || ""
+    if (!command.trim()) {
+      return {
+        content: "[run_terminal_command error] Missing required command",
+        state: { status: "error", message: "missing command" },
+      }
+    }
+
+    // Resolve cwd. If the model passed an explicit cwd we constrain it
+    // to the workspace; otherwise default to the workspace root. This
+    // is the same policy the read/grep/ls inline tools enforce so the
+    // sub-agent can never poke around outside the project tree.
+    const requestedCwd = this.pickFirstString(input, [
+      "cwd",
+      "workdir",
+      "working_directory",
+      "workingDirectory",
+    ])
+    const target = this.buildSubAgentWorkspaceTarget(
+      conversationId,
+      requestedCwd || undefined,
+      true
+    )
+    if ("error" in target) {
+      return {
+        content: `[run_terminal_command error] ${target.message}`,
+        state: { status: "error", message: target.error },
+      }
+    }
+
+    // Verify cwd is a directory — child_process.spawn will fail with a
+    // confusing ENOTDIR otherwise.
+    try {
+      const cwdStat = statSync(target.absPath)
+      if (!cwdStat.isDirectory()) {
+        return {
+          content:
+            `[run_terminal_command error] cwd is not a directory: ` +
+            target.displayPath,
+          state: { status: "error", message: "cwd is not a directory" },
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return {
+        content: `[run_terminal_command error] cwd does not exist: ${message}`,
+        state: { status: "error", message },
+      }
+    }
+
+    const HARD_TIMEOUT_MS = 60_000
+    const MAX_STREAM_BYTES = 256 * 1024 // 256 KB per stream
+    const startedAtMs = Date.now()
+
+    type SpawnOutcome = {
+      exitCode: number | null
+      signal: NodeJS.Signals | null
+      stdout: string
+      stderr: string
+      stdoutTruncated: boolean
+      stderrTruncated: boolean
+      timedOut: boolean
+      spawnError?: Error
+    }
+
+    const outcome = await new Promise<SpawnOutcome>((resolve) => {
+      const child = spawn("bash", ["-c", command], {
+        cwd: target.absPath,
+        env: process.env,
+        stdio: ["ignore", "pipe", "pipe"],
+      })
+
+      let stdout = ""
+      let stderr = ""
+      let stdoutTruncated = false
+      let stderrTruncated = false
+      let timedOut = false
+      let settled = false
+
+      const timer = setTimeout(() => {
+        timedOut = true
+        try {
+          child.kill("SIGKILL")
+        } catch {
+          // best-effort kill; if the kill itself throws there's not
+          // much we can do — the resolve below still fires off the
+          // child's `close` event.
+        }
+      }, HARD_TIMEOUT_MS)
+
+      const settle = (partial: Partial<SpawnOutcome>) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve({
+          exitCode: null,
+          signal: null,
+          stdout,
+          stderr,
+          stdoutTruncated,
+          stderrTruncated,
+          timedOut,
+          ...partial,
+        })
+      }
+
+      child.stdout?.on("data", (data: Buffer) => {
+        if (stdoutTruncated) return
+        const remaining = MAX_STREAM_BYTES - stdout.length
+        if (remaining <= 0) {
+          stdoutTruncated = true
+          return
+        }
+        const chunk = data.toString("utf8")
+        if (chunk.length > remaining) {
+          stdout += chunk.slice(0, remaining)
+          stdoutTruncated = true
+        } else {
+          stdout += chunk
+        }
+      })
+      child.stderr?.on("data", (data: Buffer) => {
+        if (stderrTruncated) return
+        const remaining = MAX_STREAM_BYTES - stderr.length
+        if (remaining <= 0) {
+          stderrTruncated = true
+          return
+        }
+        const chunk = data.toString("utf8")
+        if (chunk.length > remaining) {
+          stderr += chunk.slice(0, remaining)
+          stderrTruncated = true
+        } else {
+          stderr += chunk
+        }
+      })
+      child.on("error", (err) => {
+        // spawn-level error (e.g. ENOENT for `bash` itself) — settle
+        // immediately rather than wait for `close`.
+        settle({ spawnError: err })
+      })
+      child.on("close", (code, signal) => {
+        settle({ exitCode: code, signal })
+      })
+    })
+
+    const durationMs = Date.now() - startedAtMs
+    input.command = command
+    input.cwd = target.displayPath
+    input.exit_code = outcome.exitCode
+    input.exitCode = outcome.exitCode
+    input.signal = outcome.signal
+    input.duration_ms = durationMs
+    input.durationMs = durationMs
+    input.timed_out = outcome.timedOut
+    input.timedOut = outcome.timedOut
+    input.stdout_truncated = outcome.stdoutTruncated
+    input.stdoutTruncated = outcome.stdoutTruncated
+    input.stderr_truncated = outcome.stderrTruncated
+    input.stderrTruncated = outcome.stderrTruncated
+
+    if (outcome.spawnError) {
+      const message = outcome.spawnError.message || "spawn failed"
+      return {
+        content: `[run_terminal_command error] ${message}`,
+        state: { status: "error", message },
+      }
+    }
+
+    if (outcome.timedOut) {
+      const message = `command timed out after ${HARD_TIMEOUT_MS}ms`
+      return {
+        content:
+          `[run_terminal_command error] ${message}\n` +
+          this.formatSubAgentShellStreams(
+            outcome.stdout,
+            outcome.stderr,
+            outcome.stdoutTruncated,
+            outcome.stderrTruncated
+          ),
+        state: { status: "error", message },
+      }
+    }
+
+    const exitCode = outcome.exitCode ?? -1
+    const status: ToolResultStatus = exitCode === 0 ? "success" : "error"
+    const headerStatus =
+      status === "success" ? "success" : `failure exit_code=${exitCode}`
+    const signalLine = outcome.signal ? ` signal=${outcome.signal}` : ""
+    const header =
+      `[run_terminal_command ${headerStatus}] cwd=${target.displayPath} ` +
+      `duration_ms=${durationMs}${signalLine}`
+    return {
+      content: `${header}\n${this.formatSubAgentShellStreams(
+        outcome.stdout,
+        outcome.stderr,
+        outcome.stdoutTruncated,
+        outcome.stderrTruncated
+      )}`,
+      state: {
+        status,
+        message:
+          status === "error" ? `command exited with ${exitCode}` : undefined,
+      },
+    }
+  }
+
+  /**
+   * Format the captured stdout/stderr from an in-process sub-agent
+   * shell invocation into a single block that's friendly for the LLM
+   * to reason about. Mirrors the layout we use elsewhere for shell
+   * results so the sub-agent's tool_result history looks consistent.
+   */
+  private formatSubAgentShellStreams(
+    stdout: string,
+    stderr: string,
+    stdoutTruncated: boolean,
+    stderrTruncated: boolean
+  ): string {
+    const parts: string[] = []
+    if (stdout.length > 0) {
+      parts.push("--- stdout ---")
+      parts.push(stdout.trimEnd())
+      if (stdoutTruncated) parts.push("(stdout truncated)")
+    }
+    if (stderr.length > 0) {
+      parts.push("--- stderr ---")
+      parts.push(stderr.trimEnd())
+      if (stderrTruncated) parts.push("(stderr truncated)")
+    }
+    if (parts.length === 0) {
+      parts.push("(no output)")
+    }
+    return parts.join("\n")
+  }
+
+  private buildInlineSubAgentLsDirectoryTreeRoot(
+    absPath: string,
+    entries: string[]
+  ): Record<string, unknown> {
+    const topLevelDirs = new Set<string>()
+    const topLevelFiles = new Set<string>()
+    const extensionCounts = new Map<string, number>()
+    let fileCount = 0
+
+    for (const entry of entries) {
+      const normalized = entry.replace(/\\/g, "/")
+      const topLevelName = normalized.replace(/\/.*$/g, "").replace(/\/$/g, "")
+      if (!topLevelName) continue
+      if (normalized.endsWith("/")) {
+        topLevelDirs.add(topLevelName)
+        continue
+      }
+      fileCount += 1
+      if (!normalized.includes("/")) {
+        topLevelFiles.add(topLevelName)
+      }
+      const ext = path.extname(normalized).replace(/^\./, "") || "(none)"
+      extensionCounts.set(ext, (extensionCounts.get(ext) || 0) + 1)
+    }
+
+    return {
+      absPath,
+      childrenDirs: Array.from(topLevelDirs)
+        .sort()
+        .map((name) => ({
+          name,
+          absPath: path.join(absPath, name),
+          childrenDirs: [],
+          childrenFiles: [],
+          childrenWereProcessed: false,
+          fullSubtreeExtensionCounts: {},
+          numFiles: 0,
+        })),
+      childrenFiles: Array.from(topLevelFiles)
+        .sort()
+        .map((name) => ({ name })),
+      childrenWereProcessed: true,
+      fullSubtreeExtensionCounts: Object.fromEntries(extensionCounts),
+      numFiles: fileCount,
+    }
   }
 
   private async collectWorkspacePaths(
@@ -12828,15 +14946,185 @@ ${raw}
     )
   }
 
-  private executeInlineAwaitTask(input: Record<string, unknown>): {
+  private async executeInlineAwaitTask(
+    input: Record<string, unknown>
+  ): Promise<{
+    content: string
+    state: { status: ToolResultStatus; message?: string }
+  }> {
+    // Resolve the task identifier the parent agent passed in. We accept
+    // both the proto field name (`task_id`) and the friendlier
+    // `agentId` / `agent_id` aliases that show up when the model copies
+    // the field straight from the spawn ack.
+    const taskId =
+      this.pickFirstString(input, [
+        "task_id",
+        "taskId",
+        "agentId",
+        "agent_id",
+      ]) || ""
+    if (!taskId) {
+      return {
+        content:
+          "[await_task error] missing task_id (pass the agentId returned by " +
+          "the original task tool call)",
+        state: { status: "error", message: "missing task_id" },
+      }
+    }
+    input.task_id = taskId
+
+    // Optional polling timeout — defaults to a generous window so the
+    // common case (parent waiting for a research task) does not bounce
+    // every 30s. The tool resolves as soon as the registry's
+    // donePromise settles, regardless of timeout.
+    const blockUntilMs = (() => {
+      const raw = input.block_until_ms ?? input.blockUntilMs ?? input.timeout_ms
+      if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
+        return Math.min(Math.floor(raw), 30 * 60 * 1000)
+      }
+      return 5 * 60 * 1000
+    })()
+
+    const metadataBeforeWait = this.subagentTaskRegistry.getMetadata(taskId)
+    if (!metadataBeforeWait) {
+      return {
+        content:
+          `[await_task error] no background sub-agent named '${taskId}' ` +
+          `is known to the bridge. Did the spawn succeed and the parent " +
+          "agent pass the exact agentId from its tool result?`,
+        state: { status: "error", message: "unknown agentId" },
+      }
+    }
+
+    if (!this.subagentTaskRegistry.isRunning(taskId)) {
+      // Already terminal — return the recorded summary immediately.
+      input.completed = true
+      return {
+        content: this.formatBackgroundSubagentAwaitResult(taskId),
+        state: { status: "success" },
+      }
+    }
+
+    // Race the registry's donePromise against the polling deadline.
+    // When the deadline fires first, the still_running shape is what
+    // the model gets — symmetric with claude-code's await semantics.
+    const handles = this.subagentTaskRegistry.listRunning()
+    const handle = handles.find((h) => h.agentId === taskId)
+    if (!handle) {
+      return {
+        content: this.formatBackgroundSubagentAwaitResult(taskId),
+        state: { status: "success" },
+      }
+    }
+
+    type AwaitWinner = { kind: "done" } | { kind: "timeout" }
+    const donePromise: Promise<AwaitWinner> = this.subagentTaskRegistry
+      .awaitDone(taskId)
+      .then(() => ({ kind: "done" as const }))
+    const timeoutPromise: Promise<AwaitWinner> = new Promise((resolve) =>
+      setTimeout(() => resolve({ kind: "timeout" as const }), blockUntilMs)
+    )
+    const winner = await Promise.race([donePromise, timeoutPromise])
+    if (winner.kind === "done") {
+      input.completed = true
+      return {
+        content: this.formatBackgroundSubagentAwaitResult(taskId),
+        state: { status: "success" },
+      }
+    }
+    return {
+      content: this.formatBackgroundSubagentStillRunning(taskId, blockUntilMs),
+      state: { status: "success" },
+    }
+  }
+
+  /** Format a terminal background sub-agent's metadata into the await
+   * tool's user-visible content. Reads metadata.json so the most
+   * recent state (including conversationSteps + finalText) is reported
+   * verbatim. */
+  private formatBackgroundSubagentAwaitResult(agentId: string): string {
+    const metadata = this.subagentTaskRegistry.getMetadata(agentId)
+    if (!metadata) {
+      return `[await_task] ${agentId} unknown — no metadata on disk`
+    }
+    const lines = [
+      `[await_task] ${agentId} ${metadata.status}`,
+      `agentType: ${metadata.agentType}`,
+      `turnCount: ${metadata.turnCount}`,
+      `toolCallCount: ${metadata.toolCallCount}`,
+      `durationMs: ${metadata.durationMs ?? "unknown"}`,
+    ]
+    if (metadata.errorMessage) lines.push(`error: ${metadata.errorMessage}`)
+    if (metadata.finalText) {
+      lines.push("")
+      lines.push("--- FINAL TEXT ---")
+      lines.push(metadata.finalText)
+    }
+    return lines.join("\n")
+  }
+
+  /** Format a still-running background sub-agent into the await tool's
+   * timeout-fallback content. */
+  private formatBackgroundSubagentStillRunning(
+    agentId: string,
+    waitedMs: number
+  ): string {
+    const metadata = this.subagentTaskRegistry.getMetadata(agentId)
+    if (!metadata) {
+      return `[await_task] ${agentId} still running (waited ${waitedMs}ms; no metadata available)`
+    }
+    return [
+      `[await_task] ${agentId} still running after ${waitedMs}ms`,
+      `agentType: ${metadata.agentType}`,
+      `turnCount: ${metadata.turnCount}`,
+      `toolCallCount: ${metadata.toolCallCount}`,
+      `(transcript continues at ~/.cursor/subagents/${agentId}/transcript.jsonl)`,
+    ].join("\n")
+  }
+
+  private executeInlineKillAgent(input: Record<string, unknown>): {
     content: string
     state: { status: ToolResultStatus; message?: string }
   } {
-    const taskId = this.pickFirstString(input, ["task_id", "taskId"]) || ""
-    input.task_id = taskId
-    input.completed = true
+    const agentId =
+      this.pickFirstString(input, [
+        "agent_id",
+        "agentId",
+        "task_id",
+        "taskId",
+      ]) || ""
+    if (!agentId) {
+      return {
+        content:
+          "[kill_agent error] missing agent_id (pass the agentId returned by " +
+          "the original task tool call)",
+        state: { status: "error", message: "missing agent_id" },
+      }
+    }
+    input.agent_id = agentId
+
+    const killed = this.subagentTaskRegistry.kill(
+      agentId,
+      "killed by parent via kill_agent tool"
+    )
+    if (!killed) {
+      const metadata = this.subagentTaskRegistry.getMetadata(agentId)
+      if (!metadata) {
+        return {
+          content: `[kill_agent error] no background sub-agent named '${agentId}'`,
+          state: { status: "error", message: "unknown agentId" },
+        }
+      }
+      return {
+        content: `[kill_agent] ${agentId} was already terminal (status=${metadata.status})`,
+        state: { status: "success" },
+      }
+    }
     return {
-      content: `[await_task success] ${taskId || "task"} completed`,
+      content:
+        `[kill_agent] ${agentId} kill signal sent. The worker will halt at ` +
+        `the next abort checkpoint and write a 'killed' terminal status to ` +
+        `metadata.json. Use await_task or read_file metadata.json to confirm.`,
       state: { status: "success" },
     }
   }
@@ -13322,6 +15610,9 @@ ${raw}
     }
     if (family === "await_task" || family === "await") {
       return this.executeInlineAwaitTask(input)
+    }
+    if (family === "kill_agent") {
+      return this.executeInlineKillAgent(input)
     }
     if (family === "read_project") {
       return this.executeInlineReadProject(conversationId, input)
@@ -14324,6 +16615,18 @@ ${raw}
     }
 
     if (family === "task") {
+      // task tool dispatcher: branch on `run_in_background`. Background
+      // mode immediately settles the parent task tool with a
+      // `taskSuccess { agentId, isBackground: true }` projection so the
+      // parent BiDi stream can close and the user can keep chatting; the
+      // worker keeps running in SubagentBackgroundWorker and writes its
+      // transcript / result to disk for later inspection. Mirrors
+      // claude-code's `task(run_in_background=true)` semantics.
+      const runInBackground = this.parseRunInBackgroundFlag(input)
+      if (runInBackground) {
+        yield* this.spawnBackgroundSubAgent(conversationId, toolCallId, input)
+        return true
+      }
       yield* this.executeSubAgentTask(conversationId, toolCallId, input)
       return true
     }
@@ -14446,10 +16749,11 @@ ${raw}
 
     // Cursor protocol white-list: tools that have a dedicated ToolCall oneof
     // case in agent.v1 AND are rendered as their own UI card by the IDE
-    // (todo list / plan tree / etc). Their lifecycle MUST emit
-    // toolCallStarted / toolCallCompleted carrying the proto-typed ToolCall
-    // envelope, otherwise the IDE never receives a render trigger and the
-    // card silently disappears even though the underlying state was updated.
+    // (todo list / plan tree / sub-agent task bubble / ...). Their lifecycle
+    // MUST emit toolCallStarted / toolCallCompleted carrying the proto-typed
+    // ToolCall envelope, otherwise the IDE never receives a render trigger
+    // and either falls back to a generic "General Purpose" placeholder or
+    // silently drops the card even though the underlying state was updated.
     //
     // Historically these were lumped with the rest of `DeferredToolFamily`
     // and got suppressed alongside `web_search` / `web_fetch` (which are
@@ -14459,8 +16763,20 @@ ${raw}
     // Keep `create_plan` here even though it also has an InteractionQuery
     // round-trip — InteractionQuery selects plan content, ToolCall renders
     // the plan card; both must fire.
+    //
+    // `task` is in this list because the parent task tool bubble's title
+    // ("Explore" / "Bash" / "smoke-probe" / ...) and progress UX are
+    // driven by the IDE consuming the parent TaskToolCall.args.subagentType
+    // payload from toolCallStarted. The actual sub-agent body streams via
+    // ToolCallDeltaUpdate(taskToolCallDelta) — that's a separate channel
+    // anchored to the same callId.
     const UI_CARD_TOOL_FAMILIES: ReadonlySet<DeferredToolFamily> =
-      new Set<DeferredToolFamily>(["read_todos", "update_todos", "create_plan"])
+      new Set<DeferredToolFamily>([
+        "read_todos",
+        "update_todos",
+        "create_plan",
+        "task",
+      ])
     if (family && UI_CARD_TOOL_FAMILIES.has(family)) {
       return undefined
     }
@@ -15105,25 +17421,26 @@ ${raw}
       looksLikeInPlaceEdit ||
       looksLikeProgrammaticWrite
     ) {
-      // For `sed -i` / `perl -pi` / `WriteFile(...)` / `open(..., "w")` we
-      // cannot reliably extract the target without a real parser, so fall
-      // back to the conservative block.
-      const hasNonRedirectionWrite =
-        looksLikeInPlaceEdit || looksLikeProgrammaticWrite
-      if (hasNonRedirectionWrite) {
-        return {
-          kind: "file_write",
-          recommendedTool: "edit_file_v2",
-          reason: "deterministic file write through shell",
-        }
-      }
-
-      // Extract all `> target` / `>> target` / `tee target` paths from the
-      // ORIGINAL command (preserving case for the path resolver).
+      // Best-effort target extraction across all write shapes:
+      //   - shell redirection: `> path`, `>> path`, `tee path`
+      //   - sed -i / perl -pi: target follows the last positional arg
+      //   - programmatic writes: writeFileSync(<literal>, ...) etc.
+      // If we can extract every target AND every target lives inside an
+      // ephemeral / tmp / smoke area, allow the command through. Only
+      // block when at least one target may be a workspace file or the
+      // shape is too opaque to reason about.
       const targets = this.extractShellWriteTargets(trimmed)
+      const programmaticTargets = looksLikeProgrammaticWrite
+        ? this.extractProgrammaticWriteTargets(trimmed)
+        : []
+      const inPlaceTargets = looksLikeInPlaceEdit
+        ? this.extractInPlaceEditTargets(trimmed)
+        : []
+      const allTargets = [...targets, ...programmaticTargets, ...inPlaceTargets]
 
-      // No target extracted → can't prove safety, conservatively block.
-      if (targets.length === 0) {
+      if (allTargets.length === 0) {
+        // Could not prove safety — conservative block. Includes
+        // sed -i / perl -pi / writeFileSync without a literal path.
         return {
           kind: "file_write",
           recommendedTool: "edit_file_v2",
@@ -15131,7 +17448,7 @@ ${raw}
         }
       }
 
-      const allTargetsAreEphemeral = targets.every((target) =>
+      const allTargetsAreEphemeral = allTargets.every((target) =>
         this.isEphemeralWritePath(target)
       )
       if (allTargetsAreEphemeral) {
@@ -15226,6 +17543,83 @@ ${raw}
         }
       )
     )
+  }
+
+  /**
+   * Best-effort target extraction for programmatic file writes inside
+   * `node -e "..."` / `python -c "..."` / similar inline scripts.
+   * Pattern matches:
+   *   - writeFileSync("path", ...)        // node fs
+   *   - writeFile("path", ...)            // node fs (callback / promise)
+   *   - fs.writeFile{Sync,}("path", ...)  // explicit fs.* form
+   *   - open("path", "w")                 // python / generic
+   *   - Path("path").write_text(...)      // pathlib
+   *
+   * Quote style: ' " ` all accepted. Only the first string literal in
+   * the call's argument list is treated as the target — that matches
+   * every standard write API.
+   *
+   * Returns the empty list when no literal path could be extracted, in
+   * which case classifyAvoidableShellCommand falls back to the
+   * conservative block.
+   */
+  private extractProgrammaticWriteTargets(command: string): string[] {
+    if (!command) return []
+    const targets: string[] = []
+    // writeFileSync / writeFile / write_text / fs.writeFile* — first
+    // argument is the path. We accept identifiers prefixed with an
+    // optional `fs.` so node's `require('fs').writeFileSync` form
+    // matches.
+    const writeFnRegex =
+      /\b(?:fs\.)?(?:writeFile(?:Sync)?|write_text)\s*\(\s*(['"`])([^'"`]+)\1/gi
+    let match: RegExpExecArray | null
+    while ((match = writeFnRegex.exec(command)) !== null) {
+      const literal = match[2]
+      if (literal) targets.push(literal)
+    }
+    // open("path", "w" | "a" | "x") — second positional arg distinguishes
+    // write mode from read; we already gated on the regex earlier so
+    // capture the first arg unconditionally.
+    const openRegex =
+      /\bopen\s*\(\s*(['"`])([^'"`]+)\1\s*,\s*(['"`])(?:w|a|x)\+?\3/gi
+    while ((match = openRegex.exec(command)) !== null) {
+      const literal = match[2]
+      if (literal) targets.push(literal)
+    }
+    return targets
+  }
+
+  /**
+   * Best-effort target extraction for `sed -i` / `perl -pi` in-place
+   * edits. The target is the LAST positional argument. We strip flags
+   * and the embedded edit script, then return whatever non-flag tokens
+   * remain. Multiple targets (e.g. `sed -i 's/a/b/' f1 f2`) all get
+   * captured.
+   */
+  private extractInPlaceEditTargets(command: string): string[] {
+    if (!command) return []
+    const targets: string[] = []
+    // Match sed -i / perl -pi tail, then split on whitespace and keep
+    // tokens that don't look like flags or quoted edit scripts.
+    const inPlaceRegex =
+      /(^|[\n;&|])\s*(?:sed\s+(?:-[a-z]+\s+)*-i\b|perl\s+(?:-[a-z]+\s+)*-pi\b)([^\n;|&]*)/g
+    let match: RegExpExecArray | null
+    while ((match = inPlaceRegex.exec(command)) !== null) {
+      const tail = (match[2] || "").trim()
+      // Strip the first quoted edit script (either form: 's/a/b/' or "s/a/b/")
+      const withoutScript = tail.replace(/(^|\s)(['"])(?:[^'"\\]|\\.)*\2/, " ")
+      const tokens = withoutScript
+        .split(/\s+/)
+        .map((token) => token.replace(/^['"]/, "").replace(/['"]$/, ""))
+        .filter(
+          (token) =>
+            token.length > 0 && !token.startsWith("-") && !token.includes("=")
+        )
+      for (const token of tokens) {
+        targets.push(token)
+      }
+    }
+    return targets
   }
 
   /**
@@ -16366,9 +18760,22 @@ ${raw}
             parsed.agentControlType === "cancelSubagentAction" &&
             conversationId
           ) {
-            this.logger.log(
-              `ConversationAction.cancelSubagent: ${conversationId} subagentId=${parsed.agentControlSubagentId || "(none)"}`
+            const cancelledCount = this.cancelActiveForegroundSubAgent(
+              conversationId,
+              "cancelSubagentAction",
+              {
+                targetSubagentId: parsed.agentControlSubagentId || undefined,
+                includeBackground: true,
+              }
             )
+            this.logger.log(
+              `ConversationAction.cancelSubagent: ${conversationId} ` +
+                `subagentId=${parsed.agentControlSubagentId || "(none)"} ` +
+                `cleared=${cancelledCount}`
+            )
+            if (cancelledCount > 0) {
+              return
+            }
           } else if (
             parsed.agentControlType === "backgroundTaskCompletionAction" &&
             conversationId
@@ -16682,6 +19089,46 @@ ${raw}
             sessionBeforeRun &&
             sessionBeforeRun.pendingToolCalls.size > 0
           ) {
+            const pendingIds = Array.from(
+              sessionBeforeRun.pendingToolCalls.keys()
+            )
+            const nowMs = Date.now()
+            const freshPendingIds = pendingIds.filter((toolCallId) => {
+              const pending = sessionBeforeRun.pendingToolCalls.get(toolCallId)
+              const sentAtMs = pending?.sentAt?.getTime()
+              return (
+                typeof sentAtMs === "number" &&
+                Number.isFinite(sentAtMs) &&
+                nowMs - sentAtMs <= this.PENDING_TOOL_RESUME_GRACE_MS
+              )
+            })
+            const stalePendingIds = pendingIds.filter(
+              (toolCallId) => !freshPendingIds.includes(toolCallId)
+            )
+            if (stalePendingIds.length > 0) {
+              const clearedCount = this.interruptPendingToolCallsForRecovery(
+                conversationId!,
+                stalePendingIds,
+                "resumeAction arrived after pending tool result grace period"
+              )
+              this.logger.warn(
+                `Interrupted ${clearedCount} stale pending tool call(s) on resumeAction after ` +
+                  `${this.PENDING_TOOL_RESUME_GRACE_MS}ms grace period`
+              )
+            }
+            if (freshPendingIds.length === 0) {
+              const recoveredSession = this.sessionManager.getSession(
+                conversationId!
+              )
+              if (recoveredSession?.restartRecovery) {
+                yield* this.emitAgentFinalTextResponse(
+                  recoveredSession,
+                  recoveredSession.restartRecovery.notice
+                )
+                this.sessionManager.clearRestartRecovery(conversationId!)
+              }
+              return
+            }
             // Rebind the pending tool calls to the current stream ID, since
             // the tool results will arrive on this new stream.
             const reboundCount =
@@ -16707,19 +19154,22 @@ ${raw}
             )
           }
           if (sessionBeforeRun && sessionBeforeRun.pendingToolCalls.size > 0) {
-            // Stale pending tool calls from a previous (now-closed) BiDi stream.
-            // These tool results will NEVER arrive because the old stream is gone.
-            // Clear them to avoid a permanent dead-lock where the system waits forever.
-            const stalePendingIds = Array.from(
+            const currentPendingIds = Array.from(
               sessionBeforeRun.pendingToolCalls.keys()
             )
+            // Only resumeAction is a protocol-level instruction to wait for
+            // old pending tool results. A normal userMessageAction can still
+            // carry conversation_state.pending_tool_calls from Cursor's saved
+            // state, but treating that as "wait instead of answering" stalls
+            // ordinary chat after a tool stream closes before the IDE returns
+            // the result.
             const clearedCount = this.interruptPendingToolCallsForRecovery(
               conversationId!,
-              stalePendingIds,
-              "previous bidi stream closed before tool results arrived"
+              currentPendingIds,
+              "new user turn arrived before previous pending tool results completed"
             )
             this.logger.warn(
-              `Interrupted ${clearedCount} stale pending tool call(s) from previous stream; proceeding with new chat turn`
+              `Interrupted ${clearedCount} pending tool call(s) from previous stream; proceeding with new user turn`
             )
           }
 
@@ -16758,16 +19208,19 @@ ${raw}
           ? Array.from(sessionAtStreamEnd.pendingToolCalls.keys())
           : []
         if (pendingIdsAtStreamEnd.length > 0) {
-          const interruptedCount = this.interruptPendingToolCallsForRecovery(
-            conversationId,
-            pendingIdsAtStreamEnd,
-            "bidi stream closed before tool results arrived"
+          // Cursor may close/replace an AgentService/Run HTTP/2 stream after
+          // receiving ExecServerMessage while the IDE is still executing the
+          // tool. The follow-up can arrive on a fresh resumeAction stream,
+          // carrying conversation_state.pending_tool_calls. Treat plain input
+          // EOF as a transport boundary, not as a user/tool abort.
+          //
+          // Explicit aborts still flow through execThrow/cancelAction. New
+          // user-message turns with stale pending tools are handled above
+          // before the next model request starts.
+          this.logger.warn(
+            `BiDi stream ended with ${pendingIdsAtStreamEnd.length} pending tool call(s); ` +
+              `keeping pending state for resumeAction: ${pendingIdsAtStreamEnd.join(", ")}`
           )
-          if (interruptedCount > 0) {
-            this.logger.warn(
-              `BiDi stream ended with ${interruptedCount} pending tool call(s); marked previous turn interrupted for recovery`
-            )
-          }
         }
       }
 
@@ -16952,6 +19405,7 @@ ${raw}
     const apiTools = buildToolsForApi(toolsToUse, {
       mcpToolDefs,
       backend: route.backend,
+      subagentDefinitions: this.buildSubagentDefinitionsForToolPrompt(session),
     })
 
     // Apply truncation to stay within token limits
@@ -17268,23 +19722,30 @@ ${raw}
     // produce a valid conversationCheckpointUpdate.
     const session = this.sessionManager.getSession(conversationId)
     if (session) {
-      const turnId = this.generateTurnId(conversationId, session.turns.length)
-      this.sessionManager.addTurn(conversationId, turnId)
+      const completedTurn = this.recordCompletedTurnIfNeeded(
+        session,
+        true,
+        `post-tool continuation error: ${conversationId}`
+      )
+      for (const blobMessage of completedTurn.blobMessages) {
+        yield blobMessage
+      }
+      const completedSession = completedTurn.session
 
       const checkpoint = this.grpcService.createConversationCheckpointResponse(
         conversationId,
-        session.model,
+        completedSession.model,
         {
-          messageBlobIds: session.messageBlobIds,
-          usedTokens: session.usedTokens || 0,
-          maxTokens: this.resolveCheckpointMaxTokens(session),
-          workspaceUri: session.projectContext?.rootPath
-            ? `file://${session.projectContext.rootPath}`
+          messageBlobIds: completedSession.messageBlobIds,
+          usedTokens: completedSession.usedTokens || 0,
+          maxTokens: this.resolveCheckpointMaxTokens(completedSession),
+          workspaceUri: completedSession.projectContext?.rootPath
+            ? `file://${completedSession.projectContext.rootPath}`
             : undefined,
-          readPaths: Array.from(session.readPaths),
-          fileStates: Object.fromEntries(session.fileStates),
-          turns: session.turns,
-          todos: session.todos,
+          readPaths: Array.from(completedSession.readPaths),
+          fileStates: Object.fromEntries(completedSession.fileStates),
+          turns: completedSession.turns,
+          todos: completedSession.todos,
         }
       )
       yield checkpoint
@@ -17771,6 +20232,8 @@ ${raw}
       const apiTools = buildToolsForApi(filteredToolsToUse, {
         mcpToolDefs: activeSession.mcpToolDefs,
         backend: route.backend,
+        subagentDefinitions:
+          this.buildSubagentDefinitionsForToolPrompt(activeSession),
       })
 
       const normalizedShellHistory = this.normalizeHistoryForBackend(
@@ -18006,6 +20469,61 @@ ${raw}
     this.logger.log(
       `Received tool result: ${toolCallId} (${toolResult.resultCase})`
     )
+
+    // Sub-agent ownership check — if this pending tool call belongs to
+    // a sub-agent's LLM turn (registered with subagentOwner via
+    // executeSubAgentTask), forward the raw ExecClientMessage payload to
+    // SubagentExecBridgeService and short-circuit. Without this, the
+    // result would feed into the parent's tool-result continuation
+    // pipeline, double-settling the parent task tool. The bridge
+    // resolver unblocks the sub-agent worker which formats the result
+    // for the sub-agent's own message history and continues its loop.
+    const pendingForOwnerCheck = session.pendingToolCalls.get(toolCallId)
+    if (pendingForOwnerCheck?.subagentOwner) {
+      // Stream-aware sub-agent dispatch:
+      //
+      //   - shellStream chunks go through `deliverShellStreamChunk`,
+      //     which buffers stdout/stderr until the terminal `exit`
+      //     event and then resolves the waiter with the accumulated
+      //     payload. Intermediate chunks (start / stdout / stderr) do
+      //     NOT settle the waiter; they only update the buffer.
+      //   - everything else (read_result / grep_result / shell_result
+      //     when the IDE chose the synchronous shellArgs path / etc.)
+      //     resolves immediately via deliverResult, same as before.
+      //
+      // We must short-circuit the parent's continuation pipeline in
+      // BOTH cases — the sub-agent owns the tool call, even when the
+      // chunk is intermediate.
+      let delivered: boolean
+      if (toolResult.resultCase === "shellStream") {
+        delivered = this.subagentExecBridge.deliverShellStreamChunk(
+          toolCallId,
+          toolResult.resultData
+        )
+      } else {
+        delivered = this.subagentExecBridge.deliverResult(toolCallId, {
+          resultData: toolResult.resultData,
+          resultCase: toolResult.resultCase,
+        })
+      }
+      if (delivered) {
+        this.logger.log(
+          `Routed tool result ${toolCallId} (${toolResult.resultCase}) to ` +
+            `sub-agent ${pendingForOwnerCheck.subagentOwner}; bypassing ` +
+            `parent continuation pipeline.`
+        )
+        return
+      }
+      // Fall through if no waiter was registered — this means the
+      // sub-agent worker raced ahead (e.g. abort) and the result is
+      // orphaned. Consume the pending entry so it doesn't leak.
+      this.logger.warn(
+        `Sub-agent owner ${pendingForOwnerCheck.subagentOwner} had no waiter ` +
+          `for ${toolCallId}; consuming pending entry to prevent leak.`
+      )
+      this.sessionManager.consumePendingToolCall(conversationId, toolCallId)
+      return
+    }
 
     // Handle shell_stream events separately (streaming shell output)
     // These events come in real-time and shouldn't consume the pending tool call
@@ -19126,6 +21644,8 @@ ${raw}
         {
           mcpToolDefs: activeSession.mcpToolDefs,
           backend: route.backend,
+          subagentDefinitions:
+            this.buildSubagentDefinitionsForToolPrompt(activeSession),
         }
       )
       const normalizedContinuationHistory = this.normalizeHistoryForBackend(
@@ -20810,15 +23330,14 @@ ${raw}
   private buildCursorToolUsageSection(): string {
     return [
       "Using your tools:",
-      "- Do NOT use run_terminal_command when a relevant dedicated tool is available. This is critical because dedicated tools keep the session structured and reviewable.",
-      "- To inspect file contents, use read_file instead of cat, sed, head, or tail.",
-      "- To search file contents, use grep_search instead of grep or rg.",
-      "- To discover files or inspect directory contents, use glob_search, file_search, or list_directory instead of find or ls.",
-      "- To edit existing files, use edit_file_v2 instead of sed, awk, perl, python, or shell patching.",
-      "- To create a new file, use edit_file_v2 with search set to an empty string and replace set to the full file content; do not use cat heredoc, tee, echo redirection, or shell-based file creation.",
-      "- Before editing, read the file in the current conversation and copy a small unique search snippet verbatim from read_file output. Do not include any display-only line number prefixes.",
+      "- Prefer dedicated tools over run_terminal_command when one fits the task. Dedicated tools keep the session structured and reviewable, and the IDE renders their output natively.",
+      "- To inspect file contents, prefer read_file over cat, sed, head, or tail.",
+      "- To search file contents, prefer grep_search over grep or rg.",
+      "- To discover files or inspect directory contents, prefer glob_search, file_search, or list_directory over find or ls.",
+      "- To edit or create files, prefer edit_file_v2 over sed, awk, perl, python, cat heredoc, tee, or echo redirection. To create a new file, call edit_file_v2 with search set to an empty string and replace set to the full file content. To replace every occurrence of a string in a file, set replace_all: true; otherwise the edit fails when search matches more than once.",
+      "- Before editing an existing file, read the file in the current conversation and copy a small unique search snippet verbatim from read_file output. Do not include any display-only line number prefixes.",
+      "- run_terminal_command remains the right choice for build/test execution, system commands, scripts that compute or verify something, or work that no structured tool can express. The bridge will block shell file writes whose targets land inside the workspace; ephemeral paths (/tmp, smoke fixtures, OS temp dirs) and read-only commands run normally.",
       "- If the task already requires a report, artifact, or file edit and you have enough evidence, perform that write now instead of only saying that you will do it next.",
-      "- Reserve run_terminal_command for build/test execution, system commands, or tasks where no structured tool can express the work.",
       "- If multiple tool calls are independent, make them in parallel. If one depends on another, run them sequentially.",
     ].join("\n")
   }
@@ -20826,17 +23345,16 @@ ${raw}
   private buildCodexToolUsageSection(): string {
     return [
       "Using your tools:",
-      "- Do NOT use run_terminal_command when a relevant dedicated tool is available. This is critical because dedicated tools keep the session structured and reviewable.",
-      "- To inspect file contents, use read_file instead of cat, sed, head, or tail.",
-      "- To search file contents, use grep_search instead of grep or rg.",
-      "- To discover files or inspect directory contents, use glob_search, file_search, or list_directory instead of find or ls.",
-      "- To edit existing files, use edit_file_v2 instead of sed, awk, perl, python, or shell patching.",
-      "- To create a new file, use edit_file_v2 with search set to an empty string and replace set to the full file content; do not use cat heredoc, tee, echo redirection, or shell-based file creation.",
-      "- Before editing, read the file in the current conversation and copy a small unique search snippet verbatim from read_file output. Do not include any display-only line number prefixes.",
+      "- Prefer dedicated tools over run_terminal_command when one fits the task. Dedicated tools keep the session structured and reviewable, and the IDE renders their output natively.",
+      "- To inspect file contents, prefer read_file over cat, sed, head, or tail.",
+      "- To search file contents, prefer grep_search over grep or rg.",
+      "- To discover files or inspect directory contents, prefer glob_search, file_search, or list_directory over find or ls.",
+      "- To edit or create files, prefer edit_file_v2 over sed, awk, perl, python, cat heredoc, tee, or echo redirection. To create a new file, call edit_file_v2 with search set to an empty string and replace set to the full file content. To replace every occurrence of a string in a file, set replace_all: true; otherwise the edit fails when search matches more than once.",
+      "- Before editing an existing file, read the file in the current conversation and copy a small unique search snippet verbatim from read_file output. Do not include any display-only line number prefixes.",
       "- If you need to continue an existing shell session, use write_shell_stdin instead of starting a fresh run_terminal_command.",
       "- Prefer MCP resources over web_search when the required context is available from a configured MCP server.",
+      "- run_terminal_command remains the right choice for build/test execution, system commands, scripts that compute or verify something, or work that no structured tool can express. The bridge will block shell file writes whose targets land inside the workspace; ephemeral paths (/tmp, smoke fixtures, OS temp dirs) and read-only commands run normally.",
       "- If the task already requires a report, artifact, or file edit and you have enough evidence, perform that write now instead of only saying that you will do it next.",
-      "- Reserve run_terminal_command for build/test execution, system commands, or tasks where no structured tool can express the work.",
       "- If multiple tool calls are independent, make them in parallel. If one depends on another, run them sequentially.",
     ].join("\n")
   }
@@ -21350,16 +23868,5 @@ ${raw}
    */
   private generateConversationId(): string {
     return `conv_${Date.now()}_${Math.random().toString(36).substring(7)}`
-  }
-
-  /**
-   * Generate turn ID using SHA-256 hash
-   * Format: Base64-encoded hash (44 characters)
-   */
-  private generateTurnId(conversationId: string, turnIndex: number): string {
-    const data = `${conversationId}-turn-${turnIndex}-${Date.now()}`
-    const hash = crypto.createHash("sha256")
-    hash.update(data)
-    return hash.digest("base64")
   }
 }

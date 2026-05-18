@@ -335,6 +335,12 @@ import {
   ThinkingDeltaUpdateSchema,
   ThinkingStyle,
   TimeoutBehavior,
+  // ConversationStep — sub-agent transcript renderer expects an
+  // assembled list of these for the parent task bubble's expandable
+  // detail panel.
+  AssistantMessageSchema,
+  ConversationStepSchema,
+  ThinkingMessageSchema,
   // Todo & Phase
   TodoItemSchema,
   TokenDeltaUpdateSchema,
@@ -1823,6 +1829,211 @@ export class CursorGrpcService {
         modelCallId: modelCallId || "",
       })
     )
+  }
+
+  // ─── Sub-agent (TaskToolCallDelta) wrappers ─────────────────
+  //
+  // Cursor's official protocol streams sub-agent progress to the IDE by
+  // wrapping each inner agent.v1.InteractionUpdate inside a
+  // TaskToolCallDelta, then enveloping that as a ToolCallDeltaUpdate
+  // anchored to the parent `task` tool call's callId. This is what makes
+  // the parent `task` tool bubble in the chat expand to show live
+  // text / thinking / tool calls produced by the sub-agent — without
+  // bleeding into the main agent's text stream.
+  //
+  // The helpers below build inner InteractionUpdate values (NOT wrapped
+  // as outer AgentServerMessage Buffers, because TaskToolCallDelta needs
+  // the raw InteractionUpdate message), then `wrapAsTaskToolCallDelta`
+  // takes any such inner update and emits the full
+  // AgentServerMessage(interactionUpdate.toolCallDelta) Buffer ready to
+  // yield on the BiDi stream.
+
+  /**
+   * Wrap an inner agent.v1.InteractionUpdate inside the parent task tool
+   * call's ToolCallDeltaUpdate envelope. The inner InteractionUpdate is
+   * what the sub-agent is producing (text / thinking / tool lifecycle).
+   * The outer envelope's callId is the parent task tool call's callId
+   * so the IDE attaches the rendering to the correct task bubble.
+   */
+  wrapAsTaskToolCallDelta(
+    parentTaskCallId: string,
+    parentTaskModelCallId: string,
+    innerInteractionUpdate: ReturnType<
+      typeof create<typeof InteractionUpdateSchema>
+    >
+  ): Buffer {
+    const toolCallDelta = create(ToolCallDeltaSchema, {
+      delta: {
+        case: "taskToolCallDelta" as const,
+        value: create(TaskToolCallDeltaSchema, {
+          interactionUpdate: innerInteractionUpdate,
+        }),
+      },
+    })
+
+    return this.wrapInteractionUpdate(
+      "toolCallDelta",
+      create(ToolCallDeltaUpdateSchema, {
+        callId: parentTaskCallId,
+        toolCallDelta,
+        modelCallId: parentTaskModelCallId || "",
+      })
+    )
+  }
+
+  /**
+   * Build an inner agent.v1.InteractionUpdate carrying a textDelta. Used
+   * by the sub-agent worker to mirror sub-agent assistant text into the
+   * parent task bubble via wrapAsTaskToolCallDelta.
+   */
+  buildInnerTextDeltaInteractionUpdate(text: string) {
+    return create(InteractionUpdateSchema, {
+      message: {
+        case: "textDelta" as const,
+        value: create(TextDeltaUpdateSchema, { text }),
+      },
+    })
+  }
+
+  /**
+   * Build an inner agent.v1.InteractionUpdate carrying a thinkingDelta.
+   */
+  buildInnerThinkingDeltaInteractionUpdate(thinking: string, model?: string) {
+    return create(InteractionUpdateSchema, {
+      message: {
+        case: "thinkingDelta" as const,
+        value: create(ThinkingDeltaUpdateSchema, {
+          text: thinking,
+          thinkingStyle: resolveThinkingStyleForModel(model),
+        }),
+      },
+    })
+  }
+
+  /**
+   * Build an inner agent.v1.InteractionUpdate carrying a toolCallStarted
+   * event for a tool call that the sub-agent is making. The callId here
+   * is the sub-agent's own tool call id, NOT the parent task tool call's.
+   */
+  buildInnerToolCallStartedInteractionUpdate(
+    callId: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    toolFamilyHint?: ToolFamily,
+    modelCallId: string = ""
+  ) {
+    return create(InteractionUpdateSchema, {
+      message: {
+        case: "toolCallStarted" as const,
+        value: create(ToolCallStartedUpdateSchema, {
+          callId,
+          toolCall: this.buildToolCallV2(
+            toolName,
+            callId,
+            args,
+            toolFamilyHint
+          ),
+          modelCallId,
+        }),
+      },
+    })
+  }
+
+  /**
+   * Build an inner agent.v1.InteractionUpdate carrying a toolCallCompleted
+   * event for a tool call that the sub-agent has completed.
+   */
+  buildInnerToolCallCompletedInteractionUpdate(
+    callId: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    result: string,
+    toolFamilyHint?: ToolFamily,
+    modelCallId: string = "",
+    extraData?: ToolCompletionExtraData
+  ) {
+    return create(InteractionUpdateSchema, {
+      message: {
+        case: "toolCallCompleted" as const,
+        value: create(ToolCallCompletedUpdateSchema, {
+          callId,
+          toolCall: this.buildToolCallV2WithResult(
+            toolName,
+            callId,
+            args,
+            result,
+            extraData,
+            toolFamilyHint
+          ),
+          modelCallId,
+        }),
+      },
+    })
+  }
+
+  // ─── Sub-agent ConversationStep builders ─────────────────────
+  //
+  // The TaskSuccess.conversationSteps field in agent.v1 is the official
+  // data source the IDE uses to render the parent task bubble's
+  // expandable detail panel. Each step is one of three oneof cases:
+  //
+  //   - assistantMessage { text }
+  //   - thinkingMessage  { text, durationMs }
+  //   - toolCall         (the full proto ToolCall envelope)
+  //
+  // These builders produce the proto-typed objects that
+  // executeSubAgentTask / SubagentBackgroundWorker accumulate per turn,
+  // then pass to TaskSuccess.conversationSteps when settling the
+  // parent task tool. Without filling this field the bubble's accordion
+  // shows only "Completed" with no breakdown.
+
+  /** ConversationStep wrapping an assistant text reply. */
+  buildAssistantConversationStep(text: string) {
+    return create(ConversationStepSchema, {
+      message: {
+        case: "assistantMessage" as const,
+        value: create(AssistantMessageSchema, { text }),
+      },
+    })
+  }
+
+  /** ConversationStep wrapping a thinking trace, with duration. */
+  buildThinkingConversationStep(text: string, durationMs: number = 0) {
+    return create(ConversationStepSchema, {
+      message: {
+        case: "thinkingMessage" as const,
+        value: create(ThinkingMessageSchema, {
+          text,
+          durationMs: Math.max(0, Math.floor(durationMs)),
+        }),
+      },
+    })
+  }
+
+  /** ConversationStep wrapping a sub-agent tool invocation (with its
+   * args + result already encoded into the ToolCall envelope). */
+  buildToolCallConversationStep(
+    toolName: string,
+    callId: string,
+    args: Record<string, unknown>,
+    result: string,
+    extraData?: ToolCompletionExtraData,
+    toolFamilyHint?: ToolFamily
+  ) {
+    const toolCall = this.buildToolCallV2WithResult(
+      toolName,
+      callId,
+      args,
+      result,
+      extraData,
+      toolFamilyHint
+    )
+    return create(ConversationStepSchema, {
+      message: {
+        case: "toolCall" as const,
+        value: toolCall,
+      },
+    })
   }
 
   // ─── ExecServerMessage (Agent tool call dispatch) ────────────
@@ -3714,6 +3925,14 @@ export class CursorGrpcService {
     switch (normalized) {
       case "":
       case "unspecified":
+      // The bridge's built-in `general-purpose` agent maps to the proto's
+      // unspecified case. claude-code uses the same convention — passing
+      // an explicit "general-purpose" name produces the same IDE bubble
+      // the unset case would, so the IDE renders the default label.
+      // falls through
+      case "general-purpose":
+      case "general_purpose":
+      case "generalpurpose":
         return create(SubagentTypeSchema, {
           type: {
             case: "unspecified" as const,
@@ -3752,6 +3971,12 @@ export class CursorGrpcService {
         })
       case "browser_use":
       case "browseruse":
+      // Cursor's official 3rd built-in sub-agent is named `browser` in
+      // user-facing docs but the proto oneof case is `browserUse`. Treat
+      // both names as the same proto type so a `subagent_type: "browser"`
+      // call from the model maps cleanly to SubagentType.browserUse.
+      // falls through
+      case "browser":
         return create(SubagentTypeSchema, {
           type: {
             case: "browserUse" as const,
@@ -7830,9 +8055,12 @@ export class CursorGrpcService {
               blobId: new TextEncoder().encode(
                 kvMessage.setBlobArgs.blobId || ""
               ),
-              blobData: new TextEncoder().encode(
-                kvMessage.setBlobArgs.blobData || ""
-              ),
+              blobData:
+                kvMessage.setBlobArgs.blobData instanceof Uint8Array
+                  ? kvMessage.setBlobArgs.blobData
+                  : new TextEncoder().encode(
+                      kvMessage.setBlobArgs.blobData || ""
+                    ),
             }),
           },
         })

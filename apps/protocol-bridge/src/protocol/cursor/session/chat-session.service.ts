@@ -459,6 +459,15 @@ export interface PendingToolCall {
     signal?: string
     started: boolean
   }
+  /**
+   * When set, this tool call belongs to a sub-agent's LLM turn (not the
+   * parent agent). The handleToolResult router uses this marker to route
+   * the ExecClientMessage back to the sub-agent worker via
+   * SubagentExecBridgeService instead of feeding it into the parent's
+   * tool-result continuation pipeline. Value is the subagentId that owns
+   * the call.
+   */
+  subagentOwner?: string
 }
 
 export interface SessionToolMetrics {
@@ -570,6 +579,15 @@ export interface SubAgentContext {
   pendingToolResults: Map<string, SubAgentToolResult>
   /** IDs of tools we are still waiting for (subset of currentTurnToolCalls) */
   expectedToolCallIds: Set<string>
+
+  /**
+   * Accumulated `agent.v1.ConversationStep` proto values produced as the
+   * sub-agent runs — assistant text, thinking, tool calls. Filled into
+   * `TaskSuccess.conversationSteps` when the parent task tool settles
+   * so the IDE's parent task bubble can expand into the per-step detail
+   * accordion. Mirrors claude-code's per-turn step tracking. Stored as
+   * unknown[] because the proto type is private to cursor-grpc.service. */
+  conversationSteps: unknown[]
 }
 
 export interface SubAgentToolResult {
@@ -3143,7 +3161,8 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     modelCallId: string = "",
     historyToolName?: string,
     historyToolInput?: Record<string, unknown>,
-    codexToolCallType?: "function" | "custom"
+    codexToolCallType?: "function" | "custom",
+    subagentOwner?: string
   ): void {
     const session = this.getSession(conversationId)
     if (session) {
@@ -3172,10 +3191,12 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
         execIds: new Set(),
         beforeContent,
         streamId: session.currentStreamId,
+        subagentOwner,
       })
       session.lastActivityAt = new Date()
       this.logger.debug(
-        `Added pending tool call: ${toolCallId} (${toolName}) for session ${conversationId}`
+        `Added pending tool call: ${toolCallId} (${toolName}) for session ${conversationId}` +
+          (subagentOwner ? ` [subagent=${subagentOwner}]` : "")
       )
       this.schedulePersist(conversationId)
     }

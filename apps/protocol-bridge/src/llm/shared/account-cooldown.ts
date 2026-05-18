@@ -21,8 +21,10 @@ const QUOTA_BACKOFF_BASE_MS = 30_000 // 30 seconds
 /** Maximum 429 cooldown */
 const QUOTA_BACKOFF_MAX_MS = 15 * 60_000 // 15 minutes
 
-/** 401/402/403 cooldown */
-const AUTH_COOLDOWN_MS = 60_000 // 1 minute
+/** 401/402/403 cooldown — short duration since the retry loop handles
+ *  forced token refresh and account switching. This just prevents the
+ *  same account from being immediately re-picked in the same retry cycle. */
+const AUTH_COOLDOWN_MS = 5_000 // 5 seconds
 
 /** 404 (model not supported) cooldown */
 const NOT_FOUND_COOLDOWN_MS = 12 * 3600_000 // 12 hours

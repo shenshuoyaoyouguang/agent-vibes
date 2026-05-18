@@ -263,6 +263,7 @@ export interface ParsedCursorRequest {
   // ConversationAction.resume_action
   isResumeAction?: boolean
   resumePendingToolCallIds?: string[]
+  statePendingToolCallIds?: string[]
 
   // MCP 工具定义（从 Cursor 协议 McpToolDefinition 解析，含完整 input_schema）
   mcpToolDefs?: McpToolDef[]
@@ -1122,6 +1123,8 @@ export class CursorRequestParser {
     const stateHistory = this.extractConversationHistoryFromState(
       req.conversationState
     )
+    const statePendingToolCallIds =
+      req.conversationState?.pendingToolCalls || []
 
     // 附加图片
     const attachedImages: AttachedImage[] = []
@@ -1720,8 +1723,8 @@ export class CursorRequestParser {
           requestedModelParameters,
           requestContextEnv,
           isResumeAction: true,
-          resumePendingToolCallIds:
-            req.conversationState?.pendingToolCalls || [],
+          resumePendingToolCallIds: statePendingToolCallIds,
+          statePendingToolCallIds,
           mcpToolDefs: mcpToolDefs.length > 0 ? mcpToolDefs : undefined,
         }
       }
@@ -1773,6 +1776,7 @@ export class CursorRequestParser {
       requestedMaxOutputTokens,
       requestedModelParameters,
       requestContextEnv,
+      statePendingToolCallIds,
       mcpToolDefs: mcpToolDefs.length > 0 ? mcpToolDefs : undefined,
       attachedImages: attachedImages.length > 0 ? attachedImages : undefined,
     }

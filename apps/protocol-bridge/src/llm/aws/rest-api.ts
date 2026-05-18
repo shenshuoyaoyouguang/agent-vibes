@@ -18,6 +18,8 @@ export interface KiroRestRequestContext {
   machineId?: string
   proxyUrl?: string
   client?: Partial<KiroClientConfig>
+  /** When set to "API_KEY", adds a `tokentype: API_KEY` header to requests. */
+  tokenType?: "API_KEY"
 }
 
 interface ListProfilesResponse {
@@ -59,13 +61,16 @@ async function callKiroRest(
     host: new URL(url).host,
     client: ctx.client,
   })
-  const headers = {
+  const headers: Record<string, string> = {
     ...(init.headers as Record<string, string> | undefined),
     Accept: "application/json",
     ...buildKiroBaseHeaders({
       accessToken: ctx.accessToken,
       values: headerValues,
     }),
+  }
+  if (ctx.tokenType) {
+    headers["tokentype"] = ctx.tokenType
   }
 
   const fetchOptions: RequestInit & { dispatcher?: unknown } = {

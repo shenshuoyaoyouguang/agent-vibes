@@ -106,6 +106,8 @@ interface KiroAccount extends CooldownableAccount {
   preferredEndpoint: "auto" | "kiro" | "codewhisperer"
   endpointFallback: boolean
   client?: Partial<KiroClientConfig>
+  /** Kiro API Key (headless mode) — when set, used directly as Bearer token. */
+  kiroApiKey?: string
   /** Promise guard so concurrent refreshes share one HTTP call. */
   refreshPromise?: Promise<void>
 }
@@ -121,6 +123,7 @@ interface KiroAccountFileEntry {
   clientSecret?: string
   machineId?: string
   profileArn?: string
+  provider?: string
   proxyUrl?: string
   maxContextTokens?: number
   priority?: number
@@ -129,6 +132,8 @@ interface KiroAccountFileEntry {
   kiroVersion?: string
   systemVersion?: string
   nodeVersion?: string
+  /** Kiro API Key (headless mode, format: ksk_xxxxxxxx) */
+  kiroApiKey?: string
 }
 
 interface KiroAccountConfigFile {
@@ -213,6 +218,8 @@ export class KiroService implements OnModuleInit {
     this.logger.log(
       `Kiro backend initialized: ${this.accounts.length} account(s)`
     )
+    // Deduplicate labels so logs and dashboard can distinguish accounts.
+    this.deduplicateAccountLabels()
     for (const account of this.accounts) {
       const stateSummary = isAccountDisabled(account)
         ? `disabled (${account.disabledReason || "permanent"})`
@@ -594,6 +601,7 @@ export class KiroService implements OnModuleInit {
           proxyUrl: account.proxyUrl,
           client: account.client,
           profileArn: account.profileArn,
+          tokenType: account.authMethod === "api_key" ? "API_KEY" : undefined,
         })
         const breakdown = usage.usageBreakdownList?.[0]
         const current = breakdown?.currentUsage ?? 0
@@ -755,19 +763,42 @@ export class KiroService implements OnModuleInit {
   ): KiroAccount | null {
     const accessToken = (entry.accessToken || "").trim()
     const refreshToken = (entry.refreshToken || "").trim()
-    if (!accessToken && !refreshToken) {
+    const kiroApiKey = (entry.kiroApiKey || "").trim()
+
+    // API Key mode: only needs kiroApiKey, no accessToken/refreshToken required.
+    const isApiKey =
+      entry.authMethod === "api_key" ||
+      entry.authMethod === "apikey" ||
+      (kiroApiKey && !refreshToken && !accessToken)
+
+    if (!isApiKey && !accessToken && !refreshToken) {
       this.logger.warn(
         `Skipping Kiro account "${entry.label || "(unnamed)"}": both accessToken and refreshToken are empty`
       )
       return null
     }
-    const authMethod: KiroAuthMethod =
-      entry.authMethod === "social" ? "social" : "idc"
+    if (isApiKey && !kiroApiKey) {
+      this.logger.warn(
+        `Skipping Kiro account "${entry.label || "(unnamed)"}": authMethod=api_key but kiroApiKey is empty`
+      )
+      return null
+    }
+
+    const authMethod: KiroAuthMethod = isApiKey
+      ? "api_key"
+      : entry.authMethod === "social"
+        ? "social"
+        : "idc"
+
     if (authMethod === "idc" && (!entry.clientId || !entry.clientSecret)) {
       this.logger.warn(
         `Kiro account "${entry.label}": IdC auth needs clientId and clientSecret; refresh will fail.`
       )
     }
+
+    // For API Key accounts, use the key itself as the stable identity for stateKey.
+    const stateKeyInput =
+      authMethod === "api_key" ? kiroApiKey : refreshToken || accessToken
 
     const stateKey = crypto
       .createHash("sha256")
@@ -777,7 +808,7 @@ export class KiroService implements OnModuleInit {
       .update("\0")
       .update(entry.clientId || "")
       .update("\0")
-      .update(refreshToken || accessToken)
+      .update(stateKeyInput)
       .digest("hex")
 
     return {
@@ -786,11 +817,16 @@ export class KiroService implements OnModuleInit {
       stateKey,
       authMethod,
       region: (entry.region || "us-east-1").trim() || "us-east-1",
-      accessToken,
+      // For API Key accounts, use the key as the access token directly.
+      accessToken: authMethod === "api_key" ? kiroApiKey : accessToken,
       refreshToken,
       expiresAt: typeof entry.expiresAt === "number" ? entry.expiresAt : 0,
-      clientId: entry.clientId?.trim() || undefined,
-      clientSecret: entry.clientSecret?.trim() || undefined,
+      clientId:
+        authMethod === "idc" ? entry.clientId?.trim() || undefined : undefined,
+      clientSecret:
+        authMethod === "idc"
+          ? entry.clientSecret?.trim() || undefined
+          : undefined,
       machineId:
         (entry.machineId || "").trim() ||
         crypto.createHash("md5").update(stateKey).digest("hex"),
@@ -815,12 +851,79 @@ export class KiroService implements OnModuleInit {
         systemVersion: entry.systemVersion,
         nodeVersion: entry.nodeVersion,
       },
+      kiroApiKey: authMethod === "api_key" ? kiroApiKey : undefined,
       cooldownUntil: 0,
       modelStates: new Map(),
     }
   }
 
   // ── Account selection ──────────────────────────────────────────────────
+
+  /**
+   * Render a stable, human-friendly identifier for log lines: prefer the
+   * `(label) [stateKeyShort]` form so two accounts that share a label
+   * (e.g. two Google social logins) are still distinguishable in the log.
+   */
+  private accountTag(account: KiroAccount): string {
+    const short = account.stateKey.slice(0, 8)
+    if (account.label) return `${account.label} [${short}]`
+    return `account ${short}`
+  }
+
+  /**
+   * Find the next available account (round-robin, cooldown-aware) WITHOUT
+   * advancing the global pointer. The caller is responsible for updating
+   * `accountIndex` once it commits to using the picked account.
+   */
+  private findAvailableAccount(
+    model: string,
+    options?: { exclude?: Set<string>; startOffset?: number; now?: number }
+  ): KiroAccount | null {
+    if (this.accounts.length === 0) return null
+    const now = options?.now ?? Date.now()
+    const exclude = options?.exclude
+    const startOffset = options?.startOffset ?? 0
+    for (let offset = 0; offset < this.accounts.length; offset++) {
+      const idx =
+        (this.accountIndex + startOffset + offset) % this.accounts.length
+      const account = this.accounts[idx]!
+      if (exclude && exclude.has(account.stateKey)) continue
+      if (isAccountAvailableForModel(account, model, now)) {
+        return account
+      }
+    }
+    return null
+  }
+
+  private indexOfAccount(account: KiroAccount): number {
+    return this.accounts.findIndex((a) => a.stateKey === account.stateKey)
+  }
+
+  /**
+   * When multiple accounts share the same label, append a `#N` suffix so
+   * logs and the dashboard can distinguish them.
+   */
+  private deduplicateAccountLabels(): void {
+    const seen = new Map<string, number>()
+    for (const account of this.accounts) {
+      const base = account.label || "unnamed"
+      const count = (seen.get(base) ?? 0) + 1
+      seen.set(base, count)
+      if (count > 1) {
+        account.label = `${base} #${count}`
+      }
+    }
+    // If the first occurrence also has duplicates, tag it as #1.
+    for (const [base, count] of seen.entries()) {
+      if (count <= 1) continue
+      const first = this.accounts.find(
+        (a) => a.label === base || (!a.label && base === "unnamed")
+      )
+      if (first) {
+        first.label = `${base} #1`
+      }
+    }
+  }
 
   private pickAccountOrThrow(model: string): KiroAccount {
     if (this.accounts.length === 0) {
@@ -830,14 +933,13 @@ export class KiroService implements OnModuleInit {
       )
     }
 
-    const now = Date.now()
-    for (let offset = 0; offset < this.accounts.length; offset++) {
-      const idx = (this.accountIndex + offset) % this.accounts.length
-      const account = this.accounts[idx]!
-      if (isAccountAvailableForModel(account, model, now)) {
+    const picked = this.findAvailableAccount(model)
+    if (picked) {
+      const idx = this.indexOfAccount(picked)
+      if (idx >= 0) {
         this.accountIndex = (idx + 1) % this.accounts.length
-        return account
       }
+      return picked
     }
 
     const recovery = getEarliestRecovery(this.accounts, model)
@@ -856,9 +958,27 @@ export class KiroService implements OnModuleInit {
 
   // ── Token refresh ───────────────────────────────────────────────────────
 
-  private async ensureFreshToken(account: KiroAccount): Promise<void> {
+  /**
+   * Ensure the account has a fresh access token.
+   *
+   * - When `force=false` (default), only refresh if the token is missing or
+   *   within {@link TOKEN_REFRESH_SKEW_SECONDS} of expiry.
+   * - When `force=true`, refresh unconditionally. Used after the upstream
+   *   service rejects the token with 401/403 even though our local clock
+   *   thinks it is still valid (the social/IdC provider may have rotated
+   *   or revoked the token server-side).
+   */
+  private async ensureFreshToken(
+    account: KiroAccount,
+    options?: { force?: boolean }
+  ): Promise<void> {
+    // API Key accounts never need token refresh — the key is used directly.
+    if (account.authMethod === "api_key") return
+
+    const force = options?.force === true
     const nowSec = Math.floor(Date.now() / 1000)
     const needsRefresh =
+      force ||
       !account.accessToken ||
       (account.expiresAt > 0 &&
         nowSec >= account.expiresAt - TOKEN_REFRESH_SKEW_SECONDS)
@@ -895,24 +1015,38 @@ export class KiroService implements OnModuleInit {
         )
       } catch (refreshError) {
         // Refresh failed (e.g. one-time refresh token already used).
-        // Fallback: try to re-read from local AWS SSO cache.
+        // Fallback: try to re-read from local AWS SSO cache, but only
+        // accept tokens whose authMethod matches the current account so
+        // we never marry a Builder ID registration to a Google/GitHub
+        // social token (or vice-versa).
         this.logger.warn(
           `[Kiro] Token refresh failed for ${account.label || account.stateKey.slice(0, 12)}: ${(refreshError as Error).message}; trying local cache fallback`
         )
         const tokens = discoverLocalKiroTokens()
+        const sameMethod = tokens.filter(
+          (t) => t.authMethod === account.authMethod
+        )
         const fresh =
-          tokens.find(
+          sameMethod.find(
             (t) => t.accessToken && t.accessToken !== account.accessToken
-          ) || tokens[0]
+          ) || sameMethod[0]
         if (fresh && fresh.accessToken) {
           account.accessToken = fresh.accessToken
           account.refreshToken = fresh.refreshToken
           account.expiresAt = fresh.expiresAt
-          if (fresh.clientId) account.clientId = fresh.clientId
-          if (fresh.clientSecret) account.clientSecret = fresh.clientSecret
+          if (account.authMethod === "idc") {
+            if (fresh.clientId) account.clientId = fresh.clientId
+            if (fresh.clientSecret) account.clientSecret = fresh.clientSecret
+          } else {
+            // Social accounts must not carry idc credentials, regardless of
+            // what we fished out of the cache directory.
+            account.clientId = undefined
+            account.clientSecret = undefined
+          }
+          if (fresh.profileArn) account.profileArn = fresh.profileArn
           this.persistTokenToDisk(account)
           this.logger.log(
-            `[Kiro] Recovered token from local cache for ${account.label || account.stateKey.slice(0, 12)}`
+            `[Kiro] Recovered ${account.authMethod} token from local cache for ${account.label || account.stateKey.slice(0, 12)}`
           )
         } else {
           throw refreshError
@@ -928,6 +1062,8 @@ export class KiroService implements OnModuleInit {
   }
 
   private async ensureProfileArn(account: KiroAccount): Promise<void> {
+    // API Key accounts do not use profileArn.
+    if (account.authMethod === "api_key") return
     if (account.profileArn) return
     try {
       const arn = await listAvailableProfileArn({
@@ -1031,28 +1167,62 @@ export class KiroService implements OnModuleInit {
     account: KiroAccount,
     callback: KiroStreamCallback,
     abortSignal?: AbortSignal
-  ): Promise<{ httpStatus: number; endpointName: string }> {
+  ): Promise<{
+    httpStatus: number
+    endpointName: string
+    account: KiroAccount
+  }> {
     await this.ensureFreshToken(account)
     await this.ensureProfileArn(account)
 
-    const payload = this.buildKiroPayload(dto, account)
-    const orderedEndpoints = this.getOrderedEndpoints(account)
+    let currentAccount = account
+    const model = mapKiroModel(dto.model || "")
     let lastError: Error | null = null
     const MAX_RETRIES = 10
     const BASE_DELAY_MS = 3000
+    /** Accounts that have been tried and failed with auth errors this call. */
+    const attemptedAccountKeys = new Set<string>()
+    /** Accounts that have already been force-refreshed this call (max once per account). */
+    const forceRefreshedKeys = new Set<string>()
 
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       if (attempt > 0) {
-        // Wait before retrying (exponential backoff capped at 30s)
-        const delay = Math.min(30_000, BASE_DELAY_MS * Math.pow(2, attempt - 1))
-        this.logger.warn(
-          `[Kiro] All endpoints failed on attempt ${attempt}, retrying in ${delay}ms...`
-        )
-        await new Promise((resolve) => setTimeout(resolve, delay))
-        if (abortSignal?.aborted) {
-          throw lastError || new Error("Kiro request aborted")
+        // Before waiting, try to switch to a different account if available.
+        const alternate = this.findAvailableAccount(model, {
+          exclude: attemptedAccountKeys,
+        })
+        if (alternate && alternate.stateKey !== currentAccount.stateKey) {
+          this.logger.log(
+            `[Kiro] Switching from ${this.accountTag(currentAccount)} to ${this.accountTag(alternate)} after auth failure`
+          )
+          currentAccount = alternate
+          await this.ensureFreshToken(currentAccount)
+          await this.ensureProfileArn(currentAccount)
+        } else {
+          // No alternate available — wait with backoff (capped at 30s).
+          const delay = Math.min(
+            30_000,
+            BASE_DELAY_MS * Math.pow(2, attempt - 1)
+          )
+          this.logger.warn(
+            `[Kiro] All endpoints/accounts failed on attempt ${attempt}, retrying in ${delay}ms...`
+          )
+          await new Promise((resolve) => setTimeout(resolve, delay))
+          if (abortSignal?.aborted) {
+            throw lastError || new Error("Kiro request aborted")
+          }
+          // After waiting, cooldowns may have expired — try to pick a fresh account.
+          const recovered = this.findAvailableAccount(model)
+          if (recovered) {
+            currentAccount = recovered
+            await this.ensureFreshToken(currentAccount)
+            await this.ensureProfileArn(currentAccount)
+          }
         }
       }
+
+      const payload = this.buildKiroPayload(dto, currentAccount)
+      const orderedEndpoints = this.getOrderedEndpoints(currentAccount)
 
       for (const endpoint of orderedEndpoints) {
         payload.conversationState.currentMessage.userInputMessage.origin =
@@ -1061,22 +1231,18 @@ export class KiroService implements OnModuleInit {
         const url = endpoint.url
         const host = new URL(url).host
         const headerValues = buildStreamingHeaderValues({
-          machineId: account.machineId,
+          machineId: currentAccount.machineId,
           host,
-          client: account.client,
+          client: currentAccount.client,
         })
         const baseHeaders = buildKiroBaseHeaders({
-          accessToken: account.accessToken,
+          accessToken: currentAccount.accessToken,
           values: headerValues,
           extra: {
             "Content-Type": "application/json",
             Accept: "*/*",
             "x-amzn-kiro-agent-mode": "vibe",
             "x-amzn-codewhisperer-optout": "true",
-            // Lower-case header names match what the AWS SDK actually emits
-            // (verified in `kiro_traffic.log`). HTTP is case-insensitive so
-            // this is purely cosmetic, but it keeps captures diff-clean and
-            // avoids any anti-abuse fingerprinting on header casing.
             "amz-sdk-request": "attempt=1; max=3",
             "amz-sdk-invocation-id": randomUUID(),
           },
@@ -1084,18 +1250,20 @@ export class KiroService implements OnModuleInit {
         if (endpoint.amzTarget) {
           baseHeaders["X-Amz-Target"] = endpoint.amzTarget
         }
+        if (currentAccount.authMethod === "api_key") {
+          baseHeaders["tokentype"] = "API_KEY"
+        }
 
         const fetchOptions: RequestInit & { dispatcher?: unknown } = {
           method: "POST",
           headers: baseHeaders,
           signal: abortSignal ?? AbortSignal.timeout(STREAM_REQUEST_TIMEOUT_MS),
         }
-        const dispatcher = this.buildProxyDispatcher(account)
+        const dispatcher = this.buildProxyDispatcher(currentAccount)
         if (dispatcher) fetchOptions.dispatcher = dispatcher
 
         try {
           const bodyStr = JSON.stringify(payload)
-          // Dump full payload to temp file for debugging 400 errors.
           const tmpPath = path.join(
             os.tmpdir(),
             "agent-vibes-kiro-payload.json"
@@ -1105,7 +1273,7 @@ export class KiroService implements OnModuleInit {
             `[Kiro] Request payload written to ${tmpPath} (${bodyStr.length} bytes)`
           )
           this.logger.log(
-            `[Kiro] -> ${endpoint.name} POST ${url} (model=${mapKiroModel(dto.model || "")})`
+            `[Kiro] -> ${endpoint.name} POST ${url} (account=${this.accountTag(currentAccount)}, model=${model})`
           )
           const response = await fetch(url, {
             ...fetchOptions,
@@ -1114,15 +1282,15 @@ export class KiroService implements OnModuleInit {
 
           if (response.status === 429) {
             markAccountCooldown(
-              account,
+              currentAccount,
               429,
-              mapKiroModel(dto.model || ""),
+              model,
               response.headers.get("retry-after") || undefined,
-              account.label
+              this.accountTag(currentAccount)
             )
             this.persistAccountStates()
             this.logger.warn(
-              `[Kiro] Endpoint ${endpoint.name} quota exhausted (429); trying next`
+              `[Kiro] Endpoint ${endpoint.name} quota exhausted (429) for ${this.accountTag(currentAccount)}; trying next`
             )
             lastError = new BackendApiError(
               `Kiro endpoint ${endpoint.name} returned 429`,
@@ -1136,28 +1304,136 @@ export class KiroService implements OnModuleInit {
             const text = await response.text().catch(() => "")
             const status = response.status
             this.logger.warn(
-              `[Kiro] Endpoint ${endpoint.name} HTTP ${status}: ${text.slice(0, 240)}`
+              `[Kiro] Endpoint ${endpoint.name} HTTP ${status} for ${this.accountTag(currentAccount)}: ${text.slice(0, 240)}`
             )
-            // 401/403: auth failure — stop immediately, don't try other endpoints.
+
             if (status === 401 || status === 403) {
+              // Auth failure — attempt a forced token refresh before giving up.
+              // Each account gets at most ONE force-refresh per callKiro invocation
+              // (mirrors kiro.rs's HashSet<u64> guard to avoid infinite refresh loops).
+              const alreadyRefreshed = forceRefreshedKeys.has(
+                currentAccount.stateKey
+              )
+
+              if (!alreadyRefreshed) {
+                forceRefreshedKeys.add(currentAccount.stateKey)
+                this.logger.log(
+                  `[Kiro] Auth failure (${status}) for ${this.accountTag(currentAccount)}, attempting forced token refresh...`
+                )
+                let refreshed = false
+                try {
+                  await this.ensureFreshToken(currentAccount, { force: true })
+                  refreshed = true
+                } catch (refreshErr) {
+                  this.logger.warn(
+                    `[Kiro] Forced token refresh failed for ${this.accountTag(currentAccount)}: ${(refreshErr as Error).message}`
+                  )
+                }
+
+                if (refreshed) {
+                  // Retry the SAME endpoint once with the new token.
+                  const retryHeaders = buildKiroBaseHeaders({
+                    accessToken: currentAccount.accessToken,
+                    values: buildStreamingHeaderValues({
+                      machineId: currentAccount.machineId,
+                      host,
+                      client: currentAccount.client,
+                    }),
+                    extra: {
+                      "Content-Type": "application/json",
+                      Accept: "*/*",
+                      "x-amzn-kiro-agent-mode": "vibe",
+                      "x-amzn-codewhisperer-optout": "true",
+                      "amz-sdk-request": "attempt=1; max=3",
+                      "amz-sdk-invocation-id": randomUUID(),
+                    },
+                  })
+                  if (endpoint.amzTarget) {
+                    retryHeaders["X-Amz-Target"] = endpoint.amzTarget
+                  }
+                  if (currentAccount.authMethod === "api_key") {
+                    retryHeaders["tokentype"] = "API_KEY"
+                  }
+                  const retryFetchOptions: RequestInit & {
+                    dispatcher?: unknown
+                  } = {
+                    method: "POST",
+                    headers: retryHeaders,
+                    signal:
+                      abortSignal ??
+                      AbortSignal.timeout(STREAM_REQUEST_TIMEOUT_MS),
+                  }
+                  const retryDispatcher =
+                    this.buildProxyDispatcher(currentAccount)
+                  if (retryDispatcher)
+                    retryFetchOptions.dispatcher = retryDispatcher
+
+                  const retryPayload = this.buildKiroPayload(
+                    dto,
+                    currentAccount
+                  )
+                  retryPayload.conversationState.currentMessage.userInputMessage.origin =
+                    endpoint.origin
+                  const retryBodyStr = JSON.stringify(retryPayload)
+
+                  this.logger.log(
+                    `[Kiro] -> ${endpoint.name} POST ${url} (retry after refresh, account=${this.accountTag(currentAccount)})`
+                  )
+                  const retryResponse = await fetch(url, {
+                    ...retryFetchOptions,
+                    body: retryBodyStr,
+                  })
+
+                  if (retryResponse.ok && retryResponse.body) {
+                    await parseKiroEventStream(
+                      retryResponse.body,
+                      callback,
+                      abortSignal
+                    )
+                    this.logger.log(
+                      `[Kiro] <- ${endpoint.name} stream completed after refresh (account=${this.accountTag(currentAccount)}, model=${model})`
+                    )
+                    markAccountSuccess(currentAccount, model)
+                    clearAccountDisablement(currentAccount)
+                    this.persistAccountStates()
+                    return {
+                      httpStatus: retryResponse.status,
+                      endpointName: endpoint.name,
+                      account: currentAccount,
+                    }
+                  }
+                  // Retry also failed — fall through to cooldown.
+                  const retryText = await retryResponse.text().catch(() => "")
+                  this.logger.warn(
+                    `[Kiro] Retry after refresh still failed (${retryResponse.status}) for ${this.accountTag(currentAccount)}: ${retryText.slice(0, 200)}`
+                  )
+                  retryResponse.body?.cancel().catch(() => undefined)
+                }
+              } else {
+                this.logger.warn(
+                  `[Kiro] Auth failure (${status}) for ${this.accountTag(currentAccount)}, already force-refreshed — switching account`
+                )
+              }
+
+              // Cooldown this account and mark it as attempted.
               markAccountCooldown(
-                account,
+                currentAccount,
                 status,
                 undefined,
                 undefined,
-                account.label
+                this.accountTag(currentAccount)
               )
               this.persistAccountStates()
-              throw new BackendApiError(
+              attemptedAccountKeys.add(currentAccount.stateKey)
+              lastError = new BackendApiError(
                 `Kiro auth error: HTTP ${status} ${text.slice(0, 200)}`,
-                {
-                  backend: "kiro",
-                  statusCode: status,
-                  permanent: status === 401,
-                }
+                { backend: "kiro", statusCode: status }
               )
+              // Break out of endpoint loop to trigger account switch at top of retry loop.
+              break
             }
-            // All other non-200: continue to next endpoint (matches Kiro-Go).
+
+            // All other non-200: continue to next endpoint.
             lastError = new BackendApiError(
               `Kiro endpoint ${endpoint.name} HTTP ${status}: ${text.slice(0, 200)}`,
               { backend: "kiro", statusCode: status }
@@ -1175,12 +1451,16 @@ export class KiroService implements OnModuleInit {
 
           await parseKiroEventStream(response.body, callback, abortSignal)
           this.logger.log(
-            `[Kiro] <- ${endpoint.name} stream completed (model=${mapKiroModel(dto.model || "")})`
+            `[Kiro] <- ${endpoint.name} stream completed (account=${this.accountTag(currentAccount)}, model=${model})`
           )
-          markAccountSuccess(account, mapKiroModel(dto.model || ""))
-          clearAccountDisablement(account)
+          markAccountSuccess(currentAccount, model)
+          clearAccountDisablement(currentAccount)
           this.persistAccountStates()
-          return { httpStatus: response.status, endpointName: endpoint.name }
+          return {
+            httpStatus: response.status,
+            endpointName: endpoint.name,
+            account: currentAccount,
+          }
         } catch (error) {
           if (error instanceof BackendApiError) {
             if (error.permanent) throw error
@@ -1189,7 +1469,7 @@ export class KiroService implements OnModuleInit {
           }
           const message = (error as Error).message || String(error)
           this.logger.warn(
-            `[Kiro] Endpoint ${endpoint.name} failed: ${message}`
+            `[Kiro] Endpoint ${endpoint.name} failed for ${this.accountTag(currentAccount)}: ${message}`
           )
           lastError = new BackendApiError(
             `Kiro endpoint ${endpoint.name} failed: ${message}`,
@@ -1288,8 +1568,9 @@ export class KiroService implements OnModuleInit {
 
   private async executeNonStream(
     dto: CreateMessageDto,
-    account: KiroAccount
+    initialAccount: KiroAccount
   ): Promise<AnthropicResponse> {
+    let account = initialAccount
     const startedAt = Date.now()
     const textParts: string[] = []
     const thinkingParts: string[] = []
@@ -1325,7 +1606,13 @@ export class KiroService implements OnModuleInit {
       },
     }
 
-    await this.callKiro(dto, account, callback)
+    await this.callKiro(dto, account, callback).then((result) => {
+      // If callKiro switched accounts mid-flight, update the cache tracker
+      // to use the account that actually succeeded.
+      if (result.account.stateKey !== account.stateKey) {
+        account = result.account
+      }
+    })
     // Persist the breakpoints only after a successful response so a failed
     // request does not poison the cache state.
     this.cacheTracker.update(account.stateKey, cacheProfile)
@@ -1391,9 +1678,10 @@ export class KiroService implements OnModuleInit {
 
   private async *executeStream(
     dto: CreateMessageDto,
-    account: KiroAccount,
+    initialAccount: KiroAccount,
     abortSignal?: AbortSignal
   ): AsyncGenerator<string, void, unknown> {
+    let account = initialAccount
     const startedAt = Date.now()
     const messageId = `msg_${randomUUID()}`
     const modelId = mapKiroModel(dto.model || "")
@@ -1580,7 +1868,11 @@ export class KiroService implements OnModuleInit {
 
     const runner = (async () => {
       try {
-        await this.callKiro(dto, account, callback, abortSignal)
+        const result = await this.callKiro(dto, account, callback, abortSignal)
+        // If callKiro switched accounts mid-flight, update for cache tracking.
+        if (result.account.stateKey !== account.stateKey) {
+          account = result.account
+        }
         // Persist the breakpoints only after a successful response so a
         // failed turn does not poison the cache state of this account.
         this.cacheTracker.update(account.stateKey, cacheProfile)
@@ -1775,6 +2067,7 @@ export class KiroService implements OnModuleInit {
       this.applyPersistedAccountState(account, persisted.get(account.stateKey))
     }
     this.accounts = fresh
+    this.deduplicateAccountLabels()
     this.persistAccountStates()
   }
 
@@ -1867,6 +2160,7 @@ export class KiroService implements OnModuleInit {
         proxyUrl: account.proxyUrl,
         client: account.client,
         profileArn: account.profileArn,
+        tokenType: account.authMethod === "api_key" ? "API_KEY" : undefined,
       })
       if (models.length > 0) {
         this.discoveredModels = models
@@ -1895,6 +2189,12 @@ export class KiroService implements OnModuleInit {
   /**
    * Match an existing entry by `(authMethod, region, refreshToken|accessToken)`
    * — the same triple we use to build `stateKey`.
+   *
+   * `authMethod` is a hard filter: a Kiro IDE social refresh token MUST NOT
+   * match an old Builder ID entry (or vice-versa) even if they happen to
+   * share a refresh token / accessToken / clientId field.  When the user
+   * switches identity, we want a clean overwrite — not a merge that keeps
+   * the stale `clientId/clientSecret/profileArn`.
    */
   private findMatchingEntryIndex(
     entries: KiroAccountFileEntry[],
@@ -1928,6 +2228,10 @@ export class KiroService implements OnModuleInit {
       if (wantAccess && entryAccess && wantAccess === entryAccess) {
         return true
       }
+      // For IdC accounts a stable clientId is enough to pin the identity;
+      // for social accounts there is no such anchor so we require token
+      // match above.
+      if (candidate.authMethod !== "idc") return false
       const wantClient = normalize(candidate.clientId)
       const entryClient = normalize(entry.clientId)
       return wantClient !== "" && wantClient === entryClient
@@ -1938,7 +2242,29 @@ export class KiroService implements OnModuleInit {
   private upsertAccountFromDiscovered(
     token: DiscoveredKiroToken
   ): Promise<boolean> {
-    const entries = this.readAccountsFile()
+    let entries = this.readAccountsFile()
+
+    // If the user just switched identity (e.g. logged out of Builder ID and
+    // back in via Google), there may still be a stale opposite-authMethod
+    // entry that points at the SAME Kiro account.  We can't know that from
+    // tokens alone, but if the previous entry only differs from the new
+    // one by authMethod (same region, same accessToken or refreshToken) we
+    // drop it so the dashboard does not display a phantom IdC row anymore.
+    const oppositeAuth: KiroAuthMethod =
+      token.authMethod === "idc" ? "social" : "idc"
+    const staleIdx = this.findMatchingEntryIndex(entries, {
+      authMethod: oppositeAuth,
+      region: token.region,
+      refreshToken: token.refreshToken,
+      accessToken: token.accessToken,
+    })
+    if (staleIdx >= 0) {
+      this.logger.log(
+        `[Kiro] Removing stale ${oppositeAuth} entry shadowed by new ${token.authMethod} login`
+      )
+      entries = entries.filter((_, i) => i !== staleIdx)
+    }
+
     const idx = this.findMatchingEntryIndex(entries, {
       authMethod: token.authMethod,
       region: token.region,
@@ -1947,19 +2273,40 @@ export class KiroService implements OnModuleInit {
       clientId: token.clientId,
     })
 
-    const baseLabel = idx >= 0 ? entries[idx]!.label : undefined
+    const existing = idx >= 0 ? entries[idx] : undefined
+    const defaultLabel =
+      token.authMethod === "idc"
+        ? "Kiro Builder ID"
+        : token.provider
+          ? `Kiro Social (${token.provider})`
+          : "Kiro Social"
+
+    // Build the merged entry from scratch with explicit field-by-field
+    // selection so social entries cannot inherit stale idc fields and
+    // vice-versa.  Mutable fields (label/proxyUrl/priority/etc.) are
+    // preserved from the existing entry; identity fields are overwritten.
     const merged: KiroAccountFileEntry = {
-      ...(idx >= 0 ? entries[idx] : {}),
-      label:
-        baseLabel ||
-        (token.authMethod === "idc" ? "Kiro Builder ID" : "Kiro Social"),
+      label: existing?.label || defaultLabel,
       authMethod: token.authMethod,
       region: token.region,
       accessToken: token.accessToken,
       refreshToken: token.refreshToken,
       expiresAt: token.expiresAt || undefined,
-      clientId: token.clientId,
-      clientSecret: token.clientSecret,
+      profileArn: token.profileArn || existing?.profileArn,
+      provider: token.provider || existing?.provider,
+      machineId: existing?.machineId,
+      proxyUrl: existing?.proxyUrl,
+      maxContextTokens: existing?.maxContextTokens,
+      priority: existing?.priority,
+      preferredEndpoint: existing?.preferredEndpoint,
+      endpointFallback: existing?.endpointFallback,
+      kiroVersion: existing?.kiroVersion,
+      systemVersion: existing?.systemVersion,
+      nodeVersion: existing?.nodeVersion,
+    }
+    if (token.authMethod === "idc") {
+      merged.clientId = token.clientId
+      merged.clientSecret = token.clientSecret
     }
 
     if (idx >= 0) {
@@ -1969,7 +2316,7 @@ export class KiroService implements OnModuleInit {
     }
     this.writeAccountsFile(entries)
     this.logger.log(
-      `[Kiro] Synced account from local cache (${path.basename(token.sourcePath)}, region=${token.region})`
+      `[Kiro] Synced ${token.authMethod} account from local cache (${path.basename(token.sourcePath)}, region=${token.region}${token.provider ? `, provider=${token.provider}` : ""})`
     )
     return Promise.resolve(true)
   }

@@ -111,13 +111,18 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
   CLIENT_SIDE_TOOL_V2_EDIT_FILE_V2: {
     name: "edit_file_v2",
     description:
-      "Edit a file with exact search and replace. Before editing an existing file, read the file in the current conversation. Prefer a small unique search snippet copied verbatim from read_file output. To create a new file, set search to an empty string and replace to the full file content. If read_file output includes display-only line number prefixes, do not include those prefixes in search or replace. Do not use run_terminal_command with cat heredoc, tee, echo redirection, sed, perl, python, or shell patching for normal file creation or edits when this tool can express the change.",
+      "Edit a file with exact search and replace. Before editing an existing file, read the file in the current conversation. Prefer a small unique search snippet copied verbatim from read_file output. To create a new file, set search to an empty string and replace to the full file content. If read_file output includes display-only line number prefixes, do not include those prefixes in search or replace. Prefer this tool over run_terminal_command with cat heredoc, tee, echo redirection, sed, perl, python, or shell patching for normal file creation or edits — those still work for ephemeral paths or scripted setup, but edit_file_v2 keeps the diff reviewable in the IDE. The edit FAILS if `search` matches more than once in the file: either provide a larger snippet with surrounding context to make it unique, or set `replace_all: true` to change every occurrence (useful for variable renames or batch alias updates).",
     input_schema: {
       type: "object",
       properties: {
         path: { type: "string", description: "The path to the file to edit" },
         search: { type: "string", description: "The text to search for" },
         replace: { type: "string", description: "The replacement text" },
+        replace_all: {
+          type: "boolean",
+          description:
+            "When true, replaces every occurrence of `search` instead of failing on multi-match. Default false. Use for variable renames or batch alias updates.",
+        },
       },
       required: ["path", "search", "replace"],
     },
@@ -187,7 +192,12 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
 
   CLIENT_SIDE_TOOL_V2_SEMANTIC_SEARCH_FULL: {
     name: "semantic_search",
-    description: "Perform semantic code search across the codebase",
+    description:
+      "Find code by intent across the indexed codebase. Use for content " +
+      "questions ('where is heartbeat handled?'). Returns candidate file " +
+      "paths and snippets — pair with read_semsearch_files to read full " +
+      "context for the most promising candidates. For exact-text or path " +
+      "patterns prefer grep_search / glob_search instead.",
     input_schema: {
       type: "object",
       properties: {
@@ -200,7 +210,7 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
   CLIENT_SIDE_TOOL_V2_RUN_TERMINAL_COMMAND_V2: {
     name: "run_terminal_command",
     description:
-      "Run a command in the terminal. Do NOT use this for normal repository search, file reading, deterministic file creation, or deterministic file edits when grep_search, read_file, list_directory, or edit_file_v2 can express the task. In particular, avoid grep, rg, find, sed, cat, head, tail, cat heredoc, tee, and echo redirection for ordinary file work when structured tools are available. Use this when the user explicitly wants command execution or no structured tool fits.",
+      "Run a command in the terminal. Prefer dedicated tools (grep_search, read_file, list_directory, edit_file_v2, etc.) when one fits the task — they keep output structured and reviewable. Use run_terminal_command for build/test execution, system commands, scripts that compute or verify something, or work that no structured tool can express. Shell file writes whose targets land inside the workspace are blocked by the bridge; ephemeral paths (/tmp, smoke fixtures, OS temp dirs) and read-only commands run normally.",
     input_schema: {
       type: "object",
       properties: {
@@ -269,16 +279,53 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
 
   CLIENT_SIDE_TOOL_V2_TASK: {
     name: "task",
-    description: "Delegate a task/sub-agent execution request",
+    description:
+      "Delegate a focused sub-task to a specialised sub-agent that runs " +
+      "in its own isolated context. The sub-agent returns a single final " +
+      "message; you must relay a concise summary to the user since the " +
+      "sub-agent's intermediate output is not visible to them.",
     input_schema: {
       type: "object",
       properties: {
-        description: { type: "string", description: "Task description" },
-        prompt: { type: "string", description: "Task prompt" },
-        model: { type: "string", description: "Optional model override" },
+        description: {
+          type: "string",
+          description:
+            "3-5 word label shown in the UI bubble while the sub-agent runs.",
+        },
+        prompt: {
+          type: "string",
+          description:
+            "The detailed brief you give the sub-agent. Treat the " +
+            "sub-agent like a colleague with no prior context: state the " +
+            "goal, what's already known/ruled out, and the deliverable. " +
+            "Avoid one-liner prompts — they produce shallow output.",
+        },
+        model: {
+          type: "string",
+          description:
+            "Optional model override. Use only when the sub-agent " +
+            "definition explicitly says to.",
+        },
         subagent_type: {
           type: "string",
-          description: "Optional subagent type",
+          description:
+            "Pick from the available `subagent_type` values listed in " +
+            "this tool's description. Omit to fall back to 'general-purpose'.",
+        },
+        run_in_background: {
+          type: "boolean",
+          description:
+            "When true, the sub-agent runs asynchronously: the tool call " +
+            "returns immediately with an `agentId` and the user can keep " +
+            "chatting while the sub-agent works. Progress is written to " +
+            "`~/.cursor/subagents/<agentId>/transcript.jsonl` and the " +
+            "final answer to `~/.cursor/subagents/<agentId>/result.txt` " +
+            "— use read_file on those paths to follow up. Background " +
+            "sub-agents only get inline tools (no shell, no file edits, " +
+            "no run_terminal_command); they're best for parallel " +
+            "research / web fetches / MCP work that doesn't need to " +
+            "block the user. Default false (foreground, blocks until " +
+            "the sub-agent finishes and returns its result inline).",
         },
       },
       required: ["description"],
@@ -287,16 +334,53 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
 
   CLIENT_SIDE_TOOL_V2_TASK_V2: {
     name: "task",
-    description: "Delegate a task/sub-agent execution request",
+    description:
+      "Delegate a focused sub-task to a specialised sub-agent that runs " +
+      "in its own isolated context. The sub-agent returns a single final " +
+      "message; you must relay a concise summary to the user since the " +
+      "sub-agent's intermediate output is not visible to them.",
     input_schema: {
       type: "object",
       properties: {
-        description: { type: "string", description: "Task description" },
-        prompt: { type: "string", description: "Task prompt" },
-        model: { type: "string", description: "Optional model override" },
+        description: {
+          type: "string",
+          description:
+            "3-5 word label shown in the UI bubble while the sub-agent runs.",
+        },
+        prompt: {
+          type: "string",
+          description:
+            "The detailed brief you give the sub-agent. Treat the " +
+            "sub-agent like a colleague with no prior context: state the " +
+            "goal, what's already known/ruled out, and the deliverable. " +
+            "Avoid one-liner prompts — they produce shallow output.",
+        },
+        model: {
+          type: "string",
+          description:
+            "Optional model override. Use only when the sub-agent " +
+            "definition explicitly says to.",
+        },
         subagent_type: {
           type: "string",
-          description: "Optional subagent type",
+          description:
+            "Pick from the available `subagent_type` values listed in " +
+            "this tool's description. Omit to fall back to 'general-purpose'.",
+        },
+        run_in_background: {
+          type: "boolean",
+          description:
+            "When true, the sub-agent runs asynchronously: the tool call " +
+            "returns immediately with an `agentId` and the user can keep " +
+            "chatting while the sub-agent works. Progress is written to " +
+            "`~/.cursor/subagents/<agentId>/transcript.jsonl` and the " +
+            "final answer to `~/.cursor/subagents/<agentId>/result.txt` " +
+            "— use read_file on those paths to follow up. Background " +
+            "sub-agents only get inline tools (no shell, no file edits, " +
+            "no run_terminal_command); they're best for parallel " +
+            "research / web fetches / MCP work that doesn't need to " +
+            "block the user. Default false (foreground, blocks until " +
+            "the sub-agent finishes and returns its result inline).",
         },
       },
       required: ["description"],
@@ -378,7 +462,12 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
 
   CLIENT_SIDE_TOOL_V2_DEEP_SEARCH: {
     name: "deep_search",
-    description: "Perform a deep semantic search across the entire codebase",
+    description:
+      "Like semantic_search but spends more compute on harder queries. " +
+      "Returns candidate file paths and snippets — pair with " +
+      "read_semsearch_files for full content. Prefer semantic_search for " +
+      "first-pass exploration; use deep_search only when semantic_search " +
+      "comes back empty or too noisy.",
     input_schema: {
       type: "object",
       properties: {
@@ -390,14 +479,20 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
 
   CLIENT_SIDE_TOOL_V2_READ_SEMSEARCH_FILES: {
     name: "read_semsearch_files",
-    description: "Read files returned by semantic search candidates",
+    description:
+      "Read full context for files returned by semantic_search or " +
+      "deep_search. Pass the candidate paths from those calls (not " +
+      "arbitrary paths) so the indexer can stream cached snippets " +
+      "efficiently. For arbitrary file paths use read_file instead.",
     input_schema: {
       type: "object",
       properties: {
         file_paths: {
           type: "array",
           items: { type: "string" },
-          description: "Semantic search candidate file paths",
+          description:
+            "Candidate file paths returned by a prior semantic_search " +
+            "or deep_search call",
         },
       },
       required: ["file_paths"],
@@ -531,13 +626,54 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
 
   CLIENT_SIDE_TOOL_V2_AWAIT_TASK: {
     name: "await_task",
-    description: "Wait for previously launched task/sub-agent completion",
+    description:
+      "Wait for a previously spawned background sub-agent (run_in_background=true) " +
+      "to finish. Pass the agentId returned by the original `task` tool call. " +
+      "Resolves when the sub-agent completes or fails; if it is still running " +
+      "after the optional `block_until_ms` window, returns the still-running " +
+      "snapshot (turn / tool call counts) so the parent agent can decide to " +
+      "wait again, peek at the transcript, or move on.",
     input_schema: {
       type: "object",
       properties: {
-        task_id: { type: "string", description: "Task identifier" },
+        task_id: {
+          type: "string",
+          description:
+            "The agentId returned by the spawning task tool call. Also " +
+            "accepts agent_id / agentId / taskId.",
+        },
+        block_until_ms: {
+          type: "number",
+          description:
+            "How long (ms) to block before reporting still-running. " +
+            "Defaults to 5 minutes; capped at 30 minutes.",
+        },
       },
       required: [],
+    },
+  },
+
+  // bridge-internal definition: there is no ClientSideToolV2 enum value
+  // for kill_agent because the proto only exposes CancelSubagentAction
+  // (a ConversationAction, not a ToolCall oneof). We surface it as a
+  // bridge-defined inline tool so the parent agent can stop a
+  // run-away background sub-agent on demand.
+  CLIENT_SIDE_TOOL_V2_KILL_AGENT: {
+    name: "kill_agent",
+    description:
+      "Stop a previously spawned background sub-agent. The worker will " +
+      "halt at the next abort checkpoint and write a 'killed' terminal " +
+      "status to its metadata.json. Pass the agentId returned by the " +
+      "original `task` tool call.",
+    input_schema: {
+      type: "object",
+      properties: {
+        agent_id: {
+          type: "string",
+          description: "The agentId of the background sub-agent to kill.",
+        },
+      },
+      required: ["agent_id"],
     },
   },
 
@@ -1194,6 +1330,13 @@ const PREFERRED_CURSOR_KEY_BY_TOOL_NAME: Record<string, string> = {
   reflect: "CLIENT_SIDE_TOOL_V2_REFLECT",
   start_grind_execution: "CLIENT_SIDE_TOOL_V2_START_GRIND_EXECUTION",
   start_grind_planning: "CLIENT_SIDE_TOOL_V2_START_GRIND_PLANNING",
+  // wait_agent / kill_agent: friendlier surface for the
+  // run_in_background sub-agent lifecycle. wait_agent shares the proto
+  // CLIENT_SIDE_TOOL_V2_AWAIT_TASK envelope so dispatch lands in the
+  // same registry-aware await flow; kill_agent is a bridge-defined
+  // inline tool routed through truncated_tool_call.
+  wait_agent: "CLIENT_SIDE_TOOL_V2_AWAIT_TASK",
+  kill_agent: "CLIENT_SIDE_TOOL_V2_KILL_AGENT",
 }
 
 const TOOL_KEY_ALIASES: Record<string, string> = {
@@ -1283,6 +1426,13 @@ const TOOL_KEY_ALIASES: Record<string, string> = {
   reflect: "CLIENT_SIDE_TOOL_V2_REFLECT",
   start_grind_execution: "CLIENT_SIDE_TOOL_V2_START_GRIND_EXECUTION",
   start_grind_planning: "CLIENT_SIDE_TOOL_V2_START_GRIND_PLANNING",
+  // wait_agent / kill_agent: friendlier surface for the
+  // run_in_background sub-agent lifecycle. wait_agent shares the proto
+  // CLIENT_SIDE_TOOL_V2_AWAIT_TASK envelope so dispatch lands in the
+  // same registry-aware await flow; kill_agent is a bridge-defined
+  // inline tool routed through truncated_tool_call.
+  wait_agent: "CLIENT_SIDE_TOOL_V2_AWAIT_TASK",
+  kill_agent: "CLIENT_SIDE_TOOL_V2_KILL_AGENT",
 }
 
 const DEFAULT_AGENT_BUILTIN_CURSOR_TOOLS = [
@@ -1561,6 +1711,32 @@ export interface McpToolDefinitionForApi {
 export interface BuildToolsForApiOptions {
   mcpToolDefs?: McpToolDefinitionForApi[]
   backend?: string
+  /**
+   * Sub-agent definitions visible to the current session. When provided,
+   * the `task` tool's description is rewritten to enumerate every agent's
+   * `agentType`, `whenToUse`, and resolved tool surface — mirroring
+   * claude-code's `getPrompt(agentDefinitions)` behaviour. Without this,
+   * the model only knows the static "Delegate a task/sub-agent execution
+   * request" sentence and has to guess what `subagent_type` to pass.
+   *
+   * Optional: when undefined the static description is used (preserves
+   * the legacy contract for callers that don't have a registry yet,
+   * e.g. very early bootstrap paths).
+   */
+  subagentDefinitions?: Array<{
+    agentType: string
+    whenToUse: string
+    /** Pre-resolved user-facing tool names for this sub-agent. */
+    toolNames: string[]
+  }>
+  /**
+   * Mark this tool list as being assembled for a sub-agent's own LLM turn
+   * rather than the top-level agent. Sub-agents must NOT see the `task`
+   * tool itself (no nested sub-agents through the `task` channel — they
+   * have no ExecServerMessage path to spawn one), so the dispatcher
+   * filters it out when this flag is set.
+   */
+  forSubAgent?: boolean
 }
 
 export interface CursorBuiltInToolCapabilityOptions {
@@ -2147,6 +2323,60 @@ function addCodexToolDefinition(
   tools.push(cloneToolDefinition(definition))
 }
 
+/**
+ * Build the dynamic `task` tool description shown to the parent agent.
+ *
+ * Mirrors claude-code's getPrompt(agentDefinitions) — the model needs to
+ * see which sub-agents are available, what each is good for, and what
+ * tools each one can use, so it can pick a `subagent_type` that actually
+ * matches the task instead of falling back to "general-purpose" with a
+ * mismatched tool surface.
+ *
+ * The static description is preserved as the first paragraph so any
+ * model that never reads past the first sentence still gets the original
+ * contract; the agent listing follows.
+ */
+function buildDynamicTaskToolDescription(
+  staticDescription: string,
+  subagentDefinitions: NonNullable<
+    BuildToolsForApiOptions["subagentDefinitions"]
+  >
+): string {
+  if (subagentDefinitions.length === 0) {
+    return staticDescription
+  }
+  const lines: string[] = [
+    staticDescription,
+    "",
+    "Available `subagent_type` values and what each one is good for. Pass " +
+      "`subagent_type` to choose; omit it to fall back to `general-purpose`.",
+    "",
+  ]
+  for (const def of subagentDefinitions) {
+    const toolList =
+      def.toolNames.length === 0
+        ? "(no tools)"
+        : def.toolNames.length > 8
+          ? `${def.toolNames.slice(0, 8).join(", ")}, +${def.toolNames.length - 8} more`
+          : def.toolNames.join(", ")
+    lines.push(`- ${def.agentType}: ${def.whenToUse} (Tools: ${toolList})`)
+  }
+  lines.push("")
+  lines.push(
+    "Sub-agents do NOT have file-system or shell tools (read_file, " +
+      "list_directory, run_terminal_command, edit_file_v2, delete_file are " +
+      "intentionally omitted). For tasks needing those, do the work yourself " +
+      "instead of delegating."
+  )
+  lines.push(
+    "When you delegate, write the prompt as if briefing a colleague who " +
+      "just walked into the room with no prior context: state the goal, what " +
+      "you've already learned or ruled out, and the specific question or " +
+      "deliverable. Terse one-liner prompts produce shallow output."
+  )
+  return lines.join("\n")
+}
+
 function buildCodexToolsForApi(
   supportedTools: string[],
   options?: BuildToolsForApiOptions
@@ -2200,6 +2430,7 @@ function buildCodexToolsForApi(
     "CLIENT_SIDE_TOOL_V2_CREATE_DIAGRAM",
     "CLIENT_SIDE_TOOL_V2_GO_TO_DEFINITION",
     "CLIENT_SIDE_TOOL_V2_AWAIT_TASK",
+    "CLIENT_SIDE_TOOL_V2_KILL_AGENT",
     "CLIENT_SIDE_TOOL_V2_AWAIT",
     "CLIENT_SIDE_TOOL_V2_AI_ATTRIBUTION",
     "CLIENT_SIDE_TOOL_V2_MCP_AUTH",
@@ -2438,6 +2669,7 @@ export function buildToolsForApi(
     "CLIENT_SIDE_TOOL_V2_CREATE_DIAGRAM",
     "CLIENT_SIDE_TOOL_V2_GO_TO_DEFINITION",
     "CLIENT_SIDE_TOOL_V2_AWAIT_TASK",
+    "CLIENT_SIDE_TOOL_V2_KILL_AGENT",
     "CLIENT_SIDE_TOOL_V2_READ_PROJECT",
     "CLIENT_SIDE_TOOL_V2_UPDATE_PROJECT",
     "CLIENT_SIDE_TOOL_V2_REFLECT",
@@ -2479,6 +2711,19 @@ export function buildToolsForApi(
         continue
       }
 
+      // Sub-agents do not get the `task` tool — they cannot spawn nested
+      // sub-agents because there is no ExecServerMessage path for the
+      // child task envelope. Drop it from the tool list when assembling
+      // for a sub-agent's own LLM turn.
+      if (
+        options?.forSubAgent &&
+        (definitionKey === "CLIENT_SIDE_TOOL_V2_TASK" ||
+          definitionKey === "CLIENT_SIDE_TOOL_V2_TASK_V2")
+      ) {
+        seenDefinitionKeys.add(definitionKey)
+        continue
+      }
+
       const definition = CURSOR_TOOL_DEFINITIONS[definitionKey]
       if (definition) {
         const normalizedToolName = normalizeToolIdentifier(definition.name)
@@ -2487,9 +2732,27 @@ export function buildToolsForApi(
         }
         seenDefinitionKeys.add(definitionKey)
         seenToolNames.add(normalizedToolName)
+
+        // For the parent agent's `task` tool, rewrite the description so
+        // the model can see the available sub-agents (mirrors claude-code's
+        // dynamic getPrompt(agentDefinitions)). Without this, the model
+        // only sees "Delegate a task/sub-agent execution request" and has
+        // to guess what `subagent_type` to pass.
+        const isTaskTool =
+          definitionKey === "CLIENT_SIDE_TOOL_V2_TASK" ||
+          definitionKey === "CLIENT_SIDE_TOOL_V2_TASK_V2"
+        const description =
+          isTaskTool && options?.subagentDefinitions
+            ? buildDynamicTaskToolDescription(
+                definition.description,
+                options.subagentDefinitions
+              )
+            : definition.description
+
         tools.push({
           type: "function",
           ...definition,
+          description,
         })
       }
       continue

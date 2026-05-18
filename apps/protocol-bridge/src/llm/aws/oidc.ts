@@ -14,7 +14,7 @@ import { HttpProxyAgent } from "http-proxy-agent"
 import { HttpsProxyAgent } from "https-proxy-agent"
 import { SocksProxyAgent } from "socks-proxy-agent"
 
-export type KiroAuthMethod = "idc" | "social"
+export type KiroAuthMethod = "idc" | "social" | "api_key"
 
 export interface KiroRefreshInput {
   authMethod: KiroAuthMethod
