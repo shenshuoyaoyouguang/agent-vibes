@@ -161,6 +161,22 @@ export async function parseKiroEventStream(
             }
             break
           }
+          case "metadataEvent":
+          case "messageMetadataEvent": {
+            // Diagnostic: surface the raw metadata payload so we can tell
+            // whether the upstream is emitting cache counters at all.
+            // Bedrock's `MetadataEvent` carries a `tokenUsage` sub-object
+            // with `cacheReadInputTokens / cacheWriteInputTokens`; if the
+            // dump shows the field but our `onCacheUsage` callback never
+            // fires, parsing has a bug; if the field is absent, the
+            // upstream is silently dropping our cachePoint markers.
+            // eslint-disable-next-line no-console
+            console.log(
+              `[Kiro][diagnostic] ${eventType} payload:`,
+              JSON.stringify(event)
+            )
+            break
+          }
           case "contextUsageEvent": {
             const pct = readNumber(event, "contextUsagePercentage")
             if (pct != null && callback.onContextUsage) {
@@ -198,8 +214,22 @@ export async function parseKiroEventStream(
             // error, subsequent frames are unreliable.
             throw err
           }
-          default:
+          default: {
+            // Diagnostic: surface unknown event types once per stream so
+            // we can build an exhaustive map of what the upstream is
+            // actually emitting.  Kiro's wire frames include `usage`
+            // counters under `metadataEvent` per the Smithy schema, but
+            // empirical observation shows they never arrive on
+            // `q.us-east-1.amazonaws.com`; this dump tells us where they
+            // really live (or confirms the upstream simply doesn't emit
+            // them at all).
+            const keys = Object.keys(event).slice(0, 16)
+            // eslint-disable-next-line no-console
+            console.log(
+              `[Kiro][diagnostic] unknown event-type=${eventType} keys=[${keys.join(",")}] payload=${JSON.stringify(event).slice(0, 800)}`
+            )
             break
+          }
         }
       }
     }

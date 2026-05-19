@@ -238,11 +238,80 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
 
   CLIENT_SIDE_TOOL_V2_WEB_SEARCH: {
     name: "web_search",
-    description: "Search the web for information",
+    description:
+      "Search the web for information. The bridge picks one adapter " +
+      "per session (build-time selection) based on the active backend: " +
+      "Google grounding for Gemini sessions, the Anthropic " +
+      "`web_search_20250305` server tool for Claude API sessions, the " +
+      "OpenAI Responses `web_search` server tool for Codex sessions, " +
+      "and a keyless chain (Brave LLM Context if API key configured, " +
+      "else Exa MCP, else DuckDuckGo HTML scrape) for backends without " +
+      "first-party search. There is no error-time fallback — if the " +
+      "selected adapter fails, the tool fails and the agent decides " +
+      "whether to retry, switch to web_fetch, or give up. Set the " +
+      "`WEB_SEARCH_ADAPTER` env to override selection " +
+      "(google-grounding | anthropic-server-tool | codex-server-tool " +
+      "| exa-mcp | brave-llm | duckduckgo-html).",
     input_schema: {
       type: "object",
       properties: {
-        query: { type: "string", description: "The search query" },
+        query: {
+          type: "string",
+          description: "The search query.",
+        },
+        domain: {
+          type: "string",
+          description:
+            "Optional domain restriction; folded into the query as a " +
+            "`site:` filter when present.",
+        },
+        allowed_domains: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Only include search results from these domains. Mutually " +
+            "exclusive with `blocked_domains`. Each entry is matched " +
+            "against the result hostname as either an exact match or a " +
+            "suffix match (`example.com` matches `foo.example.com`).",
+        },
+        blocked_domains: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Never include search results from these domains. Mutually " +
+            "exclusive with `allowed_domains`. Same matching rules as " +
+            "`allowed_domains`.",
+        },
+        num_results: {
+          type: "number",
+          description:
+            "Number of search results to return. Default 8. Adapters " +
+            "treat this as a soft cap — they may return fewer if the " +
+            "upstream returned fewer hits.",
+        },
+        livecrawl: {
+          type: "string",
+          enum: ["fallback", "preferred"],
+          description:
+            "Live-crawl mode for adapters that support cached vs live " +
+            "results (Exa, Brave). `fallback` (default) uses cached " +
+            "content unless missing; `preferred` always live-crawls.",
+        },
+        search_type: {
+          type: "string",
+          enum: ["auto", "fast", "deep"],
+          description:
+            "Search depth hint for adapters that support multiple " +
+            "modes (Exa). `auto` (default) is balanced, `fast` " +
+            "prioritizes latency, `deep` prioritizes coverage.",
+        },
+        context_max_characters: {
+          type: "number",
+          description:
+            "Soft cap on the LLM-context character budget. Adapters " +
+            "use this to size per-result snippet budgets. Default " +
+            "10000.",
+        },
       },
       required: ["query"],
     },

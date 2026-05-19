@@ -251,6 +251,21 @@ export interface ParsedCursorRequest {
   agentControlShellCommand?: { command: string; execId: string }
   agentControlTriggeringAuthId?: string
   agentControlTriggeringUserId?: number
+  // ConversationAction.asyncAskQuestionCompletionAction 详细 payload。
+  // 当 IDE 用户回答了一个 run_async=true 的 ask_question 后，这里
+  // 携带原始问题（用于在历史中渲染）和用户答复（结构化的 oneof）。
+  agentControlAsyncAskCompletion?: {
+    originalToolCallId: string
+    originalQuestionText?: string
+    resultCase: "success" | "rejected" | "error" | "async" | "unknown"
+    answers?: Array<{
+      questionId: string
+      selectedOptionIds: string[]
+      freeformText?: string
+    }>
+    rejectedReason?: string
+    errorMessage?: string
+  }
 
   // InteractionQuery 响应（客户端回复服务器查询）
   interactionResponse?: {
@@ -337,6 +352,7 @@ function makeControlMessage(
     shellCommand?: { command: string; execId: string }
     triggeringAuthId?: string
     triggeringUserId?: number
+    asyncAskCompletion?: ParsedCursorRequest["agentControlAsyncAskCompletion"]
   }
 ): ParsedCursorRequest {
   return {
@@ -359,6 +375,7 @@ function makeControlMessage(
     agentControlShellCommand: options?.shellCommand,
     agentControlTriggeringAuthId: options?.triggeringAuthId,
     agentControlTriggeringUserId: options?.triggeringUserId,
+    agentControlAsyncAskCompletion: options?.asyncAskCompletion,
   }
 }
 
@@ -906,13 +923,120 @@ export class CursorRequestParser {
         if (message.value.action.case === "asyncAskQuestionCompletionAction") {
           const asyncAction = message.value.action.value as {
             originalToolCallId?: string
+            originalArgs?: {
+              questions?: Array<{
+                id?: string
+                prompt?: string
+                question?: string
+                text?: string
+              }>
+              title?: string
+            }
+            result?: {
+              result?: {
+                case?: string
+                value?: unknown
+              }
+            }
           }
+
+          // 把原始问题文本拼一行，方便回写到 user message。
+          const originalQuestionText = (() => {
+            const args = asyncAction.originalArgs
+            if (!args) return undefined
+            const parts: string[] = []
+            if (args.title) parts.push(args.title)
+            if (Array.isArray(args.questions)) {
+              for (const q of args.questions) {
+                const text = q.prompt || q.question || q.text || ""
+                if (text) parts.push(text)
+              }
+            }
+            const joined = parts.join(" / ").trim()
+            return joined || undefined
+          })()
+
+          const innerResult = asyncAction.result?.result
+          const innerCase = innerResult?.case
+          let resultCase:
+            | "success"
+            | "rejected"
+            | "error"
+            | "async"
+            | "unknown" = "unknown"
+          let answers:
+            | Array<{
+                questionId: string
+                selectedOptionIds: string[]
+                freeformText?: string
+              }>
+            | undefined
+          let rejectedReason: string | undefined
+          let errorMessage: string | undefined
+
+          if (innerCase === "success") {
+            resultCase = "success"
+            const successValue = innerResult?.value as
+              | {
+                  answers?: Array<{
+                    questionId?: string
+                    selectedOptionIds?: string[]
+                    freeformText?: string
+                  }>
+                }
+              | undefined
+            if (Array.isArray(successValue?.answers)) {
+              answers = successValue.answers.map((a) => ({
+                questionId: a?.questionId || "",
+                selectedOptionIds: Array.isArray(a?.selectedOptionIds)
+                  ? a.selectedOptionIds.filter(
+                      (id): id is string => typeof id === "string"
+                    )
+                  : [],
+                freeformText:
+                  typeof a?.freeformText === "string" &&
+                  a.freeformText.length > 0
+                    ? a.freeformText
+                    : undefined,
+              }))
+            }
+          } else if (innerCase === "rejected") {
+            resultCase = "rejected"
+            const rejectedValue = innerResult?.value as
+              | { reason?: string }
+              | undefined
+            rejectedReason =
+              typeof rejectedValue?.reason === "string"
+                ? rejectedValue.reason
+                : undefined
+          } else if (innerCase === "error") {
+            resultCase = "error"
+            const errorValue = innerResult?.value as
+              | { errorMessage?: string }
+              | undefined
+            errorMessage =
+              typeof errorValue?.errorMessage === "string"
+                ? errorValue.errorMessage
+                : undefined
+          } else if (innerCase === "async") {
+            // IDE 不应该回送嵌套 async，但保留以防协议兼容性。
+            resultCase = "async"
+          }
+
           this.logger.log(
-            `收到 conversationAction.asyncAskQuestionCompletionAction toolCallId=${asyncAction.originalToolCallId || "(none)"}`
+            `收到 conversationAction.asyncAskQuestionCompletionAction toolCallId=${asyncAction.originalToolCallId || "(none)"} case=${resultCase} answers=${answers?.length ?? 0}`
           )
           return makeControlMessage("asyncAskQuestionCompletionAction", {
             ...triggeringFields,
             toolCallId: asyncAction.originalToolCallId || "",
+            asyncAskCompletion: {
+              originalToolCallId: asyncAction.originalToolCallId || "",
+              originalQuestionText,
+              resultCase,
+              answers,
+              rejectedReason,
+              errorMessage,
+            },
           })
         }
         if (message.value.action.case === "cancelSubagentAction") {

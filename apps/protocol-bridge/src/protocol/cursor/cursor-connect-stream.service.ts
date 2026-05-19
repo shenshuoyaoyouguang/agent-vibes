@@ -116,6 +116,7 @@ import {
 import { generateBlobId, generateTraceId } from "./tools/agent-helpers"
 import { normalizeBugfixResultItems as normalizeBugfixResultItemsFromContract } from "./tools/bugfix-result-normalizer"
 import { ClientSideToolV2ExecutorService } from "./tools/client-side-tool-v2-executor.service"
+import { WebSearchAbortError, WebSearchService } from "./web-search"
 import {
   type AttachedImage,
   cursorRequestParser,
@@ -897,7 +898,8 @@ export class CursorConnectStreamService {
     private readonly subagentBackgroundWorker: SubagentBackgroundWorker,
     private readonly subagentTaskRegistry: SubagentTaskRegistry,
     private readonly subagentTranscriptStore: SubagentTranscriptStore,
-    private readonly contextHookExecutor: ContextHookExecutorService
+    private readonly contextHookExecutor: ContextHookExecutorService,
+    private readonly webSearchService: WebSearchService
   ) {
     // Register provider adapter cleanup on session expiry/deletion.
     // This ensures provider resources (Codex WS connections, warmup caches) are released.
@@ -1812,6 +1814,247 @@ export class CursorConnectStreamService {
       `Background shell action settled parent tool: ${conversationId} toolCallId=${toolCallId} commandId=${backgroundCommand.commandId}`
     )
     return false
+  }
+
+  /**
+   * Handle a `ConversationAction.asyncAskQuestionCompletionAction` from the IDE.
+   *
+   * Path: when the agent calls `ask_question(run_async=true)`, the bridge
+   * settles the synchronous `partialToolCall` with an `AskQuestionResult.async`
+   * placeholder, releasing the agent turn early. The user later answers in
+   * the IDE's queued-question UI, and the IDE sends this ConversationAction
+   * carrying the original toolCallId, original args, and the actual result
+   * (`success` with answers / `rejected` with reason / `error`).
+   *
+   * Without a handler, two things break:
+   *   1. The IDE's "Queued" panel never clears, because nothing on the
+   *      bridge side acknowledges that the action was consumed.
+   *   2. The agent's conversation history has no record of what the user
+   *      actually answered — only the `[ask_question async] waiting…`
+   *      placeholder from the original sync settlement.
+   *
+   * This handler emits an `userMessageAppended` interaction update
+   * carrying a textual rendering of the user's answer, which:
+   *   - is the IDE-canonical signal that the queued question is consumed
+   *     (so the "1 Queued" indicator clears), and
+   *   - lets the IDE chat view render the user's response in-line so
+   *     subsequent agent turns can see it.
+   */
+  // The handler is `async *` for parity with the other `handle*Action`
+  // siblings (so callers can `yield*` it through the BiDi stream), but
+  // none of its current work needs to await — yields and grpc envelope
+  // builders are all synchronous. Keep the type signature stable to
+  // preserve the protocol contract.
+  // eslint-disable-next-line @typescript-eslint/require-await
+  private async *handleAsyncAskQuestionCompletionAction(
+    conversationId: string,
+    parsed: ParsedCursorRequest
+  ): AsyncGenerator<Buffer, boolean> {
+    const completion = parsed.agentControlAsyncAskCompletion
+    const toolCallId =
+      completion?.originalToolCallId ||
+      parsed.agentControlToolCallId?.trim() ||
+      ""
+
+    if (!completion) {
+      this.logger.warn(
+        `Async ask completion missing structured payload: conversation=${conversationId} toolCallId=${toolCallId || "(none)"}`
+      )
+      return false
+    }
+
+    // Render the user's response as a single line so we can append it to
+    // the conversation history. We deliberately keep the format short and
+    // grep-friendly (matches how the IDE itself renders queued-answer
+    // bubbles).
+    const renderedAnswer = (() => {
+      switch (completion.resultCase) {
+        case "success": {
+          const parts: string[] = []
+          for (const a of completion.answers || []) {
+            const segments: string[] = []
+            if (a.selectedOptionIds.length > 0) {
+              segments.push(a.selectedOptionIds.join(", "))
+            }
+            if (a.freeformText && a.freeformText.length > 0) {
+              segments.push(a.freeformText)
+            }
+            const rendered = segments.join(" — ").trim()
+            if (rendered) {
+              parts.push(
+                a.questionId ? `${a.questionId}: ${rendered}` : rendered
+              )
+            }
+          }
+          if (parts.length === 0) {
+            return "[ask_question answered]"
+          }
+          return `[ask_question answered] ${parts.join(" | ")}`
+        }
+        case "rejected":
+          return `[ask_question rejected] ${
+            completion.rejectedReason || "(no reason)"
+          }`
+        case "error":
+          return `[ask_question error] ${
+            completion.errorMessage || "(no message)"
+          }`
+        case "async":
+          // IDE shouldn't echo a nested async result, but be defensive.
+          return "[ask_question async] (still pending)"
+        default:
+          return "[ask_question answered] (unknown result)"
+      }
+    })()
+
+    const messageId = `async_ask_completion_${
+      toolCallId || crypto.randomUUID()
+    }`
+
+    this.logger.log(
+      `ConversationAction.asyncAskQuestionCompletion settled: ${conversationId} toolCallId=${
+        toolCallId || "(none)"
+      } case=${completion.resultCase} answers=${
+        completion.answers?.length ?? 0
+      }`
+    )
+
+    yield this.grpcService.createUserMessageAppendedResponse(
+      renderedAnswer,
+      messageId
+    )
+
+    // Clear the IDE's "Queued" badge for this question.
+    // ─────────────────────────────────────────────────
+    // The original `ask_question(run_async=true)` tool call was already
+    // sync-settled with an `AskQuestionResult.async` placeholder when the
+    // agent turn ended. That placeholder is what the IDE renders as the
+    // "1 Queued · Question responses queued" indicator at the top of the
+    // conversation. The placeholder has no expiry — without an explicit
+    // protocol signal that the question is now resolved, the indicator
+    // never disappears, even after the user has actually answered.
+    //
+    // The IDE's queued list is keyed by the original `toolCallId`, and
+    // its bookkeeping is monotonic (latest result wins). So we re-emit a
+    // `toolCallCompleted(askQuestionToolCall)` carrying the same toolCall
+    // Id, but with the *real* result (`success`/`rejected`/`error`)
+    // instead of `async`. The IDE merges this into the queued state and
+    // drops the badge. On builds that already cleared the badge from the
+    // userMessageAppended above, this is a harmless no-op (the bubble
+    // result section just refreshes from `async (waiting)` to whatever
+    // the user actually picked).
+    if (toolCallId) {
+      const completedFrame = this.buildAskQuestionAsyncCompletedFrame(
+        toolCallId,
+        completion
+      )
+      if (completedFrame) {
+        yield completedFrame
+      }
+    }
+
+    return false
+  }
+
+  /**
+   * Builds a `toolCallCompleted(askQuestionToolCall)` frame that
+   * "upgrades" a previously-async `ask_question` placeholder into its
+   * real terminal result. Returns `undefined` if we cannot construct a
+   * useful frame (e.g. completion still nested-async).
+   */
+  private buildAskQuestionAsyncCompletedFrame(
+    toolCallId: string,
+    completion: NonNullable<
+      ParsedCursorRequest["agentControlAsyncAskCompletion"]
+    >
+  ): Buffer | undefined {
+    if (completion.resultCase === "async") {
+      return undefined
+    }
+
+    type AskQuestionResultProjection = NonNullable<
+      ParsedToolResult["inlineProjection"]
+    >["askQuestionResult"]
+
+    let projection: AskQuestionResultProjection
+    let summaryContent: string
+    let toolResultStatus: ToolResultStatus
+    let toolResultMessage: string | undefined
+    switch (completion.resultCase) {
+      case "success": {
+        const answers = (completion.answers || []).map((a) => ({
+          questionId: a.questionId || "",
+          selectedOptionIds: Array.isArray(a.selectedOptionIds)
+            ? a.selectedOptionIds.filter(
+                (id): id is string => typeof id === "string" && id.length > 0
+              )
+            : [],
+          freeformText:
+            typeof a.freeformText === "string" && a.freeformText.length > 0
+              ? a.freeformText
+              : undefined,
+        }))
+        projection = {
+          resultCase: "success",
+          answers,
+        }
+        summaryContent =
+          answers.length > 0
+            ? `[ask_question success] ${JSON.stringify(answers)}`
+            : "[ask_question success]"
+        toolResultStatus = "success"
+        break
+      }
+      case "rejected": {
+        const reason =
+          completion.rejectedReason && completion.rejectedReason.length > 0
+            ? completion.rejectedReason
+            : "rejected"
+        projection = {
+          resultCase: "rejected",
+          reason,
+        }
+        summaryContent = `[ask_question rejected] ${reason}`
+        toolResultStatus = "rejected"
+        toolResultMessage = reason
+        break
+      }
+      case "error":
+      default: {
+        const errorMessage =
+          completion.errorMessage && completion.errorMessage.length > 0
+            ? completion.errorMessage
+            : "ask_question failed"
+        projection = {
+          resultCase: "error",
+          errorMessage,
+        }
+        summaryContent = `[ask_question error] ${errorMessage}`
+        toolResultStatus = "error"
+        toolResultMessage = errorMessage
+        break
+      }
+    }
+
+    return this.grpcService.createToolCallCompletedResponse(
+      toolCallId,
+      "ask_question",
+      // Empty args object — the IDE keeps the args from the original
+      // toolCallStarted frame; here we only care about `result`.
+      {},
+      summaryContent,
+      // Let the grpc service derive the proto family from the toolName —
+      // `ToolFamily` is private to cursor-grpc.service and not re-exported.
+      undefined,
+      "",
+      {
+        toolResultState: {
+          status: toolResultStatus,
+          message: toolResultMessage,
+        },
+        askQuestionResult: projection,
+      }
+    )
   }
 
   private async *handleBackgroundSubagentAction(
@@ -5429,61 +5672,6 @@ ${raw}
     ].join("\n")
   }
 
-  private sanitizeStructuredWebUrl(raw: string): string {
-    const trimmed = raw.trim().replace(/[)>\]}.,;:!?]+$/g, "")
-    if (!trimmed) return ""
-
-    const markdownArtifactIndex = trimmed.indexOf("](http")
-    const candidate =
-      markdownArtifactIndex >= 0
-        ? trimmed.slice(markdownArtifactIndex + 2)
-        : trimmed
-    const normalized = candidate.replace(/^\(+/, "")
-    try {
-      const parsed = new URL(normalized)
-      parsed.hash = ""
-      return parsed.toString()
-    } catch {
-      return normalized
-    }
-  }
-
-  private extractStructuredWebSearchReferences(
-    content: string,
-    limit = 20
-  ): Array<{ title?: string; url?: string; chunk?: string }> {
-    const references: Array<{ title?: string; url?: string; chunk?: string }> =
-      []
-    const seenUrls = new Set<string>()
-    const markdownLinkPattern = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g
-    const plainUrlPattern = /https?:\/\/[^\s<>"')]+/g
-    let match: RegExpExecArray | null
-
-    while ((match = markdownLinkPattern.exec(content)) !== null) {
-      const title = (match[1] || "").trim()
-      const url = this.sanitizeStructuredWebUrl(match[2] || "")
-      if (!url || seenUrls.has(url)) continue
-      seenUrls.add(url)
-      const idx = match.index ?? 0
-      const chunk = content
-        .slice(Math.max(0, idx - 100), Math.min(content.length, idx + 220))
-        .replace(/\s+/g, " ")
-        .trim()
-      references.push({ title: title || url, url, chunk })
-      if (references.length >= limit) return references
-    }
-
-    while ((match = plainUrlPattern.exec(content)) !== null) {
-      const url = this.sanitizeStructuredWebUrl(match[0] || "")
-      if (!url || seenUrls.has(url)) continue
-      seenUrls.add(url)
-      references.push({ title: url, url, chunk: url })
-      if (references.length >= limit) return references
-    }
-
-    return references
-  }
-
   private formatToolResultForHistory(
     toolName: string,
     toolInput: Record<string, unknown>,
@@ -6420,6 +6608,71 @@ ${raw}
     const searchText = options.searchText
     const replaceText = options.replaceText
     const allowMultiple = options.allowMultiple || false
+
+    // Guard 1: identical search/replace is a no-op edit. Models occasionally
+    // emit this when retrying after a partial response or when the bridge's
+    // upstream proxy duplicates a tool_use input. Without this short-circuit
+    // the bridge would still walk the full read→write→toolResult pipeline,
+    // burning trace records and (worse) re-emitting the same fileText to
+    // any IDE-side file watchers. Treat it as a successful no-op so the
+    // caller can settle the toolCall without touching disk.
+    if (searchText === replaceText && searchText.length > 0) {
+      return {
+        fileText: content,
+        warning: `${options.warningPrefix} matches replacement verbatim; treating edit as no-op`,
+        failureContext: {
+          filePath: "",
+          reason: "noop_identical",
+          startLine: options.startLine,
+          endLine: options.endLine,
+          allowMultiple,
+          searchText,
+          replaceTextLength: replaceText.length,
+        },
+      }
+    }
+
+    // Guard 2: replacement embeds the entire search text and is much larger.
+    // This is the classic "model pasted both old and new content" failure
+    // mode (observed when the model intends to APPEND but expresses it as a
+    // search/replace). Without rejection the bridge would write the
+    // append-shaped block, leaving the original snippet still present in
+    // the file — so the next identical edit_file_v2 call would match again
+    // and append the same block a second time, causing duplication.
+    //
+    // Heuristic: searchText is at least 80 chars (avoid false positives on
+    // tiny renames), replaceText starts with the searchText verbatim, and
+    // replaceText is at least 4× larger than searchText, and the user did
+    // not pass allow_multiple. The 4× ratio comfortably allows legitimate
+    // "wrap with surrounding context" edits while catching the
+    // duplicate-paste pattern.
+    if (
+      !allowMultiple &&
+      searchText.length >= 80 &&
+      replaceText.length >= searchText.length * 4 &&
+      replaceText.startsWith(searchText)
+    ) {
+      return {
+        fileText: content,
+        warning:
+          `${options.warningPrefix} appears to embed the entire search ` +
+          `snippet at the start of the replacement (search_len=${searchText.length}, ` +
+          `replace_len=${replaceText.length}); refusing to apply as it ` +
+          `usually indicates the model intended to append additional ` +
+          `content. Either trim the duplicated prefix from replace, or ` +
+          `split this into a smaller search snippet plus an explicit ` +
+          `append edit.`,
+        failureContext: {
+          filePath: "",
+          reason: "self_swallowing_replace",
+          startLine: options.startLine,
+          endLine: options.endLine,
+          allowMultiple,
+          searchText,
+          replaceTextLength: replaceText.length,
+        },
+      }
+    }
 
     if (searchText.length === 0) {
       return {
@@ -10407,95 +10660,6 @@ ${raw}
     }
   }
 
-  /**
-   * Dispatch a web_search query to the backend currently routing the session
-   * (or fall back to a configured Google search pool when the active backend
-   * cannot perform server-side search natively).
-   *
-   * Each backend has its own server-side web_search surface, reverse-engineered
-   * from the official client binaries:
-   *   - google / google-claude → Cloud Code grounded search (already available
-   *     via googleService.executeWebSearch())
-   *   - claude-api             → Anthropic /v1/messages with the
-   *     `web_search_20250305` server tool (anthropicApiService.executeWebSearch)
-   *   - codex / openai-compat  → OpenAI Responses API with the
-   *     `web_search` server tool (codexService.executeWebSearch)
-   *   - kiro                   → AWS CodeWhisperer Streaming generateAssistant
-   *     Response does not expose a server-side web_search tool. The Kiro
-   *     desktop client itself never executes any search logic. So when a Kiro
-   *     session asks for web_search we fall back to the configured Google
-   *     account pool — this is the only deterministic way to honour the
-   *     request without inventing a generic search provider.
-   */
-  private async dispatchWebSearchByBackend(
-    conversationId: string,
-    query: string
-  ): Promise<{
-    text: string
-    references: Array<{ title: string; url: string; chunk: string }>
-  }> {
-    const session = this.sessionManager.getSession(conversationId)
-    let backend: BackendType | undefined
-    if (session?.model) {
-      try {
-        backend = this.modelRouter.resolveModel(session.model).backend
-      } catch (error) {
-        this.logger.debug(
-          `[web_search] model router could not resolve backend for session ` +
-            `${conversationId} model=${session.model}: ` +
-            `${error instanceof Error ? error.message : String(error)}`
-        )
-      }
-    }
-
-    const tryGoogle = async () => {
-      if (!this.googleService.isLocallyConfigured()) {
-        throw new Error(
-          "Google Cloud Code backend is not configured; web_search " +
-            "fallback unavailable"
-        )
-      }
-      return this.googleService.executeWebSearch(query)
-    }
-
-    switch (backend) {
-      case "google":
-      case "google-claude":
-        return tryGoogle()
-
-      case "claude-api":
-        if (!this.anthropicApiService.isAvailable?.()) {
-          this.logger.warn(
-            "[web_search] claude-api backend is not available; falling back to Google"
-          )
-          return tryGoogle()
-        }
-        return this.anthropicApiService.executeWebSearch({ query })
-
-      case "codex":
-      case "openai-compat":
-        if (!this.codexService.isAvailable?.()) {
-          this.logger.warn(
-            "[web_search] codex backend is not available; falling back to Google"
-          )
-          return tryGoogle()
-        }
-        return this.codexService.executeWebSearch({ query })
-
-      case "kiro":
-        // CodeWhisperer Streaming has no server-side web_search; route to
-        // the Google account pool exactly like a Gemini session would.
-        this.logger.debug(
-          "[web_search] Kiro session detected; routing to Google account pool"
-        )
-        return tryGoogle()
-
-      default:
-        // Unknown / unrouted session — best-effort Google fallback.
-        return tryGoogle()
-    }
-  }
-
   private async executeInlineWebTool(
     conversationId: string,
     toolName: string,
@@ -10535,48 +10699,153 @@ ${raw}
         }
       }
 
-      try {
-        const effectiveQuery = domain
-          ? `${normalizedQuery} site:${domain}`
-          : normalizedQuery
-        const searchResult = await this.dispatchWebSearchByBackend(
-          conversationId,
-          effectiveQuery
-        )
-        const maxChars = 18_000
-        const summary =
-          searchResult.text.length > maxChars
-            ? `${searchResult.text.slice(0, maxChars)}\n\n...[truncated]`
-            : searchResult.text
-        const domainLine = domain ? `\nDomain preference: ${domain}` : ""
-        const queryLine =
-          normalizedQuery === query
-            ? `Search query: ${query}`
-            : `Search query: ${query}\nNormalized query: ${normalizedQuery}`
+      // Resolve the active backend so the factory can pick the right
+      // adapter. We deliberately re-resolve per call (rather than
+      // caching on the session) — the model can change mid-conversation
+      // and the factory is cheap.
+      const session = this.sessionManager.getSession(conversationId)
+      let backend: BackendType | undefined
+      if (session?.model) {
+        try {
+          backend = this.modelRouter.resolveModel(session.model).backend
+        } catch (error) {
+          this.logger.debug(
+            `[web_search] model router could not resolve backend for session ` +
+              `${conversationId} model=${session.model}: ` +
+              `${error instanceof Error ? error.message : String(error)}`
+          )
+        }
+      }
 
-        // Prefer structured references from Cloud Code grounding metadata;
-        // fall back to regex extraction from the text body.
-        const structuredRefs =
-          searchResult.references.length > 0
-            ? searchResult.references.map((ref) => ({
-                title: ref.title || ref.url,
-                url: ref.url,
-                chunk: ref.chunk || "",
-              }))
-            : this.extractStructuredWebSearchReferences(summary, 20)
+      // Schema fields lifted from claude-code's WebSearchTool input
+      // schema. The connect-stream input bag uses snake_case (Cursor
+      // protocol convention); we accept either casing for forward
+      // compatibility with future protocol updates.
+      const toStringList = (value: unknown): string[] =>
+        Array.isArray(value)
+          ? value
+              .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+              .filter((entry) => entry.length > 0)
+          : []
+      const allowedDomains = toStringList(
+        input.allowed_domains ?? input.allowedDomains
+      )
+      const blockedDomains = toStringList(
+        input.blocked_domains ?? input.blockedDomains
+      )
+      const numResults = this.pickFirstNumber(input, [
+        "num_results",
+        "numResults",
+        "max_results",
+        "maxResults",
+      ])
+      const livecrawlRaw = this.pickFirstString(input, [
+        "livecrawl",
+        "live_crawl",
+      ])
+      const livecrawl =
+        livecrawlRaw === "preferred" || livecrawlRaw === "fallback"
+          ? livecrawlRaw
+          : undefined
+      const searchTypeRaw = this.pickFirstString(input, [
+        "search_type",
+        "searchType",
+      ])
+      const searchType =
+        searchTypeRaw === "auto" ||
+        searchTypeRaw === "fast" ||
+        searchTypeRaw === "deep"
+          ? searchTypeRaw
+          : undefined
+      const contextMaxCharacters = this.pickFirstNumber(input, [
+        "context_max_characters",
+        "contextMaxCharacters",
+      ])
+
+      try {
+        const response = await this.webSearchService.executeSearch(
+          backend,
+          normalizedQuery,
+          {
+            allowedDomains:
+              allowedDomains.length > 0 ? allowedDomains : undefined,
+            blockedDomains:
+              blockedDomains.length > 0 ? blockedDomains : undefined,
+            numResults: numResults && numResults > 0 ? numResults : undefined,
+            livecrawl,
+            searchType,
+            contextMaxCharacters:
+              contextMaxCharacters && contextMaxCharacters > 0
+                ? contextMaxCharacters
+                : undefined,
+            domain: domain || undefined,
+            conversationId,
+            model: session?.model,
+          }
+        )
+
+        const headerLines = [`Search query: ${query}`]
+        if (normalizedQuery !== query) {
+          headerLines.push(`Normalized query: ${normalizedQuery}`)
+        }
+        if (domain) {
+          headerLines.push(`Domain preference: ${domain}`)
+        }
+        headerLines.push(`Adapter: ${response.adapter}`)
+
+        const linkLines: string[] = []
+        for (const result of response.results) {
+          const title = result.title || result.url
+          let line = `- [${title}](${result.url})`
+          const snippet = result.chunk || result.snippet
+          if (snippet) {
+            const trimmedSnippet = snippet
+              .replace(/\s+/g, " ")
+              .trim()
+              .slice(0, 280)
+            if (trimmedSnippet) {
+              line += `: ${trimmedSnippet}`
+            }
+          }
+          linkLines.push(line)
+        }
+
+        const content =
+          headerLines.join("\n") +
+          "\n\nLinks:\n" +
+          linkLines.join("\n") +
+          "\n\nREMINDER: cite the URLs above using markdown hyperlinks when " +
+          "you use this information in your reply."
 
         return {
-          content: `${queryLine}${domainLine}\n\n${summary}`,
+          content,
           state: { status: "success" },
           projection: {
             webSearchResult: {
               query: normalizedQuery,
-              references: structuredRefs,
+              references: response.results.map((r) => ({
+                title: r.title || r.url,
+                url: r.url,
+                chunk: r.chunk || r.snippet || "",
+              })),
             },
           },
         }
       } catch (error) {
+        // Caller-side aborts surface as WebSearchAbortError; treat them
+        // as a "rejected" tool result so connect-stream short-circuits
+        // the in-flight tool call without emitting a "search failed"
+        // banner that the model would then have to interpret.
+        if (error instanceof WebSearchAbortError) {
+          return {
+            content: "[web_search aborted]",
+            state: { status: "rejected", message: "aborted" },
+          }
+        }
         const message = error instanceof Error ? error.message : String(error)
+        this.logger.warn(
+          `[web_search] tool call failed: ${message.slice(0, 240)}`
+        )
         return {
           content: `[web_search error] ${message}`,
           state: { status: "error", message },
@@ -18266,6 +18535,38 @@ ${raw}
         preparedTool.protocolToolInput
       )
     ) {
+      // UI-card sidecar label
+      // ────────────────────
+      // The Cursor IDE renders most ToolCall.tool oneof cases as their own
+      // UI card by looking up a per-case display template. The four
+      // "UI-card" families below were added more recently to the agent.v1
+      // proto, and older IDE builds (and some renderer paths even on
+      // current builds — e.g. nested sub-agent bubbles, history replay)
+      // do not yet ship a template for them. When that lookup misses,
+      // the IDE falls back to a raw label like `[Tool: readTodosToolCall]`
+      // sitting flush against the previous text block, with no human
+      // context attached.
+      //
+      // The protocol-conformant fix would live on the IDE side. From the
+      // bridge we cannot change the renderer, but we *can* prepend a one-
+      // line human-readable announcement via a `textDelta` so the user at
+      // least sees `Reading todos...` / `Updating todos...` / `Creating
+      // plan...` / `Running sub-agent task: <type>` next to the raw
+      // label. On builds that *do* render the card, this text shows up
+      // as a brief lead-in and is harmless.
+      //
+      // Intentionally limited to this whitelist — every other ToolCall
+      // case already gets a proper card rendering, and adding a sidecar
+      // label there would just add visual noise.
+      const sidecarLabel = this.resolveUiCardSidecarLabel(
+        preparedTool.protocolToolName,
+        preparedTool.deferredToolFamily,
+        preparedTool.protocolToolInput
+      )
+      if (sidecarLabel) {
+        yield this.grpcService.createAgentTextResponse(`${sidecarLabel}\n`)
+      }
+
       yield this.grpcService.createToolCallStartedResponse(
         activeToolCall.id,
         preparedTool.protocolToolName,
@@ -18277,6 +18578,98 @@ ${raw}
         conversationId,
         activeToolCall.id
       )
+    }
+  }
+
+  /**
+   * Resolves a single-line human-readable sidecar label for the four
+   * "UI-card" tool families (`read_todos` / `update_todos` / `create_plan`
+   * / `task`) whose dedicated ToolCall oneof cases the Cursor IDE may not
+   * have a renderer template for, causing the bubble to fall back to a
+   * raw `[Tool: <case>]` label. Returns `undefined` for tools that already
+   * have a proper card renderer or that we should not annotate.
+   *
+   * Kept on the connect-stream service (not the grpc service) because the
+   * decision depends on the prepared tool input, which is a connect-stream
+   * concept and not part of the lower grpc envelope builders.
+   */
+  private resolveUiCardSidecarLabel(
+    toolName: string,
+    deferredFamily: DeferredToolFamily | undefined,
+    input: Record<string, unknown>
+  ): string | undefined {
+    const family =
+      deferredFamily || this.normalizeDeferredToolFamily(toolName) || toolName
+    switch (family) {
+      case "read_todos": {
+        const statusFilter = Array.isArray(input.status_filter)
+          ? input.status_filter
+          : Array.isArray(input.statusFilter)
+            ? input.statusFilter
+            : []
+        const idFilter = Array.isArray(input.id_filter)
+          ? input.id_filter
+          : Array.isArray(input.idFilter)
+            ? input.idFilter
+            : []
+        const filterParts: string[] = []
+        if (statusFilter.length > 0) {
+          filterParts.push(`status=${statusFilter.join("|")}`)
+        }
+        if (idFilter.length > 0) {
+          const ids = idFilter
+            .map((value: unknown) => String(value))
+            .filter((value: string) => value.length > 0)
+          if (ids.length > 0) {
+            filterParts.push(
+              `ids=${ids.length > 4 ? `${ids.slice(0, 4).join(",")}…` : ids.join(",")}`
+            )
+          }
+        }
+        return filterParts.length > 0
+          ? `Reading todos (${filterParts.join(", ")})`
+          : "Reading todos"
+      }
+      case "update_todos": {
+        const merge =
+          input.merge === true ||
+          input.merge === "true" ||
+          input.merge === 1 ||
+          input.merge === "1"
+        const todos = Array.isArray(input.todos) ? input.todos : []
+        const count = todos.length
+        return merge
+          ? `Updating todos (merge=true, ${count} item${count === 1 ? "" : "s"})`
+          : `Updating todos (replace, ${count} item${count === 1 ? "" : "s"})`
+      }
+      case "create_plan": {
+        const title =
+          (typeof input.title === "string" && input.title.trim()) ||
+          (typeof input.name === "string" && input.name.trim()) ||
+          ""
+        return title
+          ? `Creating plan: ${title.length > 80 ? `${title.slice(0, 80)}…` : title}`
+          : "Creating plan"
+      }
+      case "task": {
+        const subagentType =
+          (typeof input.subagent_type === "string" && input.subagent_type) ||
+          (typeof input.subagentType === "string" && input.subagentType) ||
+          "general-purpose"
+        const description =
+          (typeof input.description === "string" && input.description.trim()) ||
+          ""
+        const runInBackground =
+          input.run_in_background === true || input.runInBackground === true
+        const prefix = runInBackground
+          ? `Spawning background sub-agent (${subagentType})`
+          : `Running sub-agent (${subagentType})`
+        return description
+          ? `${prefix}: ${description.length > 80 ? `${description.slice(0, 80)}…` : description}`
+          : prefix
+      }
+      default:
+        return undefined
     }
   }
 
@@ -18947,6 +19340,14 @@ ${raw}
             this.logger.log(
               `ConversationAction.asyncAskQuestionCompletion: ${conversationId} toolCallId=${parsed.agentControlToolCallId || "(none)"}`
             )
+            const shouldEndStream =
+              yield* this.handleAsyncAskQuestionCompletionAction(
+                conversationId,
+                parsed
+              )
+            if (shouldEndStream) {
+              return
+            }
           } else if (
             parsed.agentControlType === "cancelSubagentAction" &&
             conversationId

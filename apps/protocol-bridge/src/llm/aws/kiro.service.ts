@@ -2178,6 +2178,21 @@ export class KiroService implements OnModuleInit {
         this.logger.log(
           `  [Kiro] Discovered ${models.length} model(s): ${models.map((m) => m.modelId).join(", ")}`
         )
+        // Diagnostic: surface promptCaching capability per model so we can
+        // tell whether cachePoint markers are even meaningful for each
+        // model.  When `supportsPromptCaching=true`, the upstream is
+        // expected to return `cacheReadInputTokens / cacheWriteInputTokens`
+        // in the streaming `usage` block; absence in the log indicates
+        // the backend silently dropped our markers.
+        for (const m of models) {
+          const pc = m.promptCaching
+          if (!pc) continue
+          this.logger.log(
+            `  [Kiro] model=${m.modelId} promptCaching: supports=${pc.supportsPromptCaching ?? false}, ` +
+              `minTokens=${pc.minimumTokensPerCacheCheckpoint ?? "?"}, ` +
+              `maxBreakpoints=${pc.maximumCacheCheckpointsPerRequest ?? "?"}`
+          )
+        }
       }
     } catch (error) {
       this.logger.warn(

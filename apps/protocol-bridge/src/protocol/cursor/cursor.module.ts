@@ -25,6 +25,7 @@ import { SubagentTranscriptStore } from "./subagents/subagent-transcript-store.s
 import { SubagentTaskRegistry } from "./subagents/subagent-task-registry.service"
 import { SubagentBackgroundWorker } from "./subagents/subagent-background-worker.service"
 import { ClientSideToolV2ExecutorService } from "./tools/client-side-tool-v2-executor.service"
+import { WebSearchAdapterFactory, WebSearchService } from "./web-search"
 
 @Module({
   imports: [
@@ -58,6 +59,8 @@ import { ClientSideToolV2ExecutorService } from "./tools/client-side-tool-v2-exe
     SubagentTranscriptStore,
     SubagentTaskRegistry,
     SubagentBackgroundWorker,
+    WebSearchAdapterFactory,
+    WebSearchService,
   ],
   exports: [
     CursorAuthService,

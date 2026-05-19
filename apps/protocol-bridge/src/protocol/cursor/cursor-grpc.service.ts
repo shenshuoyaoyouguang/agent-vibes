@@ -4651,8 +4651,14 @@ export class CursorGrpcService {
       computer_use: "computerUseToolCall",
       web_search: "webSearchToolCall",
       web_fetch: "webFetchToolCall",
-      exa_search: "exaSearchToolCall",
-      exa_fetch: "exaFetchToolCall",
+      // exa_* tools have no dedicated proto case; mirror the reportToolCall
+      // path which projects exa_search/exa_fetch onto webSearch/webFetch.
+      // Previously this used "exaSearchToolCall" / "exaFetchToolCall" which
+      // are not real ToolCall.tool oneof cases — protobuf-es would treat
+      // the resulting envelope as malformed and the IDE would render the
+      // initial partialToolCall placeholder as `[Tool: ]`.
+      exa_search: "webSearchToolCall",
+      exa_fetch: "webFetchToolCall",
       ask_question: "askQuestionToolCall",
       switch_mode: "switchModeToolCall",
       create_plan: "createPlanToolCall",
@@ -4705,8 +4711,240 @@ export class CursorGrpcService {
     }
 
     return create(ToolCallSchema, {
-      tool: { case: matchedCase, value: {} } as ToolCallOneOf,
+      tool: this.buildEmptyToolCallOneOfFromCase(matchedCase),
     })
+  }
+
+  /**
+   * Given a `ToolCall.tool` oneof case name, build a schema-aware empty
+   * value using the corresponding `*ToolCallSchema`. This avoids the
+   * previous `tool: { case, value: {} } as ToolCallOneOf` strong-cast
+   * which let protobuf-es accept structurally-empty objects without going
+   * through the registered message descriptor — the IDE then could not
+   * resolve the inner descriptor and rendered the initial partialToolCall
+   * as a bare `[Tool: <caseName>]` label instead of the structured
+   * tool-row UI.
+   *
+   * Cases not yet wired here fall back to `truncatedToolCall`, mirroring
+   * the existing fallback in `familyToCase` for pure ExecServerMessage
+   * tools that have no dedicated ToolCall oneof case in the proto.
+   */
+  private buildEmptyToolCallOneOfFromCase(caseName: string): ToolCallOneOf {
+    switch (caseName) {
+      case "shellToolCall":
+        return {
+          case: "shellToolCall",
+          value: create(ShellToolCallSchema, {}),
+        }
+      case "deleteToolCall":
+        return {
+          case: "deleteToolCall",
+          value: create(DeleteToolCallSchema, {}),
+        }
+      case "globToolCall":
+        return {
+          case: "globToolCall",
+          value: create(GlobToolCallSchema, {}),
+        }
+      case "grepToolCall":
+        return {
+          case: "grepToolCall",
+          value: create(GrepToolCallSchema, {}),
+        }
+      case "readToolCall":
+        return {
+          case: "readToolCall",
+          value: create(ReadToolCallSchema, {}),
+        }
+      case "updateTodosToolCall":
+        return {
+          case: "updateTodosToolCall",
+          value: create(UpdateTodosToolCallSchema, {}),
+        }
+      case "readTodosToolCall":
+        return {
+          case: "readTodosToolCall",
+          value: create(ReadTodosToolCallSchema, {}),
+        }
+      case "editToolCall":
+        return {
+          case: "editToolCall",
+          value: create(EditToolCallSchema, {}),
+        }
+      case "lsToolCall":
+        return {
+          case: "lsToolCall",
+          value: create(LsToolCallSchema, {}),
+        }
+      case "readLintsToolCall":
+        return {
+          case: "readLintsToolCall",
+          value: create(ReadLintsToolCallSchema, {}),
+        }
+      case "mcpToolCall":
+        return {
+          case: "mcpToolCall",
+          value: create(McpToolCallSchema, {}),
+        }
+      case "semSearchToolCall":
+        return {
+          case: "semSearchToolCall",
+          value: create(SemSearchToolCallSchema, {}),
+        }
+      case "createPlanToolCall":
+        return {
+          case: "createPlanToolCall",
+          value: create(CreatePlanToolCallSchema, {}),
+        }
+      case "webSearchToolCall":
+        return {
+          case: "webSearchToolCall",
+          value: create(WebSearchToolCallSchema, {}),
+        }
+      case "taskToolCall":
+        return {
+          case: "taskToolCall",
+          value: create(TaskToolCallSchema, {}),
+        }
+      case "listMcpResourcesToolCall":
+        return {
+          case: "listMcpResourcesToolCall",
+          value: create(ListMcpResourcesToolCallSchema, {}),
+        }
+      case "readMcpResourceToolCall":
+        return {
+          case: "readMcpResourceToolCall",
+          value: create(ReadMcpResourceToolCallSchema, {}),
+        }
+      case "applyAgentDiffToolCall":
+        return {
+          case: "applyAgentDiffToolCall",
+          value: create(ApplyAgentDiffToolCallSchema, {}),
+        }
+      case "askQuestionToolCall":
+        return {
+          case: "askQuestionToolCall",
+          value: create(AskQuestionToolCallSchema, {}),
+        }
+      case "fetchToolCall":
+        return {
+          case: "fetchToolCall",
+          value: create(FetchToolCallSchema, {}),
+        }
+      case "switchModeToolCall":
+        return {
+          case: "switchModeToolCall",
+          value: create(SwitchModeToolCallSchema, {}),
+        }
+      case "generateImageToolCall":
+        return {
+          case: "generateImageToolCall",
+          value: create(GenerateImageToolCallSchema, {}),
+        }
+      case "recordScreenToolCall":
+        return {
+          case: "recordScreenToolCall",
+          value: create(RecordScreenToolCallSchema, {}),
+        }
+      case "computerUseToolCall":
+        return {
+          case: "computerUseToolCall",
+          value: create(ComputerUseToolCallSchema, {}),
+        }
+      case "writeShellStdinToolCall":
+        return {
+          case: "writeShellStdinToolCall",
+          value: create(WriteShellStdinToolCallSchema, {}),
+        }
+      case "reflectToolCall":
+        return {
+          case: "reflectToolCall",
+          value: create(ReflectToolCallSchema, {}),
+        }
+      case "setupVmEnvironmentToolCall":
+        return {
+          case: "setupVmEnvironmentToolCall",
+          value: create(SetupVmEnvironmentToolCallSchema, {}),
+        }
+      case "startGrindExecutionToolCall":
+        return {
+          case: "startGrindExecutionToolCall",
+          value: create(StartGrindExecutionToolCallSchema, {}),
+        }
+      case "startGrindPlanningToolCall":
+        return {
+          case: "startGrindPlanningToolCall",
+          value: create(StartGrindPlanningToolCallSchema, {}),
+        }
+      case "webFetchToolCall":
+        return {
+          case: "webFetchToolCall",
+          value: create(WebFetchToolCallSchema, {}),
+        }
+      case "reportBugfixResultsToolCall":
+        return {
+          case: "reportBugfixResultsToolCall",
+          value: create(ReportBugfixResultsToolCallSchema, {}),
+        }
+      case "aiAttributionToolCall":
+        return {
+          case: "aiAttributionToolCall",
+          value: create(AiAttributionToolCallSchema, {}),
+        }
+      case "prManagementToolCall":
+        return {
+          case: "prManagementToolCall",
+          value: create(PrManagementToolCallSchema, {}),
+        }
+      case "mcpAuthToolCall":
+        return {
+          case: "mcpAuthToolCall",
+          value: create(McpAuthToolCallSchema, {}),
+        }
+      case "awaitToolCall":
+        return {
+          case: "awaitToolCall",
+          value: create(AwaitToolCallSchema, {}),
+        }
+      case "blameByFilePathToolCall":
+        return {
+          case: "blameByFilePathToolCall",
+          value: create(BlameByFilePathToolCallSchema, {}),
+        }
+      case "getMcpToolsToolCall":
+        return {
+          case: "getMcpToolsToolCall",
+          value: create(GetMcpToolsToolCallSchema, {}),
+        }
+      case "reportBugToolCall":
+        return {
+          case: "reportBugToolCall",
+          value: create(ReportBugToolCallSchema, {}),
+        }
+      case "setActiveBranchToolCall":
+        return {
+          case: "setActiveBranchToolCall",
+          value: create(SetActiveBranchToolCallSchema, {}),
+        }
+      case "communicateUpdateToolCall":
+        return {
+          case: "communicateUpdateToolCall",
+          value: create(CommunicateUpdateToolCallSchema, {}),
+        }
+      case "sendFinalSummaryToolCall":
+        return {
+          case: "sendFinalSummaryToolCall",
+          value: create(SendFinalSummaryToolCallSchema, {}),
+        }
+      case "truncatedToolCall":
+      default:
+        return {
+          case: "truncatedToolCall",
+          value: create(TruncatedToolCallSchema, {
+            args: create(TruncatedToolCallArgsSchema, {}),
+          }),
+        }
+    }
   }
 
   private buildReflectArgs(args: Record<string, unknown>, callId: string) {
