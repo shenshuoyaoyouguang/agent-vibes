@@ -441,6 +441,15 @@ export interface PendingToolCall {
   execIds: Set<number>
   editApplyWarning?: string
   editFailureContext?: EditFailureContext
+  /**
+   * Set when `applyEditInputToFileText` collapsed the edit to a
+   * literal no-op (search === replace) rather than a real failure.
+   * Result formatter reads this to emit a friendly success result
+   * (`[edit applied: no-op]`) instead of `[edit_apply_failed]`. Mutex
+   * with `editApplyWarning`: when noopReason is set, warning MUST be
+   * undefined.
+   */
+  editNoopReason?: "identical_search_replace"
   beforeContent?: string // File content before edit (for edit tools)
   afterContent?: string // File content after edit (computed from applyEditInputToFileText)
   /**
@@ -613,6 +622,8 @@ interface PersistedPendingToolCall {
   execIds: number[]
   editApplyWarning?: string
   editFailureContext?: EditFailureContext
+  /** Mirror of {@link PendingToolCall.editNoopReason} for persistence. */
+  editNoopReason?: "identical_search_replace"
   beforeContent?: string
   shellStreamOutput?: {
     stdout: string[]
@@ -1313,6 +1324,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
           execIds: Array.from(toolCall.execIds),
           editApplyWarning: toolCall.editApplyWarning,
           editFailureContext: toolCall.editFailureContext,
+          editNoopReason: toolCall.editNoopReason,
           beforeContent: toolCall.beforeContent,
           shellStreamOutput: toolCall.shellStreamOutput
             ? {

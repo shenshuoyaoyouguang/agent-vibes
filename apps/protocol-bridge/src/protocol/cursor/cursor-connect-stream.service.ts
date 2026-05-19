@@ -6604,31 +6604,33 @@ ${raw}
     warning?: string
     failureContext?: EditFailureContext
     resolvedMatch?: EditResolvedMatch
+    /**
+     * Set when the edit was intentionally skipped because it would be a
+     * no-op (e.g. searchText === replaceText). NOT a failure: callers
+     * should report success and surface a short explanatory note rather
+     * than `[edit_apply_failed]`. Letting the caller distinguish
+     * between "edit failed" and "edit was idempotent" prevents the
+     * model from looping on a perfectly-fine tool call.
+     */
+    noopReason?: "identical_search_replace"
   } {
     const searchText = options.searchText
     const replaceText = options.replaceText
     const allowMultiple = options.allowMultiple || false
 
     // Guard 1: identical search/replace is a no-op edit. Models occasionally
-    // emit this when retrying after a partial response or when the bridge's
-    // upstream proxy duplicates a tool_use input. Without this short-circuit
-    // the bridge would still walk the full read→write→toolResult pipeline,
-    // burning trace records and (worse) re-emitting the same fileText to
-    // any IDE-side file watchers. Treat it as a successful no-op so the
-    // caller can settle the toolCall without touching disk.
+    // emit this when retrying after a partial response, when the bridge's
+    // upstream proxy duplicates a tool_use input, or — most commonly —
+    // when the model wants to *assert* a piece of state already exists
+    // (search=`alpha`, replace=`alpha`) without changing it. Older bridge
+    // builds reported this as `[edit_apply_failed]`, which the model
+    // misread as a real failure and looped on. New behaviour: short-
+    // circuit with `noopReason` so the caller emits a success result with
+    // a brief "no-op" note, never touching disk.
     if (searchText === replaceText && searchText.length > 0) {
       return {
         fileText: content,
-        warning: `${options.warningPrefix} matches replacement verbatim; treating edit as no-op`,
-        failureContext: {
-          filePath: "",
-          reason: "noop_identical",
-          startLine: options.startLine,
-          endLine: options.endLine,
-          allowMultiple,
-          searchText,
-          replaceTextLength: replaceText.length,
-        },
+        noopReason: "identical_search_replace",
       }
     }
 
@@ -7476,6 +7478,14 @@ ${raw}
     warning?: string
     failureContext?: EditFailureContext
     resolvedMatches?: EditResolvedMatch[]
+    /**
+     * Forwarded from `applySearchReplaceWithinRange` when the entire
+     * edit collapsed to a no-op (search === replace). Caller MUST treat
+     * this as success and emit a short "no-op" inline result rather
+     * than `[edit_apply_failed]`. Mirrors the new contract on
+     * `applySearchReplaceWithinRange`.
+     */
+    noopReason?: "identical_search_replace"
   } {
     const explicitFullFileText =
       typeof toolInput.file_text === "string" ? toolInput.file_text : undefined
@@ -7558,6 +7568,7 @@ ${raw}
 
       let nextContent = beforeContent
       const resolvedMatches: EditResolvedMatch[] = []
+      let allChunksNoop = true
       for (const { rawChunk, index } of orderedChunks) {
         if (!rawChunk || typeof rawChunk !== "object") {
           return {
@@ -7654,12 +7665,21 @@ ${raw}
             chunkIndex: index,
           })
         }
+        if (!chunkEdit.noopReason) {
+          allChunksNoop = false
+        }
         nextContent = chunkEdit.fileText
       }
 
       return {
         fileText: nextContent,
         ...(resolvedMatches.length > 0 ? { resolvedMatches } : {}),
+        // Surface noopReason only when *every* chunk collapsed to a
+        // no-op. A mix of real edits + no-op chunks is still a real
+        // edit; we just don't bother differentiating per-chunk.
+        ...(allChunksNoop && orderedChunks.length > 0
+          ? { noopReason: "identical_search_replace" as const }
+          : {}),
       }
     }
 
@@ -21220,6 +21240,11 @@ ${raw}
           editPending.editApplyWarning = computedEdit.warning
           editPending.editFailureContext = computedEdit.failureContext
           editPending.afterContent = computedEdit.fileText
+          // No-op edits: search === replace. Not a failure — record on
+          // the pending toolCall so the result formatter surfaces a
+          // success result with a "no-op" lead-in instead of the legacy
+          // `[edit_apply_failed]` banner.
+          editPending.editNoopReason = computedEdit.noopReason
           if ((computedEdit.resolvedMatches?.length || 0) > 0) {
             const reconciled = computedEdit.resolvedMatches
               ?.map((match) => {
@@ -21241,7 +21266,20 @@ ${raw}
             )
           }
 
-          if (computedEdit.warning) {
+          if (computedEdit.noopReason) {
+            // No-op edit (search === replace). Skip writeArgs, fall
+            // through to result formatting; the result builder reads
+            // editPending.editNoopReason and emits a friendly success
+            // result instead of the legacy `[edit_apply_failed]`
+            // banner.
+            this.logger.log(
+              `Edit ${editPending.toolCallId} is a no-op ` +
+                `(${computedEdit.noopReason}); skipping writeArgs and ` +
+                `completing with success`
+            )
+            // Fall through — caller will consume editPending and emit
+            // toolCallCompleted with success status.
+          } else if (computedEdit.warning) {
             const editInputSummary = this.summarizeEditInvocationForLogs(
               typedInput,
               {
@@ -21387,6 +21425,33 @@ ${raw}
       toolResultContent =
         `${toolResultContent}\n\n` +
         `[edit_apply_warning] ${pendingToolCall.editApplyWarning}`
+    }
+
+    // No-op edit annotation. When `applyEditInputToFileText` collapsed
+    // the edit to a literal no-op (search === replace), the dispatch
+    // path skipped writeArgs and we land here with the read_result as
+    // the only protocol-level outcome. Replace the result content with
+    // a friendly success banner so the model can see at a glance that
+    // the file was already in the desired state — and crucially does
+    // NOT see `[edit_apply_failed]`, which would prompt a retry loop.
+    if (
+      pendingToolCall.editNoopReason &&
+      this.isEditToolInvocation(pendingToolCall.toolName)
+    ) {
+      toolResultState = { status: "success" }
+      const editPath =
+        (typeof (pendingToolCall.toolInput as ToolInputWithPath).path ===
+        "string"
+          ? (pendingToolCall.toolInput as ToolInputWithPath).path
+          : undefined) || "(unknown)"
+      const noopExplanation =
+        pendingToolCall.editNoopReason === "identical_search_replace"
+          ? "search snippet matches replacement verbatim; file already in the desired state, no changes were written"
+          : `no-op (${pendingToolCall.editNoopReason})`
+      toolResultContent =
+        `[edit applied: no-op]\n` +
+        `path: ${editPath}\n` +
+        `reason: ${noopExplanation}`
     }
 
     // CRITICAL: For Agent mode, send real-time feedback before completion
