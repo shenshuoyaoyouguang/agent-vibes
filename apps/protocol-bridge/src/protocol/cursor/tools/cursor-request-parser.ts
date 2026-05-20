@@ -271,6 +271,16 @@ export interface ParsedCursorRequest {
     rejectedReason?: string
     errorMessage?: string
   }
+  agentControlBackgroundTaskCompletions?: Array<{
+    taskId: string
+    kind?: number
+    status?: number
+    title?: string
+    detail?: string
+    outputPath?: string
+    threadId?: string
+    reason?: number
+  }>
 
   // InteractionQuery 响应（客户端回复服务器查询）
   interactionResponse?: {
@@ -323,6 +333,40 @@ const EXEC_RESULT_CASE_MAP: Record<string, string> = {
   subagentAwaitResult: "subagent_await_result",
 }
 
+type ParsedBackgroundTaskCompletion = NonNullable<
+  ParsedCursorRequest["agentControlBackgroundTaskCompletions"]
+>[number]
+
+function normalizeBackgroundTaskCompletions(
+  raw: unknown
+): ParsedBackgroundTaskCompletion[] {
+  if (!Array.isArray(raw)) return []
+
+  const maybeNumber = (value: unknown): number | undefined =>
+    typeof value === "number" && Number.isFinite(value) ? value : undefined
+  const maybeString = (value: unknown): string | undefined =>
+    typeof value === "string" && value.length > 0 ? value : undefined
+
+  const completions: ParsedBackgroundTaskCompletion[] = []
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue
+    const record = entry as Record<string, unknown>
+    const taskId = maybeString(record.taskId)
+    if (!taskId) continue
+    completions.push({
+      taskId,
+      kind: maybeNumber(record.kind),
+      status: maybeNumber(record.status),
+      title: maybeString(record.title),
+      detail: maybeString(record.detail),
+      outputPath: maybeString(record.outputPath),
+      threadId: maybeString(record.threadId),
+      reason: maybeNumber(record.reason),
+    })
+  }
+  return completions
+}
+
 /**
  * 创建空控制消息的辅助函数
  */
@@ -358,6 +402,7 @@ function makeControlMessage(
     triggeringAuthId?: string
     triggeringUserId?: number
     asyncAskCompletion?: ParsedCursorRequest["agentControlAsyncAskCompletion"]
+    backgroundTaskCompletions?: ParsedCursorRequest["agentControlBackgroundTaskCompletions"]
   }
 ): ParsedCursorRequest {
   return {
@@ -381,6 +426,7 @@ function makeControlMessage(
     agentControlTriggeringAuthId: options?.triggeringAuthId,
     agentControlTriggeringUserId: options?.triggeringUserId,
     agentControlAsyncAskCompletion: options?.asyncAskCompletion,
+    agentControlBackgroundTaskCompletions: options?.backgroundTaskCompletions,
   }
 }
 
@@ -1316,13 +1362,19 @@ export class CursorRequestParser {
           })
         }
         if (message.value.action.case === "backgroundTaskCompletionAction") {
+          const bgTask = message.value.action.value as {
+            completions?: unknown
+          }
+          const completions = normalizeBackgroundTaskCompletions(
+            bgTask.completions
+          )
           this.logger.log(
-            "收到 conversationAction.backgroundTaskCompletionAction"
+            `收到 conversationAction.backgroundTaskCompletionAction completions=${completions.length}`
           )
-          return makeControlMessage(
-            "backgroundTaskCompletionAction",
-            triggeringFields
-          )
+          return makeControlMessage("backgroundTaskCompletionAction", {
+            ...triggeringFields,
+            backgroundTaskCompletions: completions,
+          })
         }
         if (message.value.action.case === "backgroundShellAction") {
           const bgShell = message.value.action.value as {
@@ -2263,18 +2315,18 @@ export class CursorRequestParser {
             }
             case "backgroundTaskCompletionAction": {
               const bgTask = action.action.value as {
-                completions?: Array<{
-                  taskId?: string
-                  status?: number
-                  reason?: number
-                }>
+                completions?: unknown
               }
+              const completions = normalizeBackgroundTaskCompletions(
+                bgTask.completions
+              )
               this.logger.log(
-                `AgentRunRequest backgroundTaskCompletionAction: conversationId=${conversationId || "(none)"} completions=${bgTask.completions?.length || 0}`
+                `AgentRunRequest backgroundTaskCompletionAction: conversationId=${conversationId || "(none)"} completions=${completions.length}`
               )
               return makeControlMessage("backgroundTaskCompletionAction", {
                 conversationId,
                 model,
+                backgroundTaskCompletions: completions,
               })
             }
             case "backgroundShellAction": {

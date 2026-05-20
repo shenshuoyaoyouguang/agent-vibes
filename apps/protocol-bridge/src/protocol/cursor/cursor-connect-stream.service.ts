@@ -109,7 +109,10 @@ import {
 import { SubagentRegistryService } from "./subagents/subagent-registry.service"
 import { SubagentTaskRegistry } from "./subagents/subagent-task-registry.service"
 import { resolveSubagentToolSurface } from "./subagents/subagent-tool-resolver"
-import { SubagentTranscriptStore } from "./subagents/subagent-transcript-store.service"
+import {
+  type SubagentTaskMetadata,
+  SubagentTranscriptStore,
+} from "./subagents/subagent-transcript-store.service"
 import {
   getSubagentSystemPrompt,
   type SubagentDefinition,
@@ -13275,6 +13278,176 @@ ${raw}
     )
   }
 
+  private findTaskToolUseForHistory(
+    session: ChatSession,
+    toolCallId: string
+  ): { toolName: string; toolInput: Record<string, unknown> } {
+    for (let i = session.messageRecords.length - 1; i >= 0; i--) {
+      const record = session.messageRecords[i]
+      if (
+        !record ||
+        record.role !== "assistant" ||
+        !Array.isArray(record.content)
+      ) {
+        continue
+      }
+      for (const block of record.content) {
+        if (!this.isLooseRecord(block) || block.type !== "tool_use") continue
+        if (block.id !== toolCallId) continue
+        return {
+          toolName: typeof block.name === "string" ? block.name : "task",
+          toolInput: this.isLooseRecord(block.input) ? block.input : {},
+        }
+      }
+    }
+
+    return { toolName: "task", toolInput: {} }
+  }
+
+  private extractSubagentIdFromCompletionPath(pathValue: string): string {
+    const normalized = pathValue.replace(/\\/g, "/")
+    const marker = "/.cursor/subagents/"
+    const markerIndex = normalized.indexOf(marker)
+    if (markerIndex === -1) return ""
+    const rest = normalized.slice(markerIndex + marker.length)
+    return rest.split("/", 1)[0] || ""
+  }
+
+  private resolveBackgroundCompletionMetadata(
+    conversationId: string,
+    parsed: ParsedCursorRequest
+  ): SubagentTaskMetadata[] {
+    const completions = parsed.agentControlBackgroundTaskCompletions || []
+    const byAgentId = new Map<string, SubagentTaskMetadata>()
+    const maybeAdd = (agentId: string) => {
+      if (!agentId || byAgentId.has(agentId)) return
+      const metadata = this.subagentTaskRegistry.getMetadata(agentId)
+      if (!metadata || metadata.parentConversationId !== conversationId) return
+      byAgentId.set(agentId, metadata)
+    }
+
+    for (const completion of completions) {
+      maybeAdd(completion.taskId)
+      if (completion.threadId) maybeAdd(completion.threadId)
+      if (completion.outputPath) {
+        maybeAdd(
+          this.extractSubagentIdFromCompletionPath(completion.outputPath)
+        )
+      }
+    }
+
+    return [...byAgentId.values()]
+  }
+
+  private updateBackgroundTaskSuccessHistory(
+    session: ChatSession,
+    parentToolCallId: string,
+    taskSuccess: NonNullable<ToolCompletedExtraData["taskSuccess"]>
+  ): void {
+    let changed = false
+    const safeTaskSuccess = this.toJsonSafe(taskSuccess)
+    const nextMessages = session.messages.map((message) => {
+      if (message.role !== "user" || !Array.isArray(message.content)) {
+        return message
+      }
+      let messageChanged = false
+      const nextContent = message.content.map((block) => {
+        if (
+          !this.isLooseRecord(block) ||
+          block.type !== "tool_result" ||
+          block.tool_use_id !== parentToolCallId
+        ) {
+          return block
+        }
+        const existingStructured = this.isLooseRecord(block.structuredContent)
+          ? block.structuredContent
+          : {}
+        messageChanged = true
+        changed = true
+        return {
+          ...block,
+          structuredContent: {
+            ...existingStructured,
+            taskSuccess: safeTaskSuccess,
+          },
+        }
+      })
+      return messageChanged
+        ? {
+            ...message,
+            content: nextContent as MessageContent,
+          }
+        : message
+    })
+
+    if (changed) {
+      this.sessionManager.replaceMessages(session.conversationId, nextMessages)
+    }
+  }
+
+  private *handleBackgroundTaskCompletionAction(
+    conversationId: string,
+    parsed: ParsedCursorRequest
+  ): Generator<Buffer> {
+    const session = this.sessionManager.getSession(conversationId)
+    if (!session) return
+
+    const metadataList = this.resolveBackgroundCompletionMetadata(
+      conversationId,
+      parsed
+    )
+    for (const metadata of metadataList) {
+      const parentToolCallId = metadata.parentToolCallId
+      if (!parentToolCallId) continue
+
+      const conversationSteps = Array.isArray(metadata.conversationSteps)
+        ? metadata.conversationSteps.map((step) =>
+            create(ConversationStepSchema, step as never)
+          )
+        : []
+      if (conversationSteps.length === 0) {
+        continue
+      }
+
+      const { toolName, toolInput } = this.findTaskToolUseForHistory(
+        session,
+        parentToolCallId
+      )
+      const transcriptPath = this.subagentTranscriptStore.getTranscriptPath(
+        metadata.agentId
+      )
+      const durationMs = metadata.durationMs ?? 0
+      const taskSuccess: NonNullable<ToolCompletedExtraData["taskSuccess"]> = {
+        agentId: metadata.agentId,
+        isBackground: true,
+        durationMs,
+        transcriptPath,
+        conversationSteps: conversationSteps as Array<Record<string, unknown>>,
+      }
+
+      this.updateBackgroundTaskSuccessHistory(
+        session,
+        parentToolCallId,
+        taskSuccess
+      )
+
+      const resultText =
+        metadata.status === "completed"
+          ? metadata.finalText || "Background sub-agent completed."
+          : metadata.errorMessage || `Background sub-agent ${metadata.status}.`
+
+      yield this.grpcService.createToolCallCompletedResponse(
+        parentToolCallId,
+        toolName,
+        toolInput,
+        resultText,
+        undefined,
+        "",
+        { taskSuccess }
+      )
+    }
+  }
+
   /**
    * Complete the sub-agent and emit result for the parent's task tool call.
    *
@@ -13334,6 +13507,12 @@ ${raw}
     )
 
     if (!subAgentCtx.isBackground) {
+      yield this.grpcService.wrapAsTaskToolCallDelta(
+        subAgentCtx.parentToolCallId,
+        subAgentCtx.parentModelCallId,
+        this.grpcService.buildInnerTurnEndedInteractionUpdate()
+      )
+
       const report = this.buildSubAgentFinalReport(
         subAgentCtx,
         finalText,
@@ -20444,6 +20623,12 @@ ${raw}
             this.logger.log(
               `ConversationAction.backgroundTaskCompletion: ${conversationId}`
             )
+            yield* this.handleBackgroundTaskCompletionAction(
+              conversationId,
+              parsed
+            )
+            yield this.grpcService.createServerHeartbeatResponse()
+            yield this.grpcService.createAgentTurnEndedResponse()
             return
           } else if (
             parsed.agentControlType === "backgroundShellAction" &&

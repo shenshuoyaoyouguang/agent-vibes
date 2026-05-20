@@ -12,7 +12,7 @@
 3. 禁止把协议内部 case 当工具调用：例如 `ToolCall.tool`、`ExecServerMessage.*`、`ExecClientMessage.*`、`InteractionQuery.*`、`InteractionUpdate.*` 只能作为 trace 观察项，不能写成“调用某某 case”。
 4. 禁止用未暴露或相似名字顶替真实工具名；如果客户端只暴露 `web_search`，就不能声称调用了 `exa_search`；如果只暴露 `web_fetch`，就不能声称调用了 `fetch`。
 5. 如果客户端工具面没有暴露某个能力，不要硬凑调用；在最终覆盖清单中记录 `not_directly_invokable` 或 `unavailable`，并说明原因。
-6. 执行方式是任务驱动，但覆盖清单不能缩水；所有当前 Cursor 协议 ToolCall / Interaction / Exec / ConversationAction / InteractionUpdate / aiserver 兼容项都必须通过 trace 观察或明确判定 gap。
+6. 执行方式是任务驱动，但覆盖清单不能缩水；所有当前 Cursor 协议 ToolCall / Interaction / Exec / ConversationAction / InteractionUpdate 都必须通过 trace 观察或明确判定 gap。
 7. 不输出 Layer 1-8 全量矩阵；但最终报告必须按下方完整覆盖清单逐项给出状态，不能遗漏工具、功能或状态机分支。
 8. 最终报告重点是：任务目标、期望客户端工具、实际触发工具、结果、证据、gap；覆盖清单用紧凑分组摘要表达。
 9. 写操作只允许发生在 smoke 工作目录下（默认 `~/.agent-vibes/smoke/`，可通过环境变量 `$AGENT_VIBES_SMOKE_DIR` 覆盖）。
@@ -32,13 +32,35 @@
 
 trace 文件不允许出现在仓库工作树内。如果在 `apps/**/.log/`、`.log/`、`<repo>/cursor_protocol_trace*` 等位置看到 trace 文件，视为污染，需要记录并删除，不能用作基线。
 
-最终报告只需要给出本轮新增 trace 的摘要：
+最终报告必须给出本轮新增 trace 的摘要：
 
 - trace 文件路径
-- 新增记录数量或时间范围
-- 观察到的关键 `topCase/nestedCase`
+- 新增记录数量（必须是精确数字，不能写 `unknown`）
+- 观察到的关键 `topCase` 与 `topCase.nestedCase` 直方图（前 10 即可）
 - 关键 `callId/id/execId` 对齐是否大体正常
 - 是否看到明显 error、abort、pending 泄漏、重复结算或提前结束
+
+为保证"新增记录数量"是精确数字，**必须**使用仓库自带的 baseline 工具：
+
+```bash
+# 开始 smoke 之前
+node scripts/smoke/capture-trace-baseline.js capture
+
+# smoke 结束后
+node scripts/smoke/capture-trace-baseline.js delta
+```
+
+`capture` 会把当前 trace 文件的 size / line_count / mtime 写入
+`$AGENT_VIBES_SMOKE_DIR/.trace-baseline.json`；`delta` 只读取 baseline 偏移量
+之后追加的字节，输出 appended-only 的行数与 `top_cases` / `nested_cases`
+直方图。脚本对 trace 文件保持只读，不会破坏其它会话的同时写入；脚本同时会
+拒绝把 baseline 状态文件写到仓库工作树内（防御 `$AGENT_VIBES_SMOKE_DIR`
+误配）。
+
+bridge 自身也加了一道保险：`CursorProtocolTraceService.tracePath()` 通过
+`guardAgainstRepoPollution()` 检测目标路径是否落在某个 `.git/` 祖先目录下，
+若是则强制回退到 `$HOME/.agent-vibes/logs/cursor_protocol_trace.jsonl`。即便
+`$CURSOR_PROTOCOL_TRACE_FILE` 被误指到 `apps/**` 之下，也不会真正污染仓库。
 
 不要输出完整 decoded frame 列表，除非发现异常。
 
@@ -52,6 +74,15 @@ trace 文件不允许出现在仓库工作树内。如果在 `apps/**/.log/`、`
 - `<SMOKE>/todo-seed.md`：至少两行文本
 - `<SMOKE>/subdir/nested.txt`：内容 `nested alpha beta`
 - `<SMOKE>/env.txt`：内容 `PLACEHOLDER_ENV=old`
+
+可以直接用仓库脚本自动化重置 smoke 目录到上述种子状态：
+
+```bash
+node scripts/smoke/capture-trace-baseline.js reset-smoke
+```
+
+脚本只会写入 `$AGENT_VIBES_SMOKE_DIR` 之内（默认 `~/.agent-vibes/smoke/`），
+若该路径解析到仓库工作树会直接 throw 拒绝执行。
 
 ## 完整覆盖清单（不得删减）
 
@@ -143,10 +174,6 @@ trace 文件不允许出现在仓库工作树内。如果在 `apps/**/.log/`、`
 - `forceBackgroundShellResult`、`forceBackgroundSubagentResult`、`mcpStateExecResult`、`subagentAwaitResult`。
 
 必须观察或判定 control：`ExecServerControlMessage.abort`、`ExecClientControlMessage.streamClose`、`ExecClientControlMessage.throw`、`ExecClientControlMessage.heartbeat`。
-
-### H. aiserver.v1 兼容 RPC
-
-必须观察或判定：`AiService/PrivacyCheck`、`AiService/CheckUsageBasedPrice`、`AiService/FindBugs`、`AiService/GetCloudSetupBlockers`、`AiService/ReportAgentFeedback`、`AiService/TranscribeAudio`、`AiService/StreamInterfaceAgentStatus`、`AiService/TestBidi`。
 
 ## 必执行任务
 
@@ -518,9 +545,27 @@ edit-1 把 `alpha-1` 改成 `alpha-2`、edit-2 把 `alpha-2` 改成 `alpha-3`）
 
 调用约定（避免误把业务校验记成协议错）：
 
-- `fix_lints`：必须传 repo 工作区根下的真实 ts 文件（例如 `apps/protocol-bridge/src/protocol/cursor/cursor-protocol-trace.service.ts`），不要传 `<SMOKE>` 下的文件，否则会被 IDE 校验拒绝（`path is outside workspace root`），那是输入约束不是协议错。
-- `report_bugfix_results`：必须传至少 1 项 dummy result（例如 `[{ "id": "smoke-probe", "status": "nop" }]`），传空数组会被入参校验拒绝。
-- `setup_vm_environment`：当前桥已经从 user-facing surface 移除该工具（mapper 不再暴露）。如果客户端 surface 上看不到它，记 `not_directly_invokable`，**不要硬调**；如果意外能调到，按实际后端响应记录。
+- `fix_lints`：必须传 repo 工作区根下的真实 ts 文件
+  （例如 `apps/protocol-bridge/src/protocol/cursor/cursor-protocol-trace.service.ts`），
+  不要传 `<SMOKE>` 下的文件，否则会被 IDE 校验拒绝
+  （`path is outside workspace root`），那是输入约束不是协议错。
+- `report_bugfix_results`：必须传至少 1 项 dummy result
+  （例如 `[{ "id": "smoke-probe", "status": "nop" }]`），传空数组会被入参校验拒绝。
+- `setup_vm_environment`：mapper 仍保留
+  `CLIENT_SIDE_TOOL_V2_SETUP_VM_ENVIRONMENT` 的 backward-compat 定义，但
+  **默认 agent surface 与 executableViaExecServerMessage set 都主动 omit 它**
+  （proxy runtime 没有 VM broker，调用必失败）。如果客户端 surface 上看不到它，
+  记 `not_directly_invokable: VM broker not implemented`；
+  如果意外能调到，按实际后端响应记录。
+- `wait_agent`：mapper 把 `wait_agent` 作为 `await_task` 的输入侧别名解析；
+  客户端 surface 上看到的是 `await_task`。在覆盖清单里 `wait_agent` 这一行应记
+  `not_directly_invokable: alias for await_task on this surface`，
+  并在 gap 列写明等价 user-facing 工具是 `await_task`。
+- `kill_agent`：proto 层**没有**独立的 `killAgentToolCall` oneof case；
+  它是 bridge 自己定义的 inline tool，路由到
+  `ConversationAction.cancelSubagentAction`。如果客户端 surface 暴露了它，
+  可以正常调用；trace 里观察到的是 `cancelSubagentAction`，不是新的
+  ToolCall case。
 
 验收：每项记录 `pass / unavailable / not_directly_invokable / failed` 与原因。
 
@@ -584,7 +629,7 @@ edit-1 把 `alpha-1` 改成 `alpha-2`、edit-2 把 `alpha-2` 改成 `alpha-3`）
 
 ### Coverage Checklist Summary
 
-按完整覆盖清单 A-H 分组列出所有项目状态。覆盖状态必须来自真实调用客户端可见工具后的 trace、可见副作用或明确不可用原因；禁止为了让某项变成 pass 而事后硬调用 proto oneof、Exec/Interaction case、mapper 内部别名或未暴露工具名。
+按完整覆盖清单 A-G 分组列出所有项目状态。覆盖状态必须来自真实调用客户端可见工具后的 trace、可见副作用或明确不可用原因；禁止为了让某项变成 pass 而事后硬调用 proto oneof、Exec/Interaction case、mapper 内部别名或未暴露工具名。
 
 判定状态使用 5 态：
 
@@ -605,7 +650,6 @@ edit-1 把 `alpha-1` 改成 `alpha-2`、edit-2 把 `alpha-2` 改成 `alpha-3`）
 - D (工具家族总表)：14 个 family 全列出，每行附 `proto cases pass / 总数`、`user-facing tools pass / 总数`、聚合状态；gap 列必须写明本 family 内未 pass 的具体项目。**禁止**用单行 "all pass" 蒙混过关。
 - F (ConversationAction)：13 个 case 全列出。
 - G (ExecServerMessage 24 项 / ExecClientMessage 24 项 / Exec control 4 项)：分 3 张表全列出。
-- H (aiserver RPC)：8 个 RPC 全列出。
 
 任何 user-facing 工具与 proto case 之间的具体映射，由 trace 的 `topCase/nestedCase` 事实决定，**不要靠脑补**；不确定的项标 `not_observed`，并在 gap 列写为何没观察到（如"工具未暴露"、"任务未派发"）。
 

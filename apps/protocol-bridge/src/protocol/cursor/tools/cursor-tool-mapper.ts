@@ -1660,6 +1660,13 @@ const DEFAULT_AGENT_BUILTIN_CURSOR_TOOLS = [
   "CLIENT_SIDE_TOOL_V2_TASK_V2",
   "CLIENT_SIDE_TOOL_V2_AWAIT_TASK",
   "CLIENT_SIDE_TOOL_V2_AWAIT",
+  // kill_agent is bridge-defined (no proto enum value — see CURSOR_TOOL_DEFINITIONS
+  // entry near CLIENT_SIDE_TOOL_V2_KILL_AGENT). It must appear in the default
+  // agent surface so that parent agents can terminate long-running sub-agents
+  // they spawned via task(run_in_background=true). Without this entry the
+  // model never sees `kill_agent` despite the mapper having a definition for
+  // it, leaving the cancelSubagentAction ConversationAction path unreachable.
+  "CLIENT_SIDE_TOOL_V2_KILL_AGENT",
   "CLIENT_SIDE_TOOL_V2_AI_ATTRIBUTION",
   "CLIENT_SIDE_TOOL_V2_MCP_AUTH",
   "CLIENT_SIDE_TOOL_V2_TODO_READ",
@@ -2959,6 +2966,17 @@ export function buildToolsForApi(
     "CLIENT_SIDE_TOOL_V2_SEMANTIC_SEARCH_FULL",
     "CLIENT_SIDE_TOOL_V2_DEEP_SEARCH",
     "CLIENT_SIDE_TOOL_V2_GLOB_FILE_SEARCH",
+    // MCP auth + AI attribution: mapper has full proto-aligned definitions
+    // and proto v1_pb.ts ships matching McpAuthArgs / AiAttributionArgs
+    // envelopes. The codex parent path already executes them; this
+    // non-codex parent path used to silently drop them because they were
+    // missing from this set, so the model could see the tool name in the
+    // catalog but invocation would fall through to the generic
+    // "tool is not executable via ExecServerMessage" inline error.
+    // Including them here matches the codex set and the
+    // DEFAULT_AGENT_BUILTIN_CURSOR_TOOLS surface.
+    "CLIENT_SIDE_TOOL_V2_MCP_AUTH",
+    "CLIENT_SIDE_TOOL_V2_AI_ATTRIBUTION",
   ])
   const seenDefinitionKeys = new Set<string>()
   const seenToolNames = new Set<string>()

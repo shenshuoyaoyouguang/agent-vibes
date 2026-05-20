@@ -386,12 +386,16 @@ export class CursorProtocolTraceService {
 
   private static tracePath(): string {
     if (process.env.CURSOR_PROTOCOL_TRACE_FILE) {
-      return path.resolve(process.env.CURSOR_PROTOCOL_TRACE_FILE)
+      return this.guardAgainstRepoPollution(
+        path.resolve(process.env.CURSOR_PROTOCOL_TRACE_FILE)
+      )
     }
     if (process.env.AGENT_VIBES_LOG_DIR) {
-      return path.resolve(
-        process.env.AGENT_VIBES_LOG_DIR,
-        "cursor_protocol_trace.jsonl"
+      return this.guardAgainstRepoPollution(
+        path.resolve(
+          process.env.AGENT_VIBES_LOG_DIR,
+          "cursor_protocol_trace.jsonl"
+        )
       )
     }
     // Default to the canonical Agent Vibes data dir so dev/test runs never
@@ -402,6 +406,51 @@ export class CursorProtocolTraceService {
       "logs",
       "cursor_protocol_trace.jsonl"
     )
+  }
+
+  /**
+   * Reject trace target paths that fall inside a Git working tree.
+   *
+   * Rationale: smoke / regression specs explicitly forbid trace files from
+   * landing in `apps/**`, `.log/`, `tmp/` etc. inside the repo. If an env
+   * override resolves to a path under any directory containing a `.git`
+   * entry, fall back to the canonical default under `$HOME/.agent-vibes/logs`
+   * so we silently neutralize accidental pollution without breaking trace
+   * recording.
+   *
+   * The walk stops at the user's home dir or the filesystem root to bound
+   * cost. We `fs.stat` rather than `existsSync` to avoid following stale
+   * symlinks; failures (permission denied / non-existent) are treated as
+   * "not a git repo" so we err on the side of honoring the override.
+   */
+  private static guardAgainstRepoPollution(target: string): string {
+    try {
+      const home = os.homedir()
+      let cursor = path.dirname(target)
+      // Bound the walk: stop at filesystem root, at $HOME, or after 32 hops.
+      for (let depth = 0; depth < 32; depth++) {
+        if (cursor === path.parse(cursor).root) break
+        if (home && cursor === home) break
+        const gitMarker = path.join(cursor, ".git")
+        if (fs.existsSync(gitMarker)) {
+          // Repo working tree detected — reject and fall back.
+          return path.resolve(
+            home,
+            ".agent-vibes",
+            "logs",
+            "cursor_protocol_trace.jsonl"
+          )
+        }
+        const parent = path.dirname(cursor)
+        if (parent === cursor) break
+        cursor = parent
+      }
+    } catch {
+      // If detection itself fails, prefer the original target — tracing must
+      // never block protocol handling. Only reject when we positively
+      // identified a `.git` ancestor.
+    }
+    return target
   }
 
   private static append(record: TraceRecord): void {

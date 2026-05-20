@@ -1973,6 +1973,21 @@ export class CursorGrpcService {
     })
   }
 
+  /**
+   * Build an inner agent.v1.InteractionUpdate carrying turnEnded. Cursor's
+   * task bubble reducer uses this nested event to move the rendered
+   * sub-agent conversation out of its generating state before the parent
+   * task tool is settled.
+   */
+  buildInnerTurnEndedInteractionUpdate() {
+    return create(InteractionUpdateSchema, {
+      message: {
+        case: "turnEnded" as const,
+        value: create(TurnEndedUpdateSchema, {}),
+      },
+    })
+  }
+
   // ─── Sub-agent ConversationStep builders ─────────────────────
   //
   // The TaskSuccess.conversationSteps field in agent.v1 is the official
