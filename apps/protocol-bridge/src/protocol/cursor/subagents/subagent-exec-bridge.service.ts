@@ -21,7 +21,8 @@
  *
  * The bridge keeps no per-conversation state beyond the toolCallId →
  * waiter map; conversation-level state lives in
- * `ChatSession.subAgentContext`.
+ * `ChatSession.subAgentContexts` (one entry per concurrent sub-agent,
+ * keyed by subagentId).
  */
 
 import { fromBinary } from "@bufbuild/protobuf"

@@ -435,8 +435,14 @@ export interface ChatSession {
   interactionQueryId: number // auto-incrementing counter
   todos: SessionTodoItem[]
 
-  // Sub-agent context (active when a task tool call is running a sub-agent)
-  subAgentContext?: SubAgentContext
+  // Sub-agent contexts keyed by subagentId. Multiple foreground sub-agents
+  // can be active concurrently when the parent dispatches several `task`
+  // tool calls in the same batch (see dispatchPreparedToolBatch). Each
+  // sub-agent loop owns one entry, lifetime-managed by setSubAgentContext
+  // / clearSubAgentContext(subagentId). Background sub-agents are tracked
+  // separately by SubagentTaskRegistry; entries here represent only the
+  // currently-suspended foreground state machines.
+  subAgentContexts: Map<string, SubAgentContext>
 
   // Recovery notice for unrecoverable in-flight state after proxy restart
   restartRecovery?: SessionRestartRecovery
@@ -805,7 +811,21 @@ interface PersistedChatSessionV1 {
   execId: number
   interactionQueryId: number
   todos: SessionTodoItem[]
+  /**
+   * @deprecated since 2026-05 — single-context schema. Read-only for
+   * backwards-compatible deserialization of pre-multi-subagent session
+   * snapshots. New writes use {@link subAgentContexts}.
+   */
   subAgentContext?: PersistedSubAgentContext
+  /**
+   * Multi-subagent persistence schema. Each entry is one foreground
+   * sub-agent that was active at the time of the snapshot. The bridge
+   * does not currently restart sub-agent state machines on cold start
+   * (cf. `deserializeSession` — restart recovery only marks them as
+   * interrupted), so this is consumed exclusively by the recovery
+   * synthesis path.
+   */
+  subAgentContexts?: PersistedSubAgentContext[]
   restartRecovery?: PersistedSessionRestartRecovery
 }
 
@@ -1259,8 +1279,8 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       usedContextTokens,
       contextUsagePct,
       requestedMaxOutputTokens,
-      subAgentTurns: session.subAgentContext?.turnCount ?? 0,
-      subAgentToolCalls: session.subAgentContext?.toolCallCount ?? 0,
+      subAgentTurns: this.sumSubAgentMetric(session, "turnCount"),
+      subAgentToolCalls: this.sumSubAgentMetric(session, "toolCallCount"),
     }
   }
 
@@ -1418,35 +1438,12 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       execId: session.execId,
       interactionQueryId: session.interactionQueryId,
       todos: [...session.todos],
-      subAgentContext: session.subAgentContext
-        ? {
-            parentToolCallId: session.subAgentContext.parentToolCallId,
-            parentModelCallId: session.subAgentContext.parentModelCallId,
-            subagentId: session.subAgentContext.subagentId,
-            messages: session.subAgentContext.messages,
-            model: session.subAgentContext.model,
-            tools: session.subAgentContext.tools,
-            accumulatedText: session.subAgentContext.accumulatedText,
-            pendingToolCallIds: Array.from(
-              session.subAgentContext.pendingToolCallIds
-            ),
-            startTime: session.subAgentContext.startTime,
-            turnCount: session.subAgentContext.turnCount,
-            toolCallCount: session.subAgentContext.toolCallCount,
-            modifiedFiles: [...session.subAgentContext.modifiedFiles],
-            isBackground: session.subAgentContext.isBackground,
-            backgroundedAt: session.subAgentContext.backgroundedAt,
-            currentTurnToolCalls:
-              session.subAgentContext.currentTurnToolCalls.map((toolCall) => ({
-                id: toolCall.id,
-                name: toolCall.name,
-                input: toolCall.input,
-              })),
-            expectedToolCallIds: Array.from(
-              session.subAgentContext.expectedToolCallIds
-            ),
-          }
-        : undefined,
+      subAgentContexts:
+        session.subAgentContexts.size > 0
+          ? Array.from(session.subAgentContexts.values()).map((ctx) =>
+              this.persistSubAgentContext(ctx)
+            )
+          : undefined,
       restartRecovery: session.restartRecovery
         ? {
             restoredAt: this.toTimestamp(session.restartRecovery.restoredAt),
@@ -1498,12 +1495,26 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       persisted.pendingInteractionQueryCount > 0
         ? persisted.pendingInteractionQueryCount
         : 0
-    const interruptedSubAgent = persisted.subAgentContext
+    // Pick a representative interrupted sub-agent for the recovery
+    // notice. New persistence schema uses `subAgentContexts: []` (one
+    // entry per concurrent foreground sub-agent); legacy snapshots used
+    // singular `subAgentContext`. We accept both and surface the first
+    // foreground (non-background) entry — that's the one most likely to
+    // have user-visible work in flight at restart time.
+    const interruptedSubAgentSource: PersistedSubAgentContext | undefined =
+      (Array.isArray(persisted.subAgentContexts) &&
+        persisted.subAgentContexts.find((entry) => !entry.isBackground)) ||
+      (Array.isArray(persisted.subAgentContexts)
+        ? persisted.subAgentContexts[0]
+        : undefined) ||
+      persisted.subAgentContext
+
+    const interruptedSubAgent = interruptedSubAgentSource
       ? {
-          subagentId: persisted.subAgentContext.subagentId,
-          parentToolCallId: persisted.subAgentContext.parentToolCallId,
-          turnCount: persisted.subAgentContext.turnCount,
-          toolCallCount: persisted.subAgentContext.toolCallCount,
+          subagentId: interruptedSubAgentSource.subagentId,
+          parentToolCallId: interruptedSubAgentSource.parentToolCallId,
+          turnCount: interruptedSubAgentSource.turnCount,
+          toolCallCount: interruptedSubAgentSource.toolCallCount,
         }
       : undefined
 
@@ -2301,7 +2312,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
           ? persisted.interactionQueryId
           : 0,
       todos: Array.isArray(persisted.todos) ? persisted.todos : [],
-      subAgentContext: undefined,
+      subAgentContexts: new Map(),
       restartRecovery: this.buildRestartRecovery(persisted),
       activeAssistantToolBatch: undefined,
     }
@@ -2392,6 +2403,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       pendingInteractionQueries: new Map(),
       interactionQueryId: 0,
       todos: [],
+      subAgentContexts: new Map(),
       restartRecovery: undefined,
       activeAssistantToolBatch: undefined,
     }
@@ -4086,39 +4098,176 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
   }
 
   // ── Sub-Agent Context helpers ──────────────────────────
+  //
+  // Multi-foreground-subagent model. When the parent agent dispatches
+  // several `task` tool calls in the same batch (cf.
+  // `dispatchPreparedToolBatch`), each one spins its own
+  // {@link SubAgentContext} state machine. We key them by `subagentId`
+  // and resolve via toolCallId at the BiDi boundary because the IDE
+  // routes ExecClientMessage results by execId/toolCallId, not by
+  // sub-agent.
 
+  /**
+   * Register or replace a sub-agent context. Replacement only happens
+   * when the same `subagentId` re-runs (defensive — the executor
+   * recreates a context after an aborted turn). Different sub-agents
+   * coexist as separate map entries.
+   */
   setSubAgentContext(conversationId: string, context: SubAgentContext): void {
     const session = this.getSession(conversationId)
     if (session) {
-      session.subAgentContext = context
+      session.subAgentContexts.set(context.subagentId, context)
       session.lastActivityAt = new Date()
       this.logger.log(
-        `Set SubAgentContext for ${conversationId}: subagentId=${context.subagentId}, parentToolCallId=${context.parentToolCallId}`
+        `Set SubAgentContext for ${conversationId}: subagentId=${context.subagentId}, parentToolCallId=${context.parentToolCallId} (active=${session.subAgentContexts.size})`
       )
       this.schedulePersist(conversationId)
     }
   }
 
-  getSubAgentContext(conversationId: string): SubAgentContext | undefined {
-    return this.getSession(conversationId)?.subAgentContext
+  /**
+   * Look up an active sub-agent by subagentId. Returns undefined when
+   * the sub-agent has already settled / been cleared. Prefer this when
+   * the caller already has the subagentId in scope (e.g. inside the
+   * executor's own loop) — the toolCallId fallback is for BiDi-boundary
+   * routing where only the protocol-level identifier is available.
+   */
+  getSubAgentContextById(
+    conversationId: string,
+    subagentId: string
+  ): SubAgentContext | undefined {
+    return this.getSession(conversationId)?.subAgentContexts.get(subagentId)
   }
 
+  /**
+   * Resolve a sub-agent from a tool call id. Matches in this order:
+   *   1. parentToolCallId — the `task` envelope itself
+   *   2. pendingToolCallIds — inner tool calls owned by the sub-agent
+   *   3. currentTurnToolCalls — pre-dispatch entries that have not yet
+   *      registered as pending (race window between LLM emit and
+   *      registerPreparedToolInvocation)
+   * Returns the first match; in practice toolCallIds are unique across
+   * sub-agents in the same session because each sub-agent's LLM
+   * generates fresh ids.
+   */
+  getSubAgentContextByToolCallId(
+    conversationId: string,
+    toolCallId: string
+  ): SubAgentContext | undefined {
+    const session = this.getSession(conversationId)
+    if (!session) return undefined
+    for (const ctx of session.subAgentContexts.values()) {
+      if (ctx.parentToolCallId === toolCallId) return ctx
+      if (ctx.pendingToolCallIds.has(toolCallId)) return ctx
+      if (ctx.currentTurnToolCalls.some((tc) => tc.id === toolCallId)) {
+        return ctx
+      }
+    }
+    return undefined
+  }
+
+  /**
+   * List every sub-agent currently attached to the session. Used by
+   * analytics / context attachment building / shutdown sweeps that want
+   * to enumerate everything live.
+   */
+  listSubAgentContexts(conversationId: string): SubAgentContext[] {
+    const session = this.getSession(conversationId)
+    if (!session) return []
+    return Array.from(session.subAgentContexts.values())
+  }
+
+  /**
+   * Internal helper used by analytics / restart-recovery serialization
+   * to sum a numeric field across every active sub-agent. Callers used
+   * to read `session.subAgentContext?.<field> ?? 0` from the singleton;
+   * with the multi-context model that becomes a per-conversation sum.
+   */
+  private sumSubAgentMetric(
+    session: ChatSession,
+    field: "turnCount" | "toolCallCount"
+  ): number {
+    let total = 0
+    for (const ctx of session.subAgentContexts.values()) {
+      total += ctx[field]
+    }
+    return total
+  }
+
+  /**
+   * Persistence helper: project a runtime SubAgentContext into the
+   * shape we write to disk. Centralised so serializeSession can map
+   * over `subAgentContexts.values()` without repeating the field-by-
+   * field copy.
+   */
+  private persistSubAgentContext(
+    ctx: SubAgentContext
+  ): PersistedSubAgentContext {
+    return {
+      parentToolCallId: ctx.parentToolCallId,
+      parentModelCallId: ctx.parentModelCallId,
+      subagentId: ctx.subagentId,
+      messages: ctx.messages,
+      model: ctx.model,
+      tools: ctx.tools,
+      accumulatedText: ctx.accumulatedText,
+      pendingToolCallIds: Array.from(ctx.pendingToolCallIds),
+      startTime: ctx.startTime,
+      turnCount: ctx.turnCount,
+      toolCallCount: ctx.toolCallCount,
+      modifiedFiles: [...ctx.modifiedFiles],
+      isBackground: ctx.isBackground,
+      backgroundedAt: ctx.backgroundedAt,
+      currentTurnToolCalls: ctx.currentTurnToolCalls.map((toolCall) => ({
+        id: toolCall.id,
+        name: toolCall.name,
+        input: toolCall.input,
+      })),
+      expectedToolCallIds: Array.from(ctx.expectedToolCallIds),
+    }
+  }
+
+  /**
+   * Mark a specific foreground sub-agent as backgrounded. The caller
+   * must supply the parent task tool call id (or subagent id) so we
+   * disambiguate when several sub-agents are active. Returns the
+   * mutated context on success or undefined when the lookup misses
+   * (e.g. tool call already settled).
+   */
   markSubAgentBackgrounded(
     conversationId: string,
     toolCallId?: string
   ): SubAgentContext | undefined {
     const session = this.getSession(conversationId)
-    const ctx = session?.subAgentContext
-    if (!session || !ctx) return undefined
+    if (!session || session.subAgentContexts.size === 0) return undefined
 
     const normalizedToolCallId = toolCallId?.trim()
-    if (
-      normalizedToolCallId &&
-      normalizedToolCallId !== ctx.parentToolCallId &&
-      normalizedToolCallId !== ctx.subagentId
-    ) {
+    let ctx: SubAgentContext | undefined
+
+    if (normalizedToolCallId) {
+      // Try parent / subagent / pending lookup. Match what the model
+      // is most likely to have referenced when emitting the
+      // backgroundSubagentAction.
+      ctx =
+        this.getSubAgentContextByToolCallId(
+          conversationId,
+          normalizedToolCallId
+        ) ?? session.subAgentContexts.get(normalizedToolCallId)
+      if (!ctx) return undefined
+    } else if (session.subAgentContexts.size === 1) {
+      // No id supplied and exactly one foreground sub-agent active —
+      // the legacy single-context call site. Pick it.
+      ctx = session.subAgentContexts.values().next().value
+    } else {
+      // Ambiguous: don't background-mark a random sub-agent; force the
+      // caller to disambiguate.
+      this.logger.warn(
+        `markSubAgentBackgrounded: ambiguous request for ${conversationId} ` +
+          `(${session.subAgentContexts.size} sub-agents active, no toolCallId provided)`
+      )
       return undefined
     }
+    if (!ctx) return undefined
 
     ctx.isBackground = true
     ctx.backgroundedAt = Date.now()
@@ -4130,22 +4279,49 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     return ctx
   }
 
-  clearSubAgentContext(conversationId: string): void {
+  /**
+   * Remove a single sub-agent's context. Other concurrent sub-agents
+   * remain untouched. Pass `undefined` only as a defensive escape hatch
+   * when the caller does not know the id; it clears all active
+   * contexts and logs a warning.
+   */
+  clearSubAgentContext(conversationId: string, subagentId?: string): void {
     const session = this.getSession(conversationId)
-    if (session) {
-      session.subAgentContext = undefined
+    if (!session) return
+
+    if (subagentId === undefined) {
+      if (session.subAgentContexts.size === 0) return
+      const ids = Array.from(session.subAgentContexts.keys())
+      this.logger.warn(
+        `clearSubAgentContext called without subagentId on ${conversationId}; ` +
+          `clearing ${ids.length} active context(s): ${ids.join(", ")}`
+      )
+      session.subAgentContexts.clear()
       session.lastActivityAt = new Date()
-      this.logger.log(`Cleared SubAgentContext for ${conversationId}`)
       this.schedulePersist(conversationId)
+      return
     }
+
+    if (!session.subAgentContexts.delete(subagentId)) return
+    session.lastActivityAt = new Date()
+    this.logger.log(
+      `Cleared SubAgentContext for ${conversationId}: subagentId=${subagentId} (remaining=${session.subAgentContexts.size})`
+    )
+    this.schedulePersist(conversationId)
   }
 
   /**
-   * Check if a tool call ID belongs to the active sub-agent.
+   * Check whether a tool call belongs to any active sub-agent. Used by
+   * BiDi handlers that need to decide whether to route an
+   * ExecClientMessage to the sub-agent dispatch path.
    */
   isSubAgentToolCall(conversationId: string, toolCallId: string): boolean {
-    const ctx = this.getSession(conversationId)?.subAgentContext
-    return !!ctx && ctx.pendingToolCallIds.has(toolCallId)
+    const session = this.getSession(conversationId)
+    if (!session) return false
+    for (const ctx of session.subAgentContexts.values()) {
+      if (ctx.pendingToolCallIds.has(toolCallId)) return true
+    }
+    return false
   }
 
   replaceMessages(conversationId: string, messages: SessionMessage[]): void {

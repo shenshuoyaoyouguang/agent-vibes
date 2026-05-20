@@ -540,27 +540,11 @@ interface TopLevelContinuationDecision {
   reasons: string[]
 }
 
-type AvoidableShellCommandClassification =
-  | {
-      kind: "file_write"
-      recommendedTool: "edit_file_v2"
-      reason: string
-    }
-  | {
-      kind: "file_read"
-      recommendedTool: "read_file"
-      reason: string
-    }
-  | {
-      kind: "file_search"
-      recommendedTool: "grep_search"
-      reason: string
-    }
-  | {
-      kind: "file_discovery"
-      recommendedTool: "list_directory" | "file_search" | "glob_search"
-      reason: string
-    }
+type AvoidableShellCommandClassification = {
+  kind: "file_write"
+  recommendedTool: "edit_file_v2"
+  reason: string
+}
 
 interface AssistantTurnStreamParams {
   conversationId: string
@@ -1141,6 +1125,12 @@ export class CursorConnectStreamService {
 
     const interruptedToolCalls: InterruptedToolCallInfo[] = []
     let interruptedSubAgent: SessionRestartRecovery["interruptedSubAgent"]
+    // Sub-agent ids whose state machine we tear down at the end of this
+    // sweep. Built up per-toolCallId so we only kill the sub-agents
+    // whose pending work was actually interrupted, leaving any sibling
+    // sub-agent (running concurrently from the same parent batch)
+    // untouched.
+    const interruptedSubagentIds = new Set<string>()
 
     for (const toolCallId of uniqueToolCallIds) {
       const pendingToolCall = session.pendingToolCalls.get(toolCallId)
@@ -1152,23 +1142,29 @@ export class CursorConnectStreamService {
         sentAt: pendingToolCall.sentAt,
       })
 
-      if (session.subAgentContext?.parentToolCallId === toolCallId) {
+      // Resolve the owning sub-agent. Try parent-tool-call first
+      // (matches the `task` envelope), then subagent-owner (inner
+      // tool call dispatched on behalf of a sub-agent), then a
+      // toolCallId fallback that walks pendingToolCallIds /
+      // currentTurnToolCalls of every active sub-agent.
+      const ownerCtx =
+        this.sessionManager.getSubAgentContextByToolCallId(
+          conversationId,
+          toolCallId
+        ) ??
+        (pendingToolCall.subagentOwner
+          ? this.sessionManager.getSubAgentContextById(
+              conversationId,
+              pendingToolCall.subagentOwner
+            )
+          : undefined)
+      if (ownerCtx) {
+        interruptedSubagentIds.add(ownerCtx.subagentId)
         interruptedSubAgent = {
-          subagentId: session.subAgentContext.subagentId,
-          parentToolCallId: session.subAgentContext.parentToolCallId,
-          turnCount: session.subAgentContext.turnCount,
-          toolCallCount: session.subAgentContext.toolCallCount,
-        }
-      }
-      if (
-        pendingToolCall.subagentOwner &&
-        session.subAgentContext?.subagentId === pendingToolCall.subagentOwner
-      ) {
-        interruptedSubAgent = {
-          subagentId: session.subAgentContext.subagentId,
-          parentToolCallId: session.subAgentContext.parentToolCallId,
-          turnCount: session.subAgentContext.turnCount,
-          toolCallCount: session.subAgentContext.toolCallCount,
+          subagentId: ownerCtx.subagentId,
+          parentToolCallId: ownerCtx.parentToolCallId,
+          turnCount: ownerCtx.turnCount,
+          toolCallCount: ownerCtx.toolCallCount,
         }
       }
 
@@ -1198,8 +1194,10 @@ export class CursorConnectStreamService {
       return 0
     }
 
-    if (interruptedSubAgent) {
-      this.sessionManager.clearSubAgentContext(conversationId)
+    // Tear down only the sub-agents we just interrupted; sibling
+    // sub-agents from the same batch remain alive.
+    for (const subagentId of interruptedSubagentIds) {
+      this.sessionManager.clearSubAgentContext(conversationId, subagentId)
     }
 
     const refreshedSession = this.sessionManager.getSession(conversationId)
@@ -1237,41 +1235,63 @@ export class CursorConnectStreamService {
     }
   ): number {
     const session = this.sessionManager.getSession(conversationId)
-    const ctx = session?.subAgentContext
-    if (!session || !ctx) return 0
-    if (
-      options?.targetSubagentId &&
-      ctx.subagentId !== options.targetSubagentId
-    ) {
-      return 0
-    }
-    if (ctx.isBackground && !options?.includeBackground) return 0
+    if (!session) return 0
 
-    const ownedPendingIds = Array.from(session.pendingToolCalls.values())
-      .filter(
-        (pending) =>
-          pending.subagentOwner === ctx.subagentId ||
-          pending.toolCallId === ctx.parentToolCallId
-      )
-      .map((pending) => pending.toolCallId)
-
-    this.subagentExecBridge.rejectConversation(
-      conversationId,
-      `sub-agent cancelled: ${reason}`
-    )
-
-    for (const toolCallId of ownedPendingIds) {
-      this.sessionManager.clearPendingToolCall(
+    // Pick which sub-agents to cancel:
+    //   - targetSubagentId set → just that one (no-op when not active)
+    //   - otherwise → every foreground sub-agent (skipping backgrounded
+    //     entries unless includeBackground is set)
+    const candidates: SubAgentContext[] = []
+    if (options?.targetSubagentId) {
+      const ctx = this.sessionManager.getSubAgentContextById(
         conversationId,
-        toolCallId,
-        `sub-agent cancelled: ${reason}`
+        options.targetSubagentId
       )
+      if (!ctx) return 0
+      if (ctx.isBackground && !options.includeBackground) return 0
+      candidates.push(ctx)
+    } else {
+      for (const ctx of this.sessionManager.listSubAgentContexts(
+        conversationId
+      )) {
+        if (ctx.isBackground && !options?.includeBackground) continue
+        candidates.push(ctx)
+      }
     }
-    this.sessionManager.clearSubAgentContext(conversationId)
-    this.logger.warn(
-      `Cancelled sub-agent ${ctx.subagentId}: cleared ${ownedPendingIds.length} pending tool call(s)`
-    )
-    return ownedPendingIds.length
+    if (candidates.length === 0) return 0
+
+    let totalCleared = 0
+    for (const ctx of candidates) {
+      const ownedPendingIds = Array.from(session.pendingToolCalls.values())
+        .filter(
+          (pending) =>
+            pending.subagentOwner === ctx.subagentId ||
+            pending.toolCallId === ctx.parentToolCallId
+        )
+        .map((pending) => pending.toolCallId)
+
+      // Reject every Exec waiter the sub-agent had outstanding so its
+      // worker loop unwinds (rejectToolCall is keyed by toolCallId so
+      // we cannot use the conversation-wide `rejectConversation` —
+      // that would also break sibling sub-agents we're not cancelling).
+      for (const toolCallId of ownedPendingIds) {
+        this.subagentExecBridge.rejectToolCall(
+          toolCallId,
+          new Error(`sub-agent cancelled: ${reason}`)
+        )
+        this.sessionManager.clearPendingToolCall(
+          conversationId,
+          toolCallId,
+          `sub-agent cancelled: ${reason}`
+        )
+      }
+      this.sessionManager.clearSubAgentContext(conversationId, ctx.subagentId)
+      this.logger.warn(
+        `Cancelled sub-agent ${ctx.subagentId}: cleared ${ownedPendingIds.length} pending tool call(s)`
+      )
+      totalCleared += ownedPendingIds.length
+    }
+    return totalCleared
   }
 
   private async *abortPendingToolCallsOnStream(
@@ -2361,12 +2381,34 @@ export class CursorConnectStreamService {
     ctx: SubAgentContext,
     conversationId: string,
     streamRoute: ModelRouteResult,
-    hints?: BackendStreamHints
+    hints?: BackendStreamHints,
+    options?: {
+      /**
+       * When true, the sub-agent has hit its maxTurns limit and is doing
+       * a forced "synthesis" turn:
+       *   - tools are removed from the DTO so the LLM cannot emit any
+       *     more tool_use blocks (which would never be dispatched);
+       *   - the system addendum reframes the task as "produce a final
+       *     answer from the tool_results already in your context".
+       *
+       * Without this, max-turn-limited sub-agents return either an empty
+       * accumulatedText or the literal placeholder
+       * `[sub-agent reached max turns]`, wasting all the work the
+       * earlier turns did. With it, we get one last LLM pass that
+       * actually synthesizes a useful answer from the collected
+       * tool_results.
+       */
+      forceFinalSynthesis?: boolean
+    }
   ): CreateMessageDto {
+    const forceFinalSynthesis = options?.forceFinalSynthesis === true
     // Pass the curated sub-agent tool surface so the model actually emits
     // tool_use blocks instead of meta-thinking text. ctx.tools is built up
-    // front in executeSubAgentTask via buildToolsForApi().
+    // front in executeSubAgentTask via buildToolsForApi(). On a final
+    // synthesis turn we deliberately omit the tools so the LLM has no
+    // choice but to write a plain-text answer.
     const subAgentToolDefinitions = (() => {
+      if (forceFinalSynthesis) return undefined
       const candidate = ctx.tools as unknown
       if (!Array.isArray(candidate) || candidate.length === 0) {
         return undefined
@@ -2381,17 +2423,26 @@ export class CursorConnectStreamService {
     const availableToolNames = (subAgentToolDefinitions || [])
       .map((tool) => tool?.name)
       .filter((value): value is string => typeof value === "string")
-    const subAgentSystemAddendum =
-      "You are a sub-agent. Operate strictly within the tool surface " +
-      "below; never invent tools. Use read-only workspace tools such as " +
-      "grep_search, read_file, and list_directory only when they are listed. " +
-      "Use shell/edit/delete only when those tools are explicitly listed " +
-      "for this agent. " +
-      (availableToolNames.length > 0
-        ? `Available tools: ${availableToolNames.join(", ")}. `
-        : "No tools are available in this sub-agent. ") +
-      "Use the smallest number of tool calls needed, then produce a final " +
-      "plain-text summary as your last assistant message (no tool_use)."
+    const subAgentSystemAddendum = forceFinalSynthesis
+      ? "You are a sub-agent that has reached its turn limit. You can " +
+        "no longer use any tools. The conversation above already contains " +
+        "every tool_result you collected. Your task NOW is to write a " +
+        "single final assistant message that synthesizes those results " +
+        "into a clear answer for the parent agent. Do not ask follow-up " +
+        "questions, do not announce you ran out of turns — just produce " +
+        "the best answer you can from the evidence on hand. Be concise " +
+        "but complete; cite specific findings from the tool_results when " +
+        "relevant."
+      : "You are a sub-agent. Operate strictly within the tool surface " +
+        "below; never invent tools. Use read-only workspace tools such as " +
+        "grep_search, read_file, and list_directory only when they are listed. " +
+        "Use shell/edit/delete only when those tools are explicitly listed " +
+        "for this agent. " +
+        (availableToolNames.length > 0
+          ? `Available tools: ${availableToolNames.join(", ")}. `
+          : "No tools are available in this sub-agent. ") +
+        "Use the smallest number of tool calls needed, then produce a final " +
+        "plain-text summary as your last assistant message (no tool_use)."
 
     const dto = this.buildStreamingDtoForRoute(streamRoute, {
       model: ctx.model,
@@ -2975,18 +3026,16 @@ export class CursorConnectStreamService {
     session: ChatSession
   ): ContextAttachmentSnapshot {
     return {
-      activeSubAgent: session.subAgentContext
-        ? {
-            subagentId: session.subAgentContext.subagentId,
-            model: session.subAgentContext.model,
-            turnCount: session.subAgentContext.turnCount,
-            toolCallCount: session.subAgentContext.toolCallCount,
-            modifiedFiles: [...session.subAgentContext.modifiedFiles],
-            pendingToolCallIds: Array.from(
-              session.subAgentContext.expectedToolCallIds
-            ),
-          }
-        : undefined,
+      activeSubAgents: this.sessionManager
+        .listSubAgentContexts(session.conversationId)
+        .map((ctx) => ({
+          subagentId: ctx.subagentId,
+          model: ctx.model,
+          turnCount: ctx.turnCount,
+          toolCallCount: ctx.toolCallCount,
+          modifiedFiles: [...ctx.modifiedFiles],
+          pendingToolCallIds: Array.from(ctx.expectedToolCallIds),
+        })),
       readPaths: Array.from(session.readPaths),
       fileStates: Array.from(session.fileStates.entries()).map(
         ([path, state]) => ({
@@ -4793,7 +4842,8 @@ ${raw}
       currentTurn.steps.push(
         ...this.buildConversationStepsFromAssistantTranscriptRecord(
           record.content,
-          toolResults
+          toolResults,
+          session
         )
       )
     }
@@ -4831,7 +4881,8 @@ ${raw}
 
   private buildConversationStepsFromAssistantTranscriptRecord(
     content: LooseMessageContent,
-    toolResults: Map<string, TranscriptToolResultForCheckpoint>
+    toolResults: Map<string, TranscriptToolResultForCheckpoint>,
+    session?: ChatSession
   ): ConversationStep[] {
     if (typeof content === "string") {
       const text = content.trim()
@@ -4862,6 +4913,10 @@ ${raw}
           toolName,
           result?.structuredContent
         )
+        // Resolve the proto family hint with session-aware MCP lookup
+        // so checkpoint replay projects MCP / web_fetch tool calls to
+        // their dedicated proto cases instead of truncatedToolCall.
+        const familyHint = this.classifyExecToolFamilyHint(toolName, session)
         steps.push(
           this.grpcService.buildToolCallConversationStep(
             toolName,
@@ -4869,7 +4924,7 @@ ${raw}
             input,
             result?.content || "",
             extraData,
-            undefined
+            familyHint
           )
         )
       }
@@ -9534,27 +9589,74 @@ ${raw}
     ) {
       try {
         const resolved = resolveMcpCallFieldsFromContract(input)
+
+        // Validate the composed name against the session's registered
+        // mcpToolDefs. composeMcpName uses providerIdentifier (e.g.
+        // "context7") to build the name, but the IDE may register tools
+        // with a different prefix (e.g. "user-context7-resolve-library-id").
+        // When the composed name doesn't match any registered def, fall
+        // back to the def registry to find the canonical name.
+        let finalName = resolved.name
+        let finalToolName = resolved.toolName
+        let finalProvider = resolved.providerIdentifier
+        const registeredDef = resolveMcpToolDefinition(
+          session.mcpToolDefs,
+          finalName
+        )
+        if (!registeredDef && session.mcpToolDefs?.length) {
+          // composeMcpName produced a name the IDE doesn't recognize.
+          // Try to find the correct def by matching providerIdentifier +
+          // toolName against the registry.
+          const correctedDef = session.mcpToolDefs.find((def) => {
+            if (!def || typeof def.name !== "string") return false
+            const defProvider = normalizeMcpToolIdentifier(
+              def.providerIdentifier || ""
+            )
+            const defToolName = normalizeMcpToolIdentifier(def.toolName || "")
+            const reqProvider = normalizeMcpToolIdentifier(finalProvider)
+            const reqToolName = normalizeMcpToolIdentifier(finalToolName)
+            // Match: provider contains requested (or vice versa) AND
+            // toolName matches exactly
+            return (
+              defToolName === reqToolName &&
+              (defProvider === reqProvider ||
+                defProvider.includes(reqProvider) ||
+                reqProvider.includes(defProvider))
+            )
+          })
+          if (correctedDef) {
+            finalName = correctedDef.name
+            finalToolName = correctedDef.toolName || finalToolName
+            finalProvider = correctedDef.providerIdentifier || finalProvider
+            this.logger.debug(
+              `MCP name correction: composeMcpName produced ` +
+                `"${resolved.name}" but IDE registry has ` +
+                `"${correctedDef.name}"; using registered name`
+            )
+          }
+        }
+
         const dispatchInput: Record<string, unknown> = {
           ...input,
-          name: resolved.name,
-          toolName: resolved.toolName,
-          providerIdentifier: resolved.providerIdentifier,
+          name: finalName,
+          toolName: finalToolName,
+          providerIdentifier: finalProvider,
           arguments: resolved.rawArgs,
         }
         const browserDispatchError = this.validateBrowserMcpDispatch(
           session,
-          resolved.name,
+          finalName,
           dispatchInput,
-          resolved.toolName
+          finalToolName
         )
         if (browserDispatchError) {
           return { errorMessage: browserDispatchError }
         }
         this.recordBrowserMcpDispatch(
           session,
-          resolved.name,
+          finalName,
           dispatchInput,
-          resolved.toolName
+          finalToolName
         )
         return {
           target: {
@@ -11744,9 +11846,36 @@ ${raw}
    * handleToolResult derives the real family from `toolName` when the
    * hint is missing.
    */
+  /**
+   * Map an Exec-dispatchable user-facing tool name to the
+   * `toolFamilyHint` field on PendingToolCall. Mirrors the cases in
+   * cursor-grpc.service.ts::detectToolFamily but only for the families
+   * the bridge actually allow-lists for sub-agent dispatch.
+   *
+   * Pass `session` when the resolution should also recognize MCP tools
+   * by walking `session.mcpToolDefs`. Without that argument, MCP tool
+   * names whose normalized form does not literally contain "mcp"
+   * (e.g. third-party MCP tools like `user-context7-resolve-library-id`
+   * or `cursor-ide-browser-browser_navigate`) fall through to
+   * `undefined` and downstream `detectToolFamily` projects them as
+   * `truncatedToolCall` → the IDE renders `[Tool: truncatedToolCall]`
+   * fallback labels in the assistant text stream. The session-aware
+   * branch fixes that by checking the session's MCP tool registry.
+   *
+   * Returning undefined is fine — the hint is a hint, not a contract;
+   * handleToolResult derives the real family from `toolName` when the
+   * hint is missing.
+   */
   private classifyExecToolFamilyHint(
-    toolName: string
+    toolName: string,
+    session?: ChatSession
   ): "mcp" | "web_fetch" | undefined {
+    if (
+      session &&
+      resolveMcpToolDefinition(session.mcpToolDefs, toolName) !== undefined
+    ) {
+      return "mcp"
+    }
     const normalized = toolName
       .trim()
       .toLowerCase()
@@ -12155,6 +12284,7 @@ ${raw}
         this.logger.error(`[SubAgent] LLM stream error: ${String(error)}`)
         yield* this.completeSubAgent(
           conversationId,
+          ctx.subagentId,
           `[sub-agent error] ${String(error)}`
         )
         return
@@ -12196,7 +12326,7 @@ ${raw}
 
       // No tool calls → sub-agent is done
       if (toolCalls.length === 0) {
-        yield* this.completeSubAgent(conversationId, fullText)
+        yield* this.completeSubAgent(conversationId, ctx.subagentId, fullText)
         return
       }
 
@@ -12222,6 +12352,19 @@ ${raw}
         // stall window even when they each finish under that window.
         yield this.grpcService.createHeartbeatResponse()
 
+        // Resolve the proto family hint once per inner tool so
+        // every downstream envelope (started, completed,
+        // ConversationStep) projects to the right ToolCall oneof case.
+        // Passing `session` makes MCP tool resolution use the session's
+        // mcpToolDefs registry so third-party MCP tool names (which do
+        // NOT literally contain "mcp" — `user-context7-resolve-library-id`,
+        // `cursor-ide-browser-browser_navigate`, ...) still get the
+        // "mcp" hint instead of falling through to truncatedToolCall.
+        const innerToolFamilyHint = this.classifyExecToolFamilyHint(
+          tc.name,
+          session
+        )
+
         // Mirror the sub-agent's tool lifecycle (started -> completed)
         // to the IDE through the parent task tool call's taskToolCallDelta
         // channel. The IDE renders these as nested tool-call bubbles
@@ -12235,17 +12378,17 @@ ${raw}
         // "read_semsearch_files") which the grpc-service `familyToCase`
         // map does not understand — those names fall through to the
         // truncatedToolCall placeholder and the IDE renders them as
-        // `[Tool: truncatedToolCall]`. Letting grpc-service derive the
-        // family itself from the tool name routes through `detectToolFamily`,
-        // which maps `glob_search` -> "glob", `semantic_search` -> "sem_search",
-        // `search_symbols` -> "sem_search", etc. — all of which DO have a
-        // proto oneof case and render correctly.
+        // `[Tool: truncatedToolCall]`. We pass the dedicated MCP /
+        // web_fetch hint computed above for tools that detectToolFamily
+        // cannot recognize from the name alone, and let grpc-service
+        // derive the family itself for everything else (`glob_search` ->
+        // "glob", `semantic_search` -> "sem_search", etc.).
         yield yieldSubAgentUpdate(
           this.grpcService.buildInnerToolCallStartedInteractionUpdate(
             tc.id,
             tc.name,
             parsedInput,
-            undefined,
+            innerToolFamilyHint,
             ctx.subagentId
           )
         )
@@ -12302,7 +12445,7 @@ ${raw}
             tc.id,
             tc.name,
             parsedInput,
-            this.classifyExecToolFamilyHint(tc.name),
+            innerToolFamilyHint,
             ctx.subagentId,
             undefined,
             undefined,
@@ -12347,7 +12490,9 @@ ${raw}
               tc.name === "run_terminal_command" ||
               tc.name === "run_terminal_command_v2"
                 ? { ...parsedInput, synchronous: true }
-                : parsedInput
+                : innerToolFamilyHint === "mcp"
+                  ? this.correctMcpToolInputName(session, parsedInput)
+                  : parsedInput
             yield this.grpcService.createAgentToolCallResponse(
               tc.name,
               tc.id,
@@ -12414,12 +12559,12 @@ ${raw}
             if (this.isSubAgentAbortError(err)) {
               const message = err instanceof Error ? err.message : String(err)
               this.sessionManager.consumePendingToolCall(conversationId, tc.id)
-              if (
-                this.sessionManager.getSubAgentContext(conversationId)
-                  ?.subagentId === ctx.subagentId
-              ) {
-                this.sessionManager.clearSubAgentContext(conversationId)
-              }
+              // Tear down only this sub-agent's context; sibling
+              // sub-agents in the same parent batch keep running.
+              this.sessionManager.clearSubAgentContext(
+                conversationId,
+                ctx.subagentId
+              )
               this.logger.warn(
                 `[SubAgent] Aborted ${ctx.subagentId} while waiting for ` +
                   `${tc.name} (${tc.id}): ${message}`
@@ -12498,15 +12643,16 @@ ${raw}
         // Emit the matching toolCallCompleted into the parent task bubble.
         // Note we always send the lifecycle pair even when the tool failed,
         // so the IDE never leaves a "started but never completed" stub.
-        // Same family-hint caveat as toolCallStarted — pass undefined so
-        // grpc-service derives the proto family via detectToolFamily.
+        // Use the same per-tool family hint we computed before
+        // toolCallStarted so MCP tools project to mcpToolCall rather
+        // than falling through to truncatedToolCall.
         yield yieldSubAgentUpdate(
           this.grpcService.buildInnerToolCallCompletedInteractionUpdate(
             tc.id,
             tc.name,
             parsedInput,
             toolResultContent,
-            undefined,
+            innerToolFamilyHint,
             ctx.subagentId,
             toolCompletedExtraData
           )
@@ -12514,6 +12660,8 @@ ${raw}
         // ConversationStep accumulation: push a toolCall step so the
         // parent task bubble's detail panel renders the per-tool
         // breakdown (which tools the sub-agent used + their results).
+        // Same family-hint as above so the per-step record uses the
+        // matching proto oneof case.
         ctx.conversationSteps.push(
           this.grpcService.buildToolCallConversationStep(
             tc.name,
@@ -12521,7 +12669,7 @@ ${raw}
             parsedInput,
             toolResultContent,
             toolCompletedExtraData,
-            undefined
+            innerToolFamilyHint
           )
         )
         // Surface success/failure via log so trace audits can correlate
@@ -12540,11 +12688,151 @@ ${raw}
       })
     }
 
-    // Reached max turns
-    yield* this.completeSubAgent(
-      conversationId,
-      ctx.accumulatedText || "[sub-agent reached max turns]"
+    // Reached max turns. Before settling the parent task tool call,
+    // run one more LLM pass with tools removed and a system addendum
+    // forcing a final synthesis. Without this, the parent agent
+    // receives `ctx.accumulatedText` (often empty — the LLM was still
+    // emitting tool_use blocks when the loop bailed) or the literal
+    // `[sub-agent reached max turns]` placeholder, wasting every tool
+    // call the sub-agent already paid for.
+    //
+    // The synthesis turn re-uses the same backend stream + heartbeat
+    // wrapper as a normal sub-agent turn. The DTO it sends is
+    // identical except (a) `tools: undefined`, (b) a synthesis-only
+    // system addendum, (c) injects a final user nudge so the
+    // assistant has an explicit instruction tied to the just-collected
+    // tool_results.
+    this.logger.log(
+      `[SubAgent] ${subagentId} reached MAX_TURNS=${MAX_TURNS}; running final synthesis turn (no tools)`
     )
+    ctx.turnCount++
+    ctx.messages.push({
+      role: "user",
+      content:
+        "You have reached your turn limit. Stop calling tools. Using " +
+        "only the tool_results already in this conversation, write a " +
+        "single final assistant message that synthesizes your findings " +
+        "into a clear answer. This is your last turn.",
+    })
+
+    let synthesisText = ""
+    try {
+      const buildSynthesisDtoForRoute = (
+        streamRoute: ModelRouteResult,
+        hints?: BackendStreamHints
+      ): CreateMessageDto =>
+        this.buildSubAgentStreamingDtoForRoute(
+          session,
+          ctx,
+          conversationId,
+          streamRoute,
+          hints,
+          { forceFinalSynthesis: true }
+        )
+
+      const buildSynthesisCodexRequestForRoute = (
+        streamRoute: ModelRouteResult,
+        hints?: BackendStreamHints
+      ): CodexExecutionRequest =>
+        this.buildCodexStreamingRequestForRoute(streamRoute, {
+          model: ctx.model,
+          promptContext: this.buildPromptContextFromSession(session),
+          conversationId,
+          session,
+          thinkingLevel: session.thinkingLevel,
+          thinkingDetailsRequested: session.thinkingDetailsRequested,
+          budgetOverride: hints?.budgetOverride,
+          // No toolDefinitions — synthesis turn must be text-only.
+          buildMessages: (budget) => {
+            const compacted =
+              this.contextManager.buildBackendMessagesFromMessages(
+                ctx.messages.map((message) => ({
+                  role: message.role,
+                  content: message.content as UnifiedMessage["content"],
+                })) as UnifiedMessage[],
+                this.EMPTY_CONTEXT_ATTACHMENT_SNAPSHOT,
+                {
+                  maxTokens: budget.maxTokens,
+                  systemPromptTokens: budget.systemPromptTokens,
+                  strategy: "auto",
+                }
+              )
+
+            return compacted.messages as CodexExecutionRequest["messages"]
+          },
+        })
+
+      // Heartbeat at the synthesis turn boundary, mirroring what
+      // every other LLM turn in this loop does.
+      yield this.grpcService.createHeartbeatResponse()
+
+      const route = this.modelRouter.resolveModel(ctx.model)
+      const streamModel = route.model
+      const stream = this.getBackendStream(streamModel, {
+        buildDtoForRoute: buildSynthesisDtoForRoute,
+        buildCodexRequestForRoute: buildSynthesisCodexRequestForRoute,
+        recoveryKey: `cursor:subagent:${conversationId}:${subagentId}:synthesis`,
+      })
+      const heartbeatStream = this.streamWithHeartbeat(stream)
+
+      for await (const item of heartbeatStream) {
+        if (item.type === "heartbeat") {
+          yield this.grpcService.createHeartbeatResponse()
+          continue
+        }
+
+        const event = this.parseSseEvent(item.value)
+        if (!event) continue
+
+        if (event.type === "content_block_delta") {
+          const delta = event.data.delta
+          if (delta?.type === "text_delta" && delta.text) {
+            synthesisText += delta.text
+            // Mirror synthesis text to the parent task bubble so the
+            // final answer streams in real time, matching the UX of
+            // an in-loop sub-agent turn.
+            yield yieldSubAgentUpdate(
+              this.grpcService.buildInnerTextDeltaInteractionUpdate(delta.text)
+            )
+          }
+          // tool_use deltas are intentionally ignored on the synthesis
+          // turn — even if the model emits one (it should not, since
+          // we did not pass any tool definitions), there is no
+          // dispatcher to handle it and we want a pure text answer.
+        }
+        // Other event types (block_start / block_stop / message_*) are
+        // safe to ignore for the synthesis pass — we only need text.
+      }
+    } catch (synthesisErr) {
+      // Synthesis is best-effort. If the LLM call itself fails, fall
+      // back to whatever we accumulated during the main loop so we
+      // still hand the parent something rather than leaving the task
+      // tool call hung.
+      this.logger.warn(
+        `[SubAgent] ${subagentId} synthesis turn failed: ${String(
+          synthesisErr
+        )}`
+      )
+    }
+
+    const finalText =
+      synthesisText.trim().length > 0
+        ? synthesisText
+        : ctx.accumulatedText || "[sub-agent reached max turns]"
+
+    // Persist the synthesis text into the conversation log so any
+    // follow-up tooling (transcript audit, conversation step renderer)
+    // sees a clean assistant message at the end of the sub-agent's
+    // history rather than a stale "[reached max turns]" placeholder.
+    if (synthesisText.trim().length > 0) {
+      ctx.messages.push({
+        role: "assistant",
+        content: synthesisText,
+      })
+      ctx.accumulatedText = synthesisText
+    }
+
+    yield* this.completeSubAgent(conversationId, ctx.subagentId, finalText)
   }
 
   // ────────────────────────────────────────────────────────────────────
@@ -12578,6 +12866,13 @@ ${raw}
       model: string
       toolNames: string[]
       abortSignal: AbortSignal
+      /**
+       * When true, the worker is doing its post-MAX_TURNS synthesis
+       * pass. Strips tools from the DTO and swaps the system addendum
+       * to "produce a final answer from existing tool_results" — same
+       * mechanism the foreground sub-agent uses on its synthesis turn.
+       */
+      forceFinalSynthesis?: boolean
     }
   ): Promise<{
     fullText: string
@@ -12600,12 +12895,18 @@ ${raw}
     // backend gets `[{ name: "semantic_search" }]`-style stubs and
     // schema validation fails silently inside the SSE generator,
     // leaving the worker's await stuck forever.
+    //
+    // On a forceFinalSynthesis pass we deliberately skip the expansion
+    // and pass an empty list so buildSubAgentStreamingDtoForRoute drops
+    // the tools key off the DTO entirely.
     const route = this.modelRouter.resolveModel(args.model)
-    const toolDefinitions = buildToolsForApi(args.toolNames, {
-      mcpToolDefs: session.mcpToolDefs,
-      backend: route.backend,
-      forSubAgent: true,
-    })
+    const toolDefinitions = args.forceFinalSynthesis
+      ? []
+      : buildToolsForApi(args.toolNames, {
+          mcpToolDefs: session.mcpToolDefs,
+          backend: route.backend,
+          forSubAgent: true,
+        })
 
     // Construct a minimal SubAgentContext for the existing
     // buildSubAgentStreamingDtoForRoute helper. The worker owns the
@@ -12641,7 +12942,8 @@ ${raw}
         tempCtx,
         conversationId,
         streamRoute,
-        hints
+        hints,
+        { forceFinalSynthesis: args.forceFinalSynthesis === true }
       )
 
     const buildCodexRequestForRoute = (
@@ -12919,7 +13221,14 @@ ${raw}
             toolName,
             callId,
             parsedInput,
-            resultContent
+            resultContent,
+            undefined,
+            // Session-aware family hint so MCP tool calls inside a
+            // background sub-agent project to mcpToolCall instead of
+            // the truncatedToolCall fallback (which the IDE renders as
+            // `[Tool: truncatedToolCall]` in the parent task bubble's
+            // detail panel).
+            this.classifyExecToolFamilyHint(toolName, session)
           ),
       },
     })
@@ -13009,9 +13318,13 @@ ${raw}
    */
   private async *completeSubAgent(
     conversationId: string,
+    subagentId: string,
     finalText: string
   ): AsyncGenerator<Buffer> {
-    const subAgentCtx = this.sessionManager.getSubAgentContext(conversationId)
+    const subAgentCtx = this.sessionManager.getSubAgentContextById(
+      conversationId,
+      subagentId
+    )
     if (!subAgentCtx) return
 
     const durationMs = Date.now() - subAgentCtx.startTime
@@ -13054,7 +13367,10 @@ ${raw}
       )
     }
 
-    this.sessionManager.clearSubAgentContext(conversationId)
+    this.sessionManager.clearSubAgentContext(
+      conversationId,
+      subAgentCtx.subagentId
+    )
   }
 
   /**
@@ -13752,6 +14068,75 @@ ${raw}
     return {
       content: `[report_bugfix_results success] results=${normalizedResults.length}`,
       state: { status: "success" },
+    }
+  }
+
+  /**
+   * Correct the MCP tool `name` field in sub-agent tool input so it
+   * matches the IDE's registered tool name. Without this, composeMcpName
+   * may produce a name like "context7-resolve-library-id" when the IDE
+   * expects "user-context7-resolve-library-id", causing McpToolNotFound
+   * and a permanently pending ExecClientMessage waiter.
+   */
+  private correctMcpToolInputName(
+    session: ChatSession,
+    input: Record<string, unknown>
+  ): Record<string, unknown> {
+    if (!session.mcpToolDefs?.length) return input
+
+    // Try to resolve the name the same way grpcService.buildExecMessageOneOf
+    // will — via resolveMcpCallFieldsFromContract.
+    let composedName: string | undefined
+    let resolvedToolName: string | undefined
+    let resolvedProvider: string | undefined
+    try {
+      const resolved = resolveMcpCallFieldsFromContract(input)
+      composedName = resolved.name
+      resolvedToolName = resolved.toolName
+      resolvedProvider = resolved.providerIdentifier
+    } catch {
+      return input
+    }
+
+    // Check if the composed name exists in the registry
+    const registeredDef = resolveMcpToolDefinition(
+      session.mcpToolDefs,
+      composedName
+    )
+    if (registeredDef) {
+      // Name is already correct
+      return input
+    }
+
+    // Find the correct def by matching provider + toolName
+    const correctedDef = session.mcpToolDefs.find((def) => {
+      if (!def || typeof def.name !== "string") return false
+      const defProvider = normalizeMcpToolIdentifier(
+        def.providerIdentifier || ""
+      )
+      const defToolName = normalizeMcpToolIdentifier(def.toolName || "")
+      const reqProvider = normalizeMcpToolIdentifier(resolvedProvider || "")
+      const reqToolName = normalizeMcpToolIdentifier(resolvedToolName || "")
+      return (
+        defToolName === reqToolName &&
+        (defProvider === reqProvider ||
+          defProvider.includes(reqProvider) ||
+          reqProvider.includes(defProvider))
+      )
+    })
+
+    if (!correctedDef) return input
+
+    this.logger.debug(
+      `[SubAgent] MCP name correction: "${composedName}" -> ` +
+        `"${correctedDef.name}" (provider="${correctedDef.providerIdentifier}")`
+    )
+
+    return {
+      ...input,
+      name: correctedDef.name,
+      toolName: correctedDef.toolName || resolvedToolName,
+      providerIdentifier: correctedDef.providerIdentifier || resolvedProvider,
     }
   }
 
@@ -17591,13 +17976,21 @@ ${raw}
     // payload from toolCallStarted. The actual sub-agent body streams via
     // ToolCallDeltaUpdate(taskToolCallDelta) — that's a separate channel
     // anchored to the same callId.
+    //
+    // `read_todos` was historically here too, but as of Cursor v3.x the
+    // IDE's `convertToolCallToBubbleData` switch (workbench.desktop.main.js,
+    // function `zms`) explicitly throws "Unsupported tool type for bubble
+    // translation: readTodosToolCall" — even though the proto oneof case is
+    // defined and the inner ToolFormer enum (`xn.TODO_READ = 34`) plus its
+    // "Reading todos" / "Read todos" status strings exist. The IDE simply
+    // forgot to wire the readTodosToolCall envelope into the bubble
+    // translator, falling back to the literal `[Tool: readTodosToolCall]`
+    // textDelta. Until Cursor ships the missing case, we suppress the
+    // lifecycle envelope on bridge side and let read_todos run inline so
+    // the assistant text stream stays clean. The model still receives the
+    // tool result through the normal inline_tool_result path.
     const UI_CARD_TOOL_FAMILIES: ReadonlySet<DeferredToolFamily> =
-      new Set<DeferredToolFamily>([
-        "read_todos",
-        "update_todos",
-        "create_plan",
-        "task",
-      ])
+      new Set<DeferredToolFamily>(["update_todos", "create_plan", "task"])
     if (family && UI_CARD_TOOL_FAMILIES.has(family)) {
       return undefined
     }
@@ -17641,6 +18034,13 @@ ${raw}
       normalized === "truncated_tool_call" ||
       normalized === "update_project" ||
       normalized === "unknown" ||
+      // discover_tool is purely bridge-internal — its result comes from
+      // in-memory deferred-tool catalog state with no Cursor protocol
+      // ToolCall mapping. Without this, lifecycle envelopes were emitted
+      // with family="unknown" → the IDE rendered `[Tool: truncatedToolCall]`
+      // labels in the assistant text stream every time the model called
+      // discover_tool to resolve a deferred tool's schema.
+      normalized === "discover_tool" ||
       compact === "backgroundcomposerfollowup" ||
       compact === "canvasdestroy" ||
       compact === "canvasgeturl" ||
@@ -17658,7 +18058,8 @@ ${raw}
       compact === "truncated" ||
       compact === "truncatedtoolcall" ||
       compact === "updateproject" ||
-      compact === "unknown"
+      compact === "unknown" ||
+      compact === "discovertool"
     )
   }
 
@@ -18208,74 +18609,135 @@ ${raw}
     )
   }
 
+  /**
+   * Classify a shell command for "you should have used a dedicated tool"
+   * intervention. Returns null when the command is either fine or its
+   * intent is not a deterministic file write.
+   *
+   * Design philosophy (mirrors claude-code's BashTool, see
+   * `claude-code/packages/builtin-tools/src/tools/BashTool/prompt.ts`):
+   *
+   *   - Hard-blocking shell read / search / discovery commands (cat,
+   *     head, tail, ls, find, grep, rg) is hostile to the user. A model
+   *     that wants to `wc -l file` should not be told "no, use
+   *     read_file" — it should just run, because read_file cannot
+   *     express line counting. claude-code's BashTool does NOT block
+   *     these; it only **suggests** the dedicated tools via the system
+   *     prompt and lets the model choose. We follow the same approach.
+   *
+   *   - File writes through shell (`echo > path`, `tee path`, `sed -i`
+   *     etc.) are still discouraged when the target is a workspace
+   *     file — the IDE cannot render the diff, the user cannot review
+   *     the change, and the model loses its file-state cache. We keep
+   *     this as a soft block, but with two corrections vs. the
+   *     previous implementation:
+   *
+   *       1. Compound commands are split per-segment before pattern
+   *          matching. `wc -l foo 2>/dev/null || echo bar; stat baz`
+   *          previously matched the global "echo + > anywhere" regex
+   *          and was rejected as a "file write through shell" — even
+   *          though no segment writes a file. Per-segment classification
+   *          fixes that false positive.
+   *
+   *       2. stderr-only redirections (`2>`, `2>>`) are not file
+   *          writes for our purposes. They route stderr to /dev/null
+   *          or a log file the user is already allowed to manage; the
+   *          IDE diff path is not relevant.
+   *
+   *   - Real security validation (network device redirects to /dev/tcp,
+   *     IFS injection, obfuscated flags, heredoc forging) is OUT OF
+   *     SCOPE here — those belong in a separate validator and are not
+   *     yet implemented in this bridge. claude-code's `bashSecurity.ts`
+   *     is the reference implementation.
+   */
   private classifyAvoidableShellCommand(
     command: string | null
   ): AvoidableShellCommandClassification | null {
     if (!command) return null
     const trimmed = command.trim()
     if (!trimmed) return null
-    const normalized = trimmed.toLowerCase()
 
-    // Deterministic repository file writes must go through the edit protocol so
-    // Cursor can render the diff and the model receives a structured result.
+    // Split the command into top-level segments separated by sequencing
+    // operators. Each segment is classified independently — a write in
+    // any segment trips the soft block, but a single segment's write
+    // intent does not get inferred from tokens that live in a different
+    // segment.
+    const segments = this.splitShellCommandSegments(trimmed)
+    if (segments.length === 0) {
+      return null
+    }
+
+    for (const segment of segments) {
+      const classification = this.classifySingleShellSegment(segment)
+      if (classification) {
+        return classification
+      }
+    }
+    return null
+  }
+
+  /**
+   * Per-segment classifier. Only file_write is recognized; read /
+   * search / discovery shapes are intentionally allowed through (see
+   * the rationale in classifyAvoidableShellCommand).
+   */
+  private classifySingleShellSegment(
+    segmentRaw: string
+  ): AvoidableShellCommandClassification | null {
+    const segment = segmentRaw.trim()
+    if (!segment) return null
+    const normalized = segment.toLowerCase()
+
+    // File writes through shell — soft block, with target whitelisting
+    // for ephemeral / tmp / smoke paths so harmless cases pass through.
     //
-    // We split the detection into two phases:
-    //   1. Pattern match: does the command look like a write?
-    //   2. Target whitelist: if every detected write target lives inside an
-    //      ephemeral / smoke / tmp area, allow it through. Only block when at
-    //      least one target may be a workspace file.
+    // The `>` / `>>` regex deliberately excludes `2>` / `2>>` (stderr
+    // redirects) by anchoring the match to a non-digit boundary at the
+    // start of the redirection token. `[^0-9&]` before the `>` allows
+    // word-boundaries (space, end of identifier) but rejects
+    // file-descriptor redirects like `2>` or `&>`.
     const looksLikeRedirectionWrite =
-      /(^|[\n;&|])\s*(?:cat|printf|echo)\b[^\n]*(?:>|>>)\s*[^&|;\s]+/.test(
+      /(^|\s)(?:cat|printf|echo)\b[^\n]*(?:^|[^\d&])>>?\s*[^&|;\s]+/.test(
         normalized
       )
-    const looksLikeTeeWrite =
-      /(^|[\n;&|])\s*tee\s+(?:-[a-z]+\s+)*[^&|;\s]+/.test(normalized)
+    const looksLikeTeeWrite = /(^|\s)tee\s+(?:-[a-z]+\s+)*[^&|;\s]+/.test(
+      normalized
+    )
     const looksLikeInPlaceEdit =
-      /(^|[\n;&|])\s*(?:sed\b[^\n]*\s-i\b|perl\b[^\n]*\s-pi\b)/.test(normalized)
+      /(^|\s)(?:sed\b[^\n]*\s-i\b|perl\b[^\n]*\s-pi\b)/.test(normalized)
     const looksLikeProgrammaticWrite =
       /\b(?:writefilesync|writefile|write_text)\s*\(/.test(normalized) ||
       /\bopen\s*\([^)]*["'](?:w|a|x)\+?["']/.test(normalized)
 
     if (
-      looksLikeRedirectionWrite ||
-      looksLikeTeeWrite ||
-      looksLikeInPlaceEdit ||
-      looksLikeProgrammaticWrite
+      !looksLikeRedirectionWrite &&
+      !looksLikeTeeWrite &&
+      !looksLikeInPlaceEdit &&
+      !looksLikeProgrammaticWrite
     ) {
-      // Best-effort target extraction across all write shapes:
-      //   - shell redirection: `> path`, `>> path`, `tee path`
-      //   - sed -i / perl -pi: target follows the last positional arg
-      //   - programmatic writes: writeFileSync(<literal>, ...) etc.
-      // If we can extract every target AND every target lives inside an
-      // ephemeral / tmp / smoke area, allow the command through. Only
-      // block when at least one target may be a workspace file or the
-      // shape is too opaque to reason about.
-      const targets = this.extractShellWriteTargets(trimmed)
-      const programmaticTargets = looksLikeProgrammaticWrite
-        ? this.extractProgrammaticWriteTargets(trimmed)
-        : []
-      const inPlaceTargets = looksLikeInPlaceEdit
-        ? this.extractInPlaceEditTargets(trimmed)
-        : []
-      const allTargets = [...targets, ...programmaticTargets, ...inPlaceTargets]
+      return null
+    }
 
-      if (allTargets.length === 0) {
-        // Could not prove safety — conservative block. Includes
-        // sed -i / perl -pi / writeFileSync without a literal path.
-        return {
-          kind: "file_write",
-          recommendedTool: "edit_file_v2",
-          reason: "deterministic file write through shell",
-        }
-      }
+    // Best-effort target extraction across all write shapes:
+    //   - shell redirection: `> path`, `>> path`, `tee path`
+    //   - sed -i / perl -pi: target follows the last positional arg
+    //   - programmatic writes: writeFileSync(<literal>, ...) etc.
+    // If we can extract every target AND every target lives inside an
+    // ephemeral / tmp / smoke area, allow the command through. Only
+    // block when at least one target may be a workspace file or the
+    // shape is too opaque to reason about.
+    const targets = this.extractShellWriteTargets(segment)
+    const programmaticTargets = looksLikeProgrammaticWrite
+      ? this.extractProgrammaticWriteTargets(segment)
+      : []
+    const inPlaceTargets = looksLikeInPlaceEdit
+      ? this.extractInPlaceEditTargets(segment)
+      : []
+    const allTargets = [...targets, ...programmaticTargets, ...inPlaceTargets]
 
-      const allTargetsAreEphemeral = allTargets.every((target) =>
-        this.isEphemeralWritePath(target)
-      )
-      if (allTargetsAreEphemeral) {
-        return null
-      }
-
+    if (allTargets.length === 0) {
+      // Could not prove safety — conservative block. Includes
+      // sed -i / perl -pi / writeFileSync without a literal path.
       return {
         kind: "file_write",
         recommendedTool: "edit_file_v2",
@@ -18283,34 +18745,104 @@ ${raw}
       }
     }
 
-    if (
-      /^(?:cat|sed\s+-n|head|tail|nl)\b/.test(normalized) &&
-      !/[<>]/.test(normalized)
-    ) {
-      return {
-        kind: "file_read",
-        recommendedTool: "read_file",
-        reason: "file inspection through shell",
-      }
+    const allTargetsAreEphemeral = allTargets.every((target) =>
+      this.isEphemeralWritePath(target)
+    )
+    if (allTargetsAreEphemeral) {
+      return null
     }
 
-    if (/^(?:rg|grep|git\s+grep)\b/.test(normalized)) {
-      return {
-        kind: "file_search",
-        recommendedTool: "grep_search",
-        reason: "repository text search through shell",
-      }
+    return {
+      kind: "file_write",
+      recommendedTool: "edit_file_v2",
+      reason: "deterministic file write through shell",
     }
+  }
 
-    if (/^(?:ls|find|fd|tree)\b/.test(normalized)) {
-      return {
-        kind: "file_discovery",
-        recommendedTool: "list_directory",
-        reason: "file discovery through shell",
+  /**
+   * Split a shell command on top-level sequencing operators
+   * (`;`, `&&`, `||`, `|`) while respecting single quotes, double
+   * quotes, and backslash escapes so operators inside a quoted string
+   * are treated as literal text. Heredoc bodies are NOT inspected — a
+   * heredoc that contains `;` does not split the surrounding command.
+   *
+   * Returns the segments in source order. Empty segments are dropped.
+   * This is a heuristic split (not a full bash parser) — sufficient
+   * for false-positive avoidance in classifyAvoidableShellCommand,
+   * not sufficient for security-critical validation.
+   */
+  private splitShellCommandSegments(command: string): string[] {
+    const segments: string[] = []
+    let current = ""
+    let i = 0
+    let inSingle = false
+    let inDouble = false
+    while (i < command.length) {
+      const ch = command[i]
+      const next = command[i + 1]
+      if (inSingle) {
+        current += ch
+        if (ch === "'") inSingle = false
+        i++
+        continue
       }
+      if (inDouble) {
+        if (ch === "\\" && next !== undefined) {
+          current += ch + next
+          i += 2
+          continue
+        }
+        current += ch
+        if (ch === '"') inDouble = false
+        i++
+        continue
+      }
+      if (ch === "\\" && next !== undefined) {
+        current += ch + next
+        i += 2
+        continue
+      }
+      if (ch === "'") {
+        inSingle = true
+        current += ch
+        i++
+        continue
+      }
+      if (ch === '"') {
+        inDouble = true
+        current += ch
+        i++
+        continue
+      }
+      if (ch === ";") {
+        if (current.trim()) segments.push(current)
+        current = ""
+        i++
+        continue
+      }
+      if (ch === "&" && next === "&") {
+        if (current.trim()) segments.push(current)
+        current = ""
+        i += 2
+        continue
+      }
+      if (ch === "|" && next === "|") {
+        if (current.trim()) segments.push(current)
+        current = ""
+        i += 2
+        continue
+      }
+      if (ch === "|") {
+        if (current.trim()) segments.push(current)
+        current = ""
+        i++
+        continue
+      }
+      current += ch
+      i++
     }
-
-    return null
+    if (current.trim()) segments.push(current)
+    return segments
   }
 
   /**
@@ -18540,10 +19072,17 @@ ${raw}
     }
 
     const commandPreview = this.truncateForToolSummary(command || "", 220)
+    // classification is currently always `kind: "file_write"` — the
+    // read / search / discovery shapes are no longer hard-blocked
+    // (they're steered via the system prompt instead). The
+    // recommendation text reflects that single remaining case; if we
+    // ever re-introduce other classifications they need their own
+    // recommendation strings.
     const recommendation =
-      classification.kind === "file_write"
-        ? "Use edit_file_v2. For a new file, call edit_file_v2 with search set to an empty string and replace set to the full file content. For an existing file, read_file first, then edit_file_v2 with a small exact search snippet."
-        : `Use ${classification.recommendedTool} instead.`
+      "Use edit_file_v2. For a new file, call edit_file_v2 with search " +
+      "set to an empty string and replace set to the full file content. " +
+      "For an existing file, read_file first, then edit_file_v2 with a " +
+      "small exact search snippet."
     const message =
       `run_terminal_command rejected: ${classification.reason}; ` +
       `${recommendation} command=${JSON.stringify(commandPreview)}`
@@ -20384,10 +20923,14 @@ ${raw}
     this.resetTopLevelAgentTurnState(session, conversationId)
 
     // Map Cursor model name to backend model name
-    const route = this.modelRouter.resolveModel(parsed.model)
+    const effectiveModel = parsed.model?.trim() || session.model
+    if (!parsed.model?.trim()) {
+      parsed.model = effectiveModel
+    }
+    const route = this.modelRouter.resolveModel(effectiveModel)
     const backendModel = route.model
     this.logger.debug(
-      `Mapped Cursor model "${parsed.model}" to backend model "${backendModel}" (backend=${route.backend})`
+      `Mapped Cursor model "${effectiveModel}" to backend model "${backendModel}" (backend=${route.backend})`
     )
     this.startProviderWarmup(route, conversationId, "initial-chat")
 

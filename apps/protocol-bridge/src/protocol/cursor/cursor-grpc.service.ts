@@ -2296,6 +2296,9 @@ export class CursorGrpcService {
     if (normalized.includes("listmcpresourcetemplates"))
       return "list_mcp_resources"
     if (normalized.includes("viewimage")) return "read"
+    // Bridge-internal tools with no proto representation
+    if (normalized === "discovertool" || normalized === "discover_tool")
+      return "truncated"
     // Cursor's current protobuf does not expose exact Codex-native oneofs for
     // sub-agent lifecycle or apply_patch. Project them onto the closest native
     // Cursor families so the UI/tool stream stays structured instead of
@@ -4354,15 +4357,40 @@ export class CursorGrpcService {
       }
       case "mcp": {
         const a = args as McpArgs
-        const { name, toolName, providerIdentifier, rawArgs } =
-          this.resolveMcpCallFields(a as unknown as Record<string, unknown>)
+        let mcpExecName: string
+        let mcpExecToolName: string
+        let mcpExecProviderIdentifier: string
+        let mcpExecRawArgs: Record<string, unknown>
+        try {
+          const resolved = this.resolveMcpCallFields(
+            a as unknown as Record<string, unknown>
+          )
+          mcpExecName = resolved.name
+          mcpExecToolName = resolved.toolName
+          mcpExecProviderIdentifier = resolved.providerIdentifier
+          mcpExecRawArgs = resolved.rawArgs
+        } catch {
+          // Fallback: use whatever identity fields are available
+          mcpExecName = safeString((a as Record<string, unknown>).name)
+          mcpExecToolName = safeString(
+            (a as Record<string, unknown>).toolName ||
+              (a as Record<string, unknown>).tool_name
+          )
+          mcpExecProviderIdentifier = safeString(
+            (a as Record<string, unknown>).providerIdentifier ||
+              (a as Record<string, unknown>).provider_identifier ||
+              (a as Record<string, unknown>).serverName ||
+              (a as Record<string, unknown>).server_name
+          )
+          mcpExecRawArgs = { ...(a as unknown as Record<string, unknown>) }
+        }
         return {
           case: "mcpArgs" as const,
           value: create(McpArgsSchema, {
-            name,
-            toolName,
-            providerIdentifier,
-            args: this.toProtoValueMap(rawArgs),
+            name: mcpExecName,
+            toolName: mcpExecToolName,
+            providerIdentifier: mcpExecProviderIdentifier,
+            args: this.toProtoValueMap(mcpExecRawArgs),
             toolCallId,
           }),
         }
@@ -5152,16 +5180,31 @@ export class CursorGrpcService {
           }),
         }
       case "mcp": {
-        const { name, toolName, providerIdentifier, rawArgs } =
-          this.resolveMcpCallFields(args)
+        let mcpName: string
+        let mcpToolNameStarted: string
+        let mcpProviderIdentifier: string
+        let mcpRawArgs: Record<string, unknown>
+        try {
+          const resolved = this.resolveMcpCallFields(args)
+          mcpName = resolved.name
+          mcpToolNameStarted = resolved.toolName
+          mcpProviderIdentifier = resolved.providerIdentifier
+          mcpRawArgs = resolved.rawArgs
+        } catch {
+          // Fallback: derive identity from the outer toolName parameter
+          mcpToolNameStarted = toolName
+          mcpName = toolName
+          mcpProviderIdentifier = ""
+          mcpRawArgs = { ...args }
+        }
         return {
           case: "mcpToolCall" as const,
           value: create(McpToolCallSchema, {
             args: create(McpArgsSchema, {
-              name,
-              toolName,
-              providerIdentifier,
-              args: this.toProtoValueMap(rawArgs),
+              name: mcpName,
+              toolName: mcpToolNameStarted,
+              providerIdentifier: mcpProviderIdentifier,
+              args: this.toProtoValueMap(mcpRawArgs),
               toolCallId: callId,
             }),
           }),
@@ -6884,12 +6927,26 @@ export class CursorGrpcService {
     }
 
     if (family === "mcp") {
-      const {
-        name,
-        toolName,
-        providerIdentifier,
-        rawArgs: mcpArgsInput,
-      } = this.resolveMcpCallFields(args)
+      let name: string
+      let mcpToolName: string
+      let providerIdentifier: string
+      let mcpArgsInput: Record<string, unknown>
+      try {
+        const resolved = this.resolveMcpCallFields(args)
+        name = resolved.name
+        mcpToolName = resolved.toolName
+        providerIdentifier = resolved.providerIdentifier
+        mcpArgsInput = resolved.rawArgs
+      } catch {
+        // MCP tool args stored in transcript may not contain identity fields
+        // (e.g. user-context7-resolve-library-id stores { libraryName, query }
+        // without name/toolName/providerIdentifier). Fall back to deriving
+        // identity from the outer toolName parameter.
+        mcpToolName = toolName
+        name = toolName
+        providerIdentifier = ""
+        mcpArgsInput = { ...args }
+      }
       let mcpResultOneOf: McpToolResult["result"]
       if (status === "success") {
         const contentItems = this.buildMcpResultContentItems(result)
@@ -6931,7 +6988,7 @@ export class CursorGrpcService {
           args: create(McpArgsSchema, {
             name,
             args: this.toProtoValueMap(mcpArgsInput),
-            toolName,
+            toolName: mcpToolName,
             providerIdentifier,
             toolCallId: callId,
           }),

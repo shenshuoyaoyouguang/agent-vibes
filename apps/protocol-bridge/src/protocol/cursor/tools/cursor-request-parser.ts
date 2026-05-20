@@ -6,7 +6,10 @@ import {
   AgentClientMessage,
   AgentClientMessageSchema,
   AgentRunRequest,
+  AssistantMessageSchema,
+  ConversationStepSchema,
   ConversationStateStructure,
+  ConversationTurnStructureSchema,
   type CursorRule,
   ExecClientControlMessage,
   ExecClientMessage,
@@ -14,6 +17,8 @@ import {
   InteractionResponse,
   type RequestedModel_ModelParameterValue,
   UserMessage,
+  UserMessageAction,
+  UserMessageSchema,
 } from "../../../gen/agent/v1_pb"
 import { parseModelRequest } from "../../../llm/shared/model-request"
 import { normalizeRequestedThinkingEffort } from "../../../llm/shared/thinking-intent"
@@ -392,6 +397,157 @@ export class CursorRequestParser {
     return this.textDecoder.decode(blobId)
   }
 
+  private getStoredBlobBytes(blobId: string): Buffer | null {
+    if (!blobId) return null
+    const blobData = this.kvStorageService.getBlob(blobId)
+    if (!blobData) return null
+
+    try {
+      return Buffer.from(blobData, "base64")
+    } catch {
+      return null
+    }
+  }
+
+  private resolveStoredBlobBytes(blobIdBytes?: Uint8Array): Buffer | null {
+    if (!blobIdBytes || blobIdBytes.length === 0) return null
+    const blobId = this.decodeBlobId(blobIdBytes)
+    return this.getStoredBlobBytes(blobId)
+  }
+
+  private resolveProtocolReferenceBytes(ref?: Uint8Array): Buffer | null {
+    if (!ref || ref.length === 0) return null
+    return this.resolveStoredBlobBytes(ref) || Buffer.from(ref)
+  }
+
+  private extractTextFromStructuredPayload(payload: string): string {
+    if (!payload) return ""
+
+    try {
+      const parsed = JSON.parse(payload) as unknown
+      if (typeof parsed === "string") return parsed
+
+      if (parsed && typeof parsed === "object") {
+        const direct = parsed as Record<string, unknown>
+        for (const key of ["text", "content", "query", "message"]) {
+          const value = direct[key]
+          if (typeof value === "string" && value.trim()) {
+            return value
+          }
+        }
+      }
+
+      const parts: string[] = []
+      const visit = (value: unknown, depth: number) => {
+        if (depth > 8 || value == null) return
+        if (typeof value === "string") return
+        if (Array.isArray(value)) {
+          for (const item of value) visit(item, depth + 1)
+          return
+        }
+        if (typeof value !== "object") return
+
+        const record = value as Record<string, unknown>
+        if (typeof record.text === "string" && record.text.trim()) {
+          parts.push(record.text)
+        }
+        for (const nested of Object.values(record)) {
+          visit(nested, depth + 1)
+        }
+      }
+      visit(parsed, 0)
+
+      const joined = parts.join("").trim()
+      return joined || payload
+    } catch {
+      return payload
+    }
+  }
+
+  private decodeStoredTextBlob(blobIdBytes?: Uint8Array): string {
+    const bytes = this.resolveStoredBlobBytes(blobIdBytes)
+    if (!bytes || bytes.length === 0) return ""
+
+    return this.extractTextFromStructuredPayload(bytes.toString("utf8"))
+  }
+
+  private extractUserMessagePrompt(userMsg?: UserMessage): string {
+    if (!userMsg) return ""
+
+    if (userMsg.text?.trim()) {
+      return userMsg.text
+    }
+
+    const textBlob = this.decodeStoredTextBlob(userMsg.textBlobId)
+    if (textBlob.trim()) {
+      return textBlob
+    }
+
+    const richTextBlob = this.decodeStoredTextBlob(userMsg.richTextBlobId)
+    if (richTextBlob.trim()) {
+      return richTextBlob
+    }
+
+    return ""
+  }
+
+  private extractAttachedImagesFromUserMessage(
+    userMsg?: UserMessage
+  ): AttachedImage[] {
+    const attachedImages: AttachedImage[] = []
+    if (!userMsg?.selectedContext?.selectedImages?.length) {
+      return attachedImages
+    }
+
+    for (const img of userMsg.selectedContext.selectedImages) {
+      const mimeType = img.mimeType || "image/png"
+      let base64Data: string | undefined
+
+      switch (img.dataOrBlobId.case) {
+        case "data":
+          base64Data = Buffer.from(img.dataOrBlobId.value).toString("base64")
+          break
+        case "blobIdWithData": {
+          const blobId = this.decodeBlobId(img.dataOrBlobId.value.blobId)
+          base64Data = Buffer.from(img.dataOrBlobId.value.data).toString(
+            "base64"
+          )
+          if (blobId) {
+            this.kvStorageService.storeBlob(blobId, base64Data)
+          }
+          break
+        }
+        case "blobId": {
+          const blobId = this.decodeBlobId(img.dataOrBlobId.value)
+          base64Data = this.kvStorageService.getBlob(blobId)
+          if (!base64Data) {
+            this.logger.error(
+              `Image blob not found for selected image (uuid=${img.uuid}, blobId=${blobId})`
+            )
+          }
+          break
+        }
+      }
+
+      if (base64Data) {
+        attachedImages.push({
+          data: base64Data,
+          mimeType,
+          width: img.dimension?.width,
+          height: img.dimension?.height,
+        })
+      }
+    }
+
+    if (attachedImages.length > 0) {
+      this.logger.log(
+        `Extracted ${attachedImages.length} image(s) from selectedContext (total ${attachedImages.reduce((sum, img) => sum + img.data.length, 0)} base64 chars)`
+      )
+    }
+
+    return attachedImages
+  }
+
   /**
    * Convert a protobuf google.protobuf.Value to plain JS value.
    */
@@ -728,6 +884,89 @@ export class CursorRequestParser {
     return { role, content }
   }
 
+  private extractUserMessageFromReference(ref?: Uint8Array): string {
+    const bytes = this.resolveProtocolReferenceBytes(ref)
+    if (!bytes || bytes.length === 0) return ""
+
+    try {
+      const userMsg = fromBinary(UserMessageSchema, bytes)
+      const prompt = this.extractUserMessagePrompt(userMsg)
+      if (prompt.trim()) return prompt
+    } catch {
+      // Not a UserMessage protobuf.
+    }
+
+    return this.extractTextFromStructuredPayload(bytes.toString("utf8"))
+  }
+
+  private extractConversationStepMessageFromReference(
+    ref?: Uint8Array
+  ): { role: "assistant"; content: string } | null {
+    const bytes = this.resolveProtocolReferenceBytes(ref)
+    if (!bytes || bytes.length === 0) return null
+
+    try {
+      const step = fromBinary(ConversationStepSchema, bytes)
+      if (step.message.case === "assistantMessage") {
+        const content = step.message.value.text || ""
+        return content ? { role: "assistant", content } : null
+      }
+    } catch {
+      // Not a ConversationStep protobuf.
+    }
+
+    try {
+      const assistant = fromBinary(AssistantMessageSchema, bytes)
+      if (assistant.text) {
+        return { role: "assistant", content: assistant.text }
+      }
+    } catch {
+      // Not an AssistantMessage protobuf.
+    }
+
+    const candidate = this.parseConversationMessageCandidate(
+      this.extractTextFromStructuredPayload(bytes.toString("utf8"))
+    )
+    return candidate?.role === "assistant"
+      ? { role: "assistant", content: candidate.content }
+      : null
+  }
+
+  private extractMessagesFromConversationTurnReference(
+    ref?: Uint8Array
+  ): Array<{ role: "user" | "assistant"; content: string }> {
+    const bytes = this.resolveProtocolReferenceBytes(ref)
+    if (!bytes || bytes.length === 0) return []
+
+    try {
+      const turnStructure = fromBinary(ConversationTurnStructureSchema, bytes)
+      if (turnStructure.turn.case !== "agentConversationTurn") {
+        return []
+      }
+
+      const messages: Array<{
+        role: "user" | "assistant"
+        content: string
+      }> = []
+      const agentTurn = turnStructure.turn.value
+      const userText = this.extractUserMessageFromReference(
+        agentTurn.userMessage
+      )
+      if (userText.trim()) {
+        messages.push({ role: "user", content: userText })
+      }
+
+      for (const stepRef of agentTurn.steps) {
+        const msg = this.extractConversationStepMessageFromReference(stepRef)
+        if (msg) messages.push(msg)
+      }
+
+      return messages
+    } catch {
+      return []
+    }
+  }
+
   private extractConversationHistoryFromState(
     state?: ConversationStateStructure
   ): Array<{ role: "user" | "assistant"; content: string }> {
@@ -762,17 +1001,34 @@ export class CursorRequestParser {
       }
     }
 
+    const parsePayloadOrReferencedBlob = (payload: Uint8Array) => {
+      const decoded = this.decodeStateBytes(payload)
+      if (decoded) {
+        parseDecodedPayload(decoded)
+        const blobBytes = this.getStoredBlobBytes(decoded)
+        if (blobBytes) {
+          parseDecodedPayload(blobBytes.toString("utf8"))
+        }
+      }
+    }
+
     if (state.rootPromptMessagesJson?.length) {
       for (const payload of state.rootPromptMessagesJson) {
-        const decoded = this.decodeStateBytes(payload)
-        if (decoded) parseDecodedPayload(decoded)
+        parsePayloadOrReferencedBlob(payload)
       }
     }
 
     if (state.turns?.length) {
       for (const turn of state.turns) {
-        const decoded = this.decodeStateBytes(turn)
-        if (decoded) parseDecodedPayload(decoded)
+        const turnMessages =
+          this.extractMessagesFromConversationTurnReference(turn)
+        if (turnMessages.length > 0) {
+          for (const msg of turnMessages) {
+            pushDedup(msg)
+          }
+          continue
+        }
+        parsePayloadOrReferencedBlob(turn)
       }
     }
 
@@ -878,6 +1134,14 @@ export class CursorRequestParser {
         ) {
           this.logger.debug(
             `收到 conversationAction.triggeringUserInfo authId=${triggeringFields.triggeringAuthId || "(none)"} userId=${triggeringFields.triggeringUserId ?? "(none)"}`
+          )
+        }
+
+        if (message.value.action.case === "userMessageAction") {
+          this.logger.log("收到 conversationAction.userMessageAction")
+          return this.parseConversationUserMessageAction(
+            message.value.action.value,
+            triggeringFields
           )
         }
 
@@ -1233,6 +1497,106 @@ export class CursorRequestParser {
     }
   }
 
+  private parseConversationUserMessageAction(
+    action: UserMessageAction,
+    triggeringFields?: {
+      triggeringAuthId?: string
+      triggeringUserId?: number
+    }
+  ): ParsedCursorRequest | null {
+    void triggeringFields
+
+    const prompt = this.extractUserMessagePrompt(action.userMessage)
+    const attachedImages = this.extractAttachedImagesFromUserMessage(
+      action.userMessage
+    )
+
+    if (!prompt.trim() && attachedImages.length === 0) {
+      this.logger.debug("conversationAction.userMessageAction 中无有效 prompt")
+      return null
+    }
+
+    const conversation: Array<{
+      role: "user" | "assistant"
+      content: string
+    }> = []
+
+    for (const prepended of action.prependUserMessages || []) {
+      const text = this.extractUserMessagePrompt(prepended)
+      if (text.trim()) {
+        conversation.push({ role: "user", content: text })
+      }
+    }
+    if (prompt.trim()) {
+      conversation.push({ role: "user", content: prompt })
+    }
+
+    const requestContext = action.requestContext
+    let rootPath = ""
+    const directories: string[] = []
+    if (requestContext?.repositoryInfo?.length) {
+      for (const repo of requestContext.repositoryInfo) {
+        if (!repo.workspaceUri) continue
+        const path = repo.workspaceUri.replace(/^file:\/\//, "")
+        if (!rootPath) rootPath = path
+        if (!directories.includes(path)) directories.push(path)
+      }
+    }
+    if (!rootPath && requestContext?.gitRepos?.length) {
+      for (const git of requestContext.gitRepos) {
+        if (!git.path) continue
+        if (!rootPath) rootPath = git.path
+        if (!directories.includes(git.path)) directories.push(git.path)
+      }
+    }
+
+    const builtInToolCapabilityOptions = {
+      webSearchEnabled: requestContext?.webSearchEnabled,
+      webFetchEnabled: requestContext?.webFetchEnabled,
+      readLintsEnabled: requestContext?.readLintsEnabled,
+    }
+    const supportedTools = getDefaultAgentToolNames(
+      builtInToolCapabilityOptions
+    )
+    const useWeb =
+      requestContext?.webSearchEnabled === true ||
+      requestContext?.webFetchEnabled === true
+
+    this.logger.log(
+      `conversationAction.userMessageAction: prompt="${prompt.substring(0, 100)}...", ` +
+        `workspace=${rootPath || "(none)"}, tools=${supportedTools.length}, useWeb=${useWeb}`
+    )
+
+    return {
+      conversation,
+      newMessage: prompt,
+      model: "",
+      thinkingLevel: 0,
+      unifiedMode: "AGENT",
+      isAgentic: true,
+      supportedTools,
+      useWeb,
+      projectContext: rootPath
+        ? { rootPath, directories, files: [] }
+        : undefined,
+      requestContextEnv: requestContext?.env
+        ? {
+            terminalsFolder:
+              requestContext.env.terminalsFolder?.trim() || undefined,
+            projectFolder:
+              requestContext.env.projectFolder?.trim() || undefined,
+            shell: requestContext.env.shell?.trim() || undefined,
+            timeZone: requestContext.env.timeZone?.trim() || undefined,
+            agentTranscriptsFolder:
+              requestContext.env.agentTranscriptsFolder?.trim() || undefined,
+            artifactsFolder:
+              requestContext.env.artifactsFolder?.trim() || undefined,
+          }
+        : undefined,
+      attachedImages: attachedImages.length > 0 ? attachedImages : undefined,
+    }
+  }
+
   /**
    * 解析 AgentRunRequest → 提取 prompt、model、conversationId
    */
@@ -1244,11 +1608,24 @@ export class CursorRequestParser {
     let requestContext:
       | import("../../../gen/agent/v1_pb").RequestContext
       | undefined
+    const statePendingToolCallIds =
+      req.conversationState?.pendingToolCalls || []
+
+    if (req.preFetchedBlobs?.length) {
+      for (const blob of req.preFetchedBlobs) {
+        const blobId = this.decodeBlobId(blob.id)
+        if (blobId && blob.value?.length) {
+          this.kvStorageService.storeBinaryBlob(blobId, blob.value)
+        }
+      }
+      this.logger.debug(
+        `Stored ${req.preFetchedBlobs.length} preFetchedBlob(s) from AgentRunRequest`
+      )
+    }
+
     const stateHistory = this.extractConversationHistoryFromState(
       req.conversationState
     )
-    const statePendingToolCallIds =
-      req.conversationState?.pendingToolCalls || []
 
     // 附加图片
     const attachedImages: AttachedImage[] = []
@@ -1256,58 +1633,10 @@ export class CursorRequestParser {
     if (action && actionCase === "userMessageAction") {
       const userMsg: UserMessage | undefined = action.action.value.userMessage
       if (userMsg) {
-        prompt = userMsg.text
-
-        // 提取 selectedContext.selectedImages 中的图片数据
-        if (userMsg.selectedContext?.selectedImages?.length) {
-          for (const img of userMsg.selectedContext.selectedImages) {
-            const mimeType = img.mimeType || "image/png"
-            let base64Data: string | undefined
-
-            switch (img.dataOrBlobId.case) {
-              case "data":
-                base64Data = Buffer.from(img.dataOrBlobId.value).toString(
-                  "base64"
-                )
-                break
-              case "blobIdWithData": {
-                const blobId = this.decodeBlobId(img.dataOrBlobId.value.blobId)
-                base64Data = Buffer.from(img.dataOrBlobId.value.data).toString(
-                  "base64"
-                )
-                if (blobId) {
-                  this.kvStorageService.storeBlob(blobId, base64Data)
-                }
-                break
-              }
-              case "blobId": {
-                const blobId = this.decodeBlobId(img.dataOrBlobId.value)
-                base64Data = this.kvStorageService.getBlob(blobId)
-                if (!base64Data) {
-                  this.logger.error(
-                    `Image blob not found for selected image (uuid=${img.uuid}, blobId=${blobId})`
-                  )
-                }
-                break
-              }
-            }
-
-            if (base64Data) {
-              attachedImages.push({
-                data: base64Data,
-                mimeType,
-                width: img.dimension?.width,
-                height: img.dimension?.height,
-              })
-            }
-          }
-
-          if (attachedImages.length > 0) {
-            this.logger.log(
-              `Extracted ${attachedImages.length} image(s) from selectedContext (total ${attachedImages.reduce((sum, img) => sum + img.data.length, 0)} base64 chars)`
-            )
-          }
-        }
+        prompt = this.extractUserMessagePrompt(userMsg)
+        attachedImages.push(
+          ...this.extractAttachedImagesFromUserMessage(userMsg)
+        )
       }
       // 提取 requestContext（包含 workspace、rules 等信息）
       requestContext = action.action.value.requestContext
@@ -1794,6 +2123,16 @@ export class CursorRequestParser {
       )
     }
 
+    if (!prompt.trim() && attachedImages.length === 0 && !actionCase) {
+      const stateTail = stateHistory[stateHistory.length - 1]
+      if (stateTail?.role === "user" && stateTail.content.trim()) {
+        prompt = stateTail.content
+        this.logger.log(
+          `AgentRunRequest inferred prompt from conversation_state tail (${prompt.length} chars)`
+        )
+      }
+    }
+
     const hasUserInput = prompt.length > 0 || attachedImages.length > 0
 
     if (!hasUserInput) {
@@ -1848,6 +2187,55 @@ export class CursorRequestParser {
           requestContextEnv,
           isResumeAction: true,
           resumePendingToolCallIds: statePendingToolCallIds,
+          statePendingToolCallIds,
+          mcpToolDefs: mcpToolDefs.length > 0 ? mcpToolDefs : undefined,
+        }
+      }
+
+      if (
+        !actionCase &&
+        (conversationId ||
+          req.conversationState ||
+          requestedModelId ||
+          modelDetailsModelId)
+      ) {
+        this.logger.log(
+          `AgentRunRequest attach-only: conversationId=${conversationId || "(none)"}, model=${model}, ` +
+            `history=${stateHistory.length}, tools=${supportedTools.length}`
+        )
+        return {
+          conversation: stateHistory,
+          newMessage: "",
+          model,
+          thinkingLevel,
+          thinkingDetailsRequested,
+          unifiedMode: "AGENT",
+          isAgentic: true,
+          supportedTools,
+          useWeb,
+          conversationId,
+          projectContext: rootPath
+            ? { rootPath, directories, files: [] }
+            : undefined,
+          cursorRules,
+          selectedCursorRulePaths:
+            selectedCursorRulePaths.size > 0
+              ? Array.from(selectedCursorRulePaths)
+              : undefined,
+          selectedCursorRuleNames:
+            selectedCursorRuleNames.size > 0
+              ? Array.from(selectedCursorRuleNames)
+              : undefined,
+          cursorCommands:
+            cursorCommands.length > 0 ? cursorCommands : undefined,
+          customSystemPrompt: customSystemPrompt || undefined,
+          contextTokenLimit,
+          usedContextTokens,
+          requestedMaxOutputTokens,
+          requestedModelParameters,
+          requestContextEnv,
+          isAgentControlMessage: true,
+          agentControlType: "other",
           statePendingToolCallIds,
           mcpToolDefs: mcpToolDefs.length > 0 ? mcpToolDefs : undefined,
         }

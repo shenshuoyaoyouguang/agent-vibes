@@ -126,6 +126,14 @@ export interface BackgroundWorkerHostDeps {
       model: string
       toolNames: string[]
       abortSignal: AbortSignal
+      /**
+       * When true, the host strips tool definitions from the DTO and
+       * swaps the system addendum for a synthesis-only prompt. Used by
+       * the worker on its very last turn (after MAX_TURNS) to force the
+       * LLM to produce a final answer instead of another tool_use.
+       * See foreground sub-agent loop for the matching foreground path.
+       */
+      forceFinalSynthesis?: boolean
     }
   ): Promise<{
     fullText: string
@@ -460,9 +468,84 @@ export class SubagentBackgroundWorker {
       }
 
       if (turnCount >= MAX_TURNS && !errorMessage) {
-        finalText =
-          finalText ||
-          "[background sub-agent reached max turns without final answer]"
+        // Reached max turns. Run a final synthesis pass with no tools
+        // so the LLM produces an actual answer instead of looping on
+        // tool_use blocks the worker can no longer dispatch. Mirrors
+        // the foreground sub-agent path in cursor-connect-stream.
+        if (!abortController.signal.aborted) {
+          this.logger.log(
+            `[BackgroundSubAgent] ${agentId} reached MAX_TURNS=${MAX_TURNS}; ` +
+              `running final synthesis turn (no tools)`
+          )
+          messages.push({
+            role: "user",
+            content:
+              "You have reached your turn limit. Stop calling tools. " +
+              "Using only the tool_results already in this conversation, " +
+              "write a single final assistant message that synthesizes " +
+              "your findings into a clear answer. This is your last turn.",
+          })
+          this.transcriptStore.appendTranscript(agentId, {
+            ts: Date.now(),
+            kind: "turn_start",
+            data: {
+              turnIndex: turnCount + 1,
+              message: "synthesis turn (max turns reached)",
+            },
+          })
+          try {
+            const synthesisResult = await args.host.runSubAgentLlmTurn(
+              args.parentConversationId,
+              {
+                subagentId: agentId,
+                messages,
+                model: args.model,
+                toolNames: inlineToolNames,
+                abortSignal: abortController.signal,
+                forceFinalSynthesis: true,
+              }
+            )
+            if (!synthesisResult.error) {
+              const synthText = synthesisResult.fullText.trim()
+              if (synthText.length > 0) {
+                finalText = synthesisResult.fullText
+                messages.push({
+                  role: "assistant",
+                  content: synthesisResult.fullText,
+                })
+                this.transcriptStore.appendTranscript(agentId, {
+                  ts: Date.now(),
+                  kind: "assistant_text",
+                  data: { text: synthesisResult.fullText },
+                })
+                conversationSteps.push(
+                  args.host.buildAssistantStep(synthesisResult.fullText)
+                )
+              }
+            } else if (
+              synthesisResult.error === "aborted" ||
+              abortController.signal.aborted
+            ) {
+              terminalStatus = "killed"
+              errorMessage = "aborted by registry"
+            } else {
+              this.logger.warn(
+                `[BackgroundSubAgent] ${agentId} synthesis turn LLM error: ` +
+                  synthesisResult.error
+              )
+            }
+          } catch (synthesisErr) {
+            this.logger.warn(
+              `[BackgroundSubAgent] ${agentId} synthesis turn threw: ` +
+                String(synthesisErr)
+            )
+          }
+        }
+
+        if (!finalText) {
+          finalText =
+            "[background sub-agent reached max turns without final answer]"
+        }
       }
     } catch (error) {
       terminalStatus = "failed"

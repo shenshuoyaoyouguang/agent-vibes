@@ -24,6 +24,8 @@ interface TraceRecord {
   execId?: string
   toolCallId?: string
   modelCallId?: string
+  conversationId?: string
+  model?: string
   bytes?: number
   compressedBytes?: number
   context?: string
@@ -201,6 +203,16 @@ function summarizeClientMessage(
   }
 
   switch (msg.message.case) {
+    case "runRequest": {
+      const value = msg.message.value
+      record.nestedCase = value.action?.action.case || undefined
+      record.conversationId = value.conversationId || undefined
+      record.model =
+        value.requestedModel?.modelId ||
+        value.modelDetails?.modelId ||
+        undefined
+      break
+    }
     case "execClientMessage": {
       const value = msg.message.value
       record.nestedCase = value.message.case || undefined

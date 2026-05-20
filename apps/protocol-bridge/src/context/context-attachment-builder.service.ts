@@ -22,14 +22,21 @@ export interface ContextAttachmentSnapshot {
   }>
   todos: SessionTodoAttachmentLike[]
   investigationSummaries?: InvestigationMemorySummaryLike[]
-  activeSubAgent?: {
+  /**
+   * Snapshots of every foreground sub-agent currently running on the
+   * conversation. Multiple entries appear when the parent dispatched
+   * several `task` tool calls in the same batch (cf.
+   * `dispatchPreparedToolBatch`). Empty array when no sub-agent is
+   * active.
+   */
+  activeSubAgents?: Array<{
     subagentId: string
     model: string
     turnCount: number
     toolCallCount: number
     modifiedFiles: string[]
     pendingToolCallIds: string[]
-  }
+  }>
 }
 
 @Injectable()
@@ -164,34 +171,37 @@ export class ContextAttachmentBuilderService {
   private buildSubAgentAttachment(
     snapshot: ContextAttachmentSnapshot
   ): ContextProjectionAttachment | null {
-    const subAgent = snapshot.activeSubAgent
-    if (!subAgent) return null
+    const subAgents = snapshot.activeSubAgents
+    if (!subAgents || subAgents.length === 0) return null
 
-    const lines = [
-      `- Active sub-agent: ${subAgent.subagentId}`,
-      `- Model: ${subAgent.model}`,
-      `- Completed turns: ${subAgent.turnCount}`,
-      `- Tool calls: ${subAgent.toolCallCount}`,
-    ]
-
-    if (subAgent.pendingToolCallIds.length > 0) {
-      lines.push(
-        `- Waiting on tools: ${subAgent.pendingToolCallIds.join(", ")}`
-      )
+    const sections: string[] = []
+    for (const subAgent of subAgents) {
+      const lines = [
+        `- Sub-agent: ${subAgent.subagentId}`,
+        `- Model: ${subAgent.model}`,
+        `- Completed turns: ${subAgent.turnCount}`,
+        `- Tool calls: ${subAgent.toolCallCount}`,
+      ]
+      if (subAgent.pendingToolCallIds.length > 0) {
+        lines.push(
+          `- Waiting on tools: ${subAgent.pendingToolCallIds.join(", ")}`
+        )
+      }
+      if (subAgent.modifiedFiles.length > 0) {
+        lines.push(
+          ...subAgent.modifiedFiles
+            .slice(-10)
+            .map((filePath) => `- Modified file: ${filePath}`)
+        )
+      }
+      sections.push(lines.join("\n"))
     }
-    if (subAgent.modifiedFiles.length > 0) {
-      lines.push(
-        ...subAgent.modifiedFiles
-          .slice(-10)
-          .map((filePath) => `- Modified file: ${filePath}`)
-      )
-    }
 
-    return this.buildAttachment(
-      "sub_agent",
-      "Active Sub-Agent",
-      lines.join("\n")
-    )
+    const heading =
+      subAgents.length === 1
+        ? "Active Sub-Agent"
+        : `Active Sub-Agents (${subAgents.length})`
+    return this.buildAttachment("sub_agent", heading, sections.join("\n\n"))
   }
 
   private buildFileStatesAttachment(
