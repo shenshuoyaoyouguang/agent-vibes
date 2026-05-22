@@ -32,6 +32,7 @@ import {
   isMessageRecord,
   stripInternalContextEvents,
 } from "../../../context/context-transcript-events"
+import { ToolResultStorageService } from "../../../context/tool-result-storage.service"
 import type { BackendType } from "../../../llm/shared/model-router.service"
 import { PersistenceService } from "../../../persistence"
 import { ParsedCursorRequest } from "../tools/cursor-request-parser"
@@ -556,14 +557,15 @@ export interface ChatSession {
     attachmentFingerprint?: string
   }
 
-  // Tracks assistant tool batches that have been emitted but are not yet fully
-  // settled. Used to avoid continuing strict backends before the whole batch is
-  // closed, including inline-completed tools.
+  // Tracks the current assistant tool batch. Once the batch is settled, it is
+  // kept until the next batch starts so exactly one tool result can claim the
+  // follow-up continuation.
   activeAssistantToolBatch?: {
     id: string
     backend: BackendType
     toolCallIds: string[]
     unsettledToolCallIds: string[]
+    continuationClaimed?: boolean
   }
 }
 
@@ -870,7 +872,7 @@ interface PersistedTopLevelAgentTurnState {
 }
 
 interface PersistedChatSessionV1 {
-  version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11
+  version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13
   conversationId: string
   messages: SessionMessage[]
   messageRecords?: ContextTranscriptRecord[]
@@ -981,7 +983,10 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     session: ChatSession
   ) => void
 
-  constructor(private readonly persistence: PersistenceService) {}
+  constructor(
+    private readonly persistence: PersistenceService,
+    private readonly toolResultStorage: ToolResultStorageService
+  ) {}
 
   onModuleInit(): void {
     this.cleanupOldPersistedSessions()
@@ -1026,10 +1031,20 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     if (!this.persistence.isReady) return
     const cutoff = Date.now() - this.PERSISTED_SESSION_TTL_MS
     try {
+      const expiredRows = this.persistence
+        .prepare(
+          `SELECT conversation_id
+             FROM cursor_sessions
+            WHERE last_activity_at < ?`
+        )
+        .all(cutoff) as Array<{ conversation_id: string }>
       const result = this.persistence
         .prepare(`DELETE FROM cursor_sessions WHERE last_activity_at < ?`)
         .run(cutoff)
       if (result.changes > 0) {
+        for (const row of expiredRows) {
+          this.deleteToolResultStorage(row.conversation_id)
+        }
         this.logger.log(
           `Cleaned up ${result.changes} expired persisted session(s)`
         )
@@ -1123,6 +1138,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
 
       if (Date.now() - row.last_activity_at > this.PERSISTED_SESSION_TTL_MS) {
         this.deletePersistedSession(conversationId)
+        this.deleteToolResultStorage(conversationId)
         return undefined
       }
 
@@ -1151,6 +1167,16 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     } catch (error) {
       this.logger.error(
         `Failed to delete persisted session ${conversationId}: ${String(error)}`
+      )
+    }
+  }
+
+  private deleteToolResultStorage(conversationId: string): void {
+    try {
+      this.toolResultStorage.deleteConversation(conversationId)
+    } catch (error) {
+      this.logger.warn(
+        `Failed to delete stored tool results for ${conversationId}: ${String(error)}`
       )
     }
   }
@@ -1414,7 +1440,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
 
   private serializeSession(session: ChatSession): PersistedChatSessionV1 {
     return {
-      version: 11,
+      version: 13,
       conversationId: session.conversationId,
       messages: session.messages,
       messageRecords: session.messageRecords,
@@ -1616,36 +1642,64 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
   private buildRestartRecovery(
     persisted: PersistedChatSessionV1
   ): SessionRestartRecovery | undefined {
-    if (persisted.restartRecovery) {
-      return {
-        restoredAt: new Date(
-          this.toTimestamp(persisted.restartRecovery.restoredAt)
-        ),
-        notice: persisted.restartRecovery.notice,
-        interruptedToolCalls:
-          persisted.restartRecovery.interruptedToolCalls.map((toolCall) => ({
-            toolCallId: toolCall.toolCallId,
-            toolName: toolCall.toolName,
-            sentAt: new Date(this.toTimestamp(toolCall.sentAt)),
-          })),
-        interruptedInteractionQueryCount:
-          persisted.restartRecovery.interruptedInteractionQueryCount,
-        interruptedSubAgent: persisted.restartRecovery.interruptedSubAgent,
-      }
-    }
-
-    const interruptedToolCalls = Array.isArray(persisted.pendingToolCalls)
+    const pendingInterruptedToolCalls = Array.isArray(
+      persisted.pendingToolCalls
+    )
       ? persisted.pendingToolCalls.map((toolCall) => ({
           toolCallId: toolCall.toolCallId,
           toolName: toolCall.toolName,
           sentAt: new Date(this.toTimestamp(toolCall.sentAt)),
         }))
       : []
-    const interruptedInteractionQueryCount =
+    const pendingInteractionQueryCount =
       typeof persisted.pendingInteractionQueryCount === "number" &&
       persisted.pendingInteractionQueryCount > 0
         ? persisted.pendingInteractionQueryCount
         : 0
+
+    if (persisted.restartRecovery) {
+      const interruptedToolCalls =
+        persisted.restartRecovery.interruptedToolCalls.map((toolCall) => ({
+          toolCallId: toolCall.toolCallId,
+          toolName: toolCall.toolName,
+          sentAt: new Date(this.toTimestamp(toolCall.sentAt)),
+        }))
+      const knownInterruptedIds = new Set(
+        interruptedToolCalls.map((toolCall) => toolCall.toolCallId)
+      )
+      for (const pendingToolCall of pendingInterruptedToolCalls) {
+        if (knownInterruptedIds.has(pendingToolCall.toolCallId)) continue
+        interruptedToolCalls.push(pendingToolCall)
+      }
+
+      let notice = persisted.restartRecovery.notice
+      if (pendingInterruptedToolCalls.length > 0) {
+        const sampleNames = pendingInterruptedToolCalls
+          .slice(0, 3)
+          .map((toolCall) => toolCall.toolName || toolCall.toolCallId)
+        notice +=
+          `\nPending tool calls from the last saved stream were also interrupted: ` +
+          sampleNames.join(", ")
+        if (pendingInterruptedToolCalls.length > sampleNames.length) {
+          notice += `, +${pendingInterruptedToolCalls.length - sampleNames.length} more`
+        }
+      }
+
+      return {
+        restoredAt: new Date(
+          this.toTimestamp(persisted.restartRecovery.restoredAt)
+        ),
+        notice,
+        interruptedToolCalls,
+        interruptedInteractionQueryCount:
+          persisted.restartRecovery.interruptedInteractionQueryCount +
+          pendingInteractionQueryCount,
+        interruptedSubAgent: persisted.restartRecovery.interruptedSubAgent,
+      }
+    }
+
+    const interruptedToolCalls = pendingInterruptedToolCalls
+    const interruptedInteractionQueryCount = pendingInteractionQueryCount
     // Pick a representative interrupted sub-agent for the recovery
     // notice. New persistence schema uses `subAgentContexts: []` (one
     // entry per concurrent foreground sub-agent); legacy snapshots used
@@ -1743,6 +1797,8 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       toolResultReplacementState: {
         seenToolUseIds: [],
         replacementByToolUseId: {},
+        storedByToolUseId: {},
+        records: [],
       },
       nativeCacheEditState: {
         toolOrder: [],
@@ -2422,10 +2478,27 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
                               .replacementByToolUseId,
                           }
                         : {},
+                    storedByToolUseId:
+                      rawContextState.toolResultReplacementState
+                        .storedByToolUseId &&
+                      typeof rawContextState.toolResultReplacementState
+                        .storedByToolUseId === "object"
+                        ? {
+                            ...rawContextState.toolResultReplacementState
+                              .storedByToolUseId,
+                          }
+                        : {},
+                    records: Array.isArray(
+                      rawContextState.toolResultReplacementState.records
+                    )
+                      ? [...rawContextState.toolResultReplacementState.records]
+                      : [],
                   }
                 : {
                     seenToolUseIds: [],
                     replacementByToolUseId: {},
+                    storedByToolUseId: {},
+                    records: [],
                   },
             nativeCacheEditState: this.normalizeNativeCacheEditState(
               rawContextState.nativeCacheEditState
@@ -3912,6 +3985,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       backend,
       toolCallIds: [...normalizedToolCallIds],
       unsettledToolCallIds: [...normalizedToolCallIds],
+      continuationClaimed: false,
     }
     session.lastActivityAt = new Date()
     this.schedulePersist(conversationId)
@@ -3937,9 +4011,6 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     }
 
     batch.unsettledToolCallIds = nextUnsettled
-    if (batch.unsettledToolCallIds.length === 0) {
-      session.activeAssistantToolBatch = undefined
-    }
 
     session.lastActivityAt = new Date()
     this.schedulePersist(conversationId)
@@ -3957,6 +4028,25 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       session.activeAssistantToolBatch.backend === backend &&
       session.activeAssistantToolBatch.unsettledToolCallIds.length > 0
     )
+  }
+
+  claimAssistantToolBatchContinuation(
+    conversationId: string,
+    backend: BackendType,
+    toolCallId: string
+  ): boolean {
+    const session = this.getSession(conversationId)
+    const batch = session?.activeAssistantToolBatch
+    if (!session || !batch) return true
+    if (batch.backend !== backend) return true
+    if (!batch.toolCallIds.includes(toolCallId)) return true
+    if (batch.unsettledToolCallIds.length > 0) return false
+    if (batch.continuationClaimed) return false
+
+    batch.continuationClaimed = true
+    session.lastActivityAt = new Date()
+    this.schedulePersist(conversationId)
+    return true
   }
 
   getPendingToolCallIdsByStream(
@@ -4501,6 +4591,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     this.clearScheduledPersist(conversationId)
     this.sessions.delete(conversationId)
     this.deletePersistedSession(conversationId)
+    this.deleteToolResultStorage(conversationId)
     this.logger.log(`Deleted session: ${conversationId}`)
   }
 

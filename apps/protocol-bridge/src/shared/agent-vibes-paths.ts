@@ -36,6 +36,10 @@ export function getAgentVibesAccountsDir(): string {
   return path.join(getAgentVibesHome(), "data")
 }
 
+export function getAgentVibesToolResultsDir(): string {
+  return path.join(getAgentVibesHome(), "tool-results")
+}
+
 export function ensureAgentVibesDirs(): void {
   const dirs = [
     getAgentVibesHome(),
@@ -43,6 +47,7 @@ export function ensureAgentVibesDirs(): void {
     getAgentVibesLogsDir(),
     getAgentVibesCertsDir(),
     getAgentVibesAccountsDir(),
+    getAgentVibesToolResultsDir(),
   ]
   for (const dir of dirs) {
     if (!fs.existsSync(dir)) {

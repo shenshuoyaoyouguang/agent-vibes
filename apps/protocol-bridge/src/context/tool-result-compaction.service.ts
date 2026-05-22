@@ -525,10 +525,28 @@ export class ToolResultCompactionService {
     const nextReplacementByToolUseId = {
       ...(replacementState.replacementByToolUseId || {}),
     }
+    const nextRecords = [...(replacementState.records || [])]
     for (const [toolUseId, replacement] of replacementTextByToolUseId) {
       nextReplacementByToolUseId[toolUseId] = replacement
+      if (
+        !nextRecords.some(
+          (record) =>
+            record.kind === "tool-result" &&
+            record.toolUseId === toolUseId &&
+            record.replacement === replacement
+        )
+      ) {
+        nextRecords.push({
+          kind: "tool-result",
+          toolUseId,
+          replacement,
+          reason: "microcompact",
+          createdAt: Date.now(),
+        })
+      }
     }
     replacementState.replacementByToolUseId = nextReplacementByToolUseId
+    replacementState.records = nextRecords
   }
 
   private applyReplacements(

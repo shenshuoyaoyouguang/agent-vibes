@@ -35,7 +35,10 @@ export type {
   ContextCompactRunnerSummaryRequest,
   ContextCompactRunnerSummaryResult,
 } from "./context-compact-runner.service"
-export { ContextCompactionService } from "./context-compaction.service"
+export {
+  ContextCompactionService,
+  ContextProjectionBudgetExceededError,
+} from "./context-compaction.service"
 export type {
   ContextCompactionCandidate,
   ContextCompactionResult,
@@ -104,6 +107,11 @@ export type {
 export { normalizeToolProtocolMessages } from "./tool-protocol-normalizer"
 export type { ToolProtocolNormalizationResult } from "./tool-protocol-normalizer"
 export { ToolResultCompactionService } from "./tool-result-compaction.service"
+export { ToolResultStorageService } from "./tool-result-storage.service"
+export type {
+  ToolResultStorageReadChunkResult,
+  ToolResultStorageWriteResult,
+} from "./tool-result-storage.service"
 
 // Round-aware truncation helpers
 export {

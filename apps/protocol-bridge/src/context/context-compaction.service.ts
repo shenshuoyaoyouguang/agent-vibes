@@ -233,7 +233,22 @@ export class ContextCompactionService {
       integrityMode: options.integrityMode,
       pendingToolUseIds: options.pendingToolUseIds,
     })
-    const messageTokens = this.tokenCounter.countMessages(messages)
+    let finalMessages = messages
+    let messageTokens = this.tokenCounter.countMessages(finalMessages)
+    if (messageTokens > hardMaxTokens && !options.dryRun) {
+      const hardFit = this.buildHardFitProjection(
+        finalMessages,
+        hardMaxTokens,
+        options.integrityMode,
+        options.pendingToolUseIds
+      )
+      if (hardFit) {
+        finalMessages = hardFit.messages
+        projected = hardFit.projectedMessages
+        messageTokens = hardFit.estimatedTokens
+        snipCompaction = hardFit.snipCompaction
+      }
+    }
     if (messageTokens > hardMaxTokens) {
       this.telemetry.recordEvent({
         event: "compaction.projection_budget_exceeded",
@@ -251,7 +266,7 @@ export class ContextCompactionService {
     this.recordResultTelemetry(snipCompaction, microcompactCompaction)
 
     return {
-      messages,
+      messages: finalMessages,
       projectedMessages: projected,
       estimatedTokens: messageTokens,
       wasCompacted: !!appliedCompaction,
@@ -261,6 +276,81 @@ export class ContextCompactionService {
       nativeCacheEditCompaction,
       toolResultCompaction: microcompactCompaction,
     }
+  }
+
+  private buildHardFitProjection(
+    messages: UnifiedMessage[],
+    hardMaxTokens: number,
+    integrityMode?: "strict-adjacent" | "global",
+    pendingToolUseIds?: Iterable<string>
+  ):
+    | {
+        messages: UnifiedMessage[]
+        projectedMessages: ProjectedContextMessage[]
+        estimatedTokens: number
+        snipCompaction: ContextSnipCompactionResult
+      }
+    | undefined {
+    if (messages.length <= 1) return undefined
+
+    const targetTokens = Math.max(
+      this.MIN_REQUEST_BUDGET,
+      Math.floor(hardMaxTokens * 0.92)
+    )
+    const mode = integrityMode ?? "global"
+    const roundAlignedIndex =
+      this.toolIntegrity.findRoundAlignedTruncationPoint(
+        messages,
+        targetTokens,
+        {
+          mode,
+        }
+      )
+    const candidateIndexes = [
+      roundAlignedIndex,
+      this.toolIntegrity.findBudgetSafeTruncationPointWithIntegrity(
+        messages,
+        targetTokens,
+        { mode }
+      ),
+    ]
+
+    for (const truncationIndex of candidateIndexes) {
+      if (truncationIndex <= 0 || truncationIndex >= messages.length) {
+        continue
+      }
+
+      const candidate = this.toolIntegrity.sanitizeMessages(
+        messages.slice(truncationIndex),
+        {
+          mode,
+          pendingToolUseIds,
+        }
+      ).messages
+      if (candidate.length === 0) continue
+
+      const estimatedTokens = this.tokenCounter.countMessages(candidate)
+      if (estimatedTokens > hardMaxTokens) continue
+
+      return {
+        messages: candidate,
+        projectedMessages: candidate.map((message) => ({
+          role: message.role === "assistant" ? "assistant" : "user",
+          content: message.content,
+          source: "snip",
+        })),
+        estimatedTokens,
+        snipCompaction: {
+          changed: true,
+          removedRecords: truncationIndex,
+          retainedRecords: candidate.length,
+          summaryTokenCount: 0,
+          estimatedTokens,
+        },
+      }
+    }
+
+    return undefined
   }
 
   prepareCompactionCandidate(
@@ -906,6 +996,8 @@ export class ContextCompactionService {
       state.toolResultReplacementState = {
         seenToolUseIds: [],
         replacementByToolUseId: {},
+        storedByToolUseId: {},
+        records: [],
       }
     }
     this.nativeCacheEdits.reset(state)
@@ -962,6 +1054,10 @@ export class ContextCompactionService {
             replacementByToolUseId: {
               ...state.toolResultReplacementState.replacementByToolUseId,
             },
+            storedByToolUseId: {
+              ...(state.toolResultReplacementState.storedByToolUseId || {}),
+            },
+            records: [...(state.toolResultReplacementState.records || [])],
           }
         : undefined,
       nativeCacheEditState: state.nativeCacheEditState

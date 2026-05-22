@@ -264,6 +264,16 @@ export class MessagesService implements OnModuleInit {
     return route.backend === "google" || route.backend === "google-claude"
   }
 
+  private getToolIntegrityModeForRoute(
+    route: ModelRouteResult
+  ): "strict-adjacent" | "global" {
+    return this.isGoogleBackend(route) ||
+      route.backend === "kiro" ||
+      route.backend === "claude-api"
+      ? "strict-adjacent"
+      : "global"
+  }
+
   private normalizePositiveInteger(value: unknown): number | undefined {
     if (typeof value !== "number") return undefined
     if (!Number.isFinite(value) || value <= 0) return undefined
@@ -348,6 +358,7 @@ export class MessagesService implements OnModuleInit {
       this.EMPTY_ATTACHMENT_SNAPSHOT,
       budget,
       {
+        integrityMode: this.getToolIntegrityModeForRoute(route),
         pendingToolUseIds: dto._pendingToolUseIds,
         strategy: "auto",
       }

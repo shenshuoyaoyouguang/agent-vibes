@@ -238,9 +238,35 @@ export interface ContextCompactionBasis {
   epoch: number
 }
 
+export interface ContextStoredToolResultReference {
+  toolUseId: string
+  documentId: string
+  relativePath: string
+  toolName: string
+  originalSizeChars: number
+  originalLineCount: number
+  previewChars: number
+  chunkSize: number
+  chunkCount: number
+  contentType: "text" | "json"
+  sha256: string
+  createdAt: number
+}
+
+export interface ContextToolResultReplacementRecord {
+  kind: "tool-result"
+  toolUseId: string
+  replacement: string
+  documentId?: string
+  reason?: "per_tool" | "aggregate" | "empty" | "microcompact"
+  createdAt: number
+}
+
 export interface ContextToolResultReplacementState {
   seenToolUseIds: string[]
   replacementByToolUseId: Record<string, string>
+  storedByToolUseId?: Record<string, ContextStoredToolResultReference>
+  records?: ContextToolResultReplacementRecord[]
 }
 
 export interface ContextNativeCacheEditPin {

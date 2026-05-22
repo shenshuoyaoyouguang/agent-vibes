@@ -414,6 +414,8 @@ export class ContextManagerService {
       toolResultReplacementState: {
         seenToolUseIds: [],
         replacementByToolUseId: {},
+        storedByToolUseId: {},
+        records: [],
       },
       nativeCacheEditState: {
         toolOrder: [],

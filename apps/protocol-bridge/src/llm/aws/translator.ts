@@ -20,6 +20,7 @@ import type {
   KiroToolUse,
   KiroToolWrapper,
   KiroUserInputMessage,
+  KiroUserInputMessageContext,
 } from "./protocol-types"
 
 // ── Model name mapping (long key first to avoid prefix collisions) ──
@@ -179,8 +180,17 @@ export function claudeToKiro(
     }
   }
 
-  // Drop leading assistant turns; Kiro requires history to start with a user.
-  const trimmedHistory = trimLeadingAssistantHistory(history)
+  // Drop / repair protocol-invalid history before Kiro schema validation.
+  // Kiro is stricter than Anthropic here: a history toolResult must belong to
+  // the immediately preceding assistant toolUse, and history cannot start with
+  // orphaned toolResults from a truncated transcript.
+  const trimmedHistory = sanitizeKiroHistoryToolAdjacency(
+    trimLeadingAssistantHistory(history)
+  )
+  const safeCurrentToolResults = sanitizeCurrentToolResultsForHistory(
+    currentToolResults,
+    trimmedHistory
+  )
 
   // currentMessage.content 拼装：
   //   - 文本消息：(可选 SYSTEM PROMPT) + 用户文本
@@ -188,7 +198,7 @@ export function claudeToKiro(
   //   - 仅 image：图片占位说明
   //   - 其它：占位 "."
   let finalContent: string
-  if (currentToolResults.length > 0 && !currentContent) {
+  if (safeCurrentToolResults.length > 0 && !currentContent) {
     // 仅 tool_result 的延续请求。content 必须为空，
     // tool_result 文本完全靠 userInputMessageContext.toolResults 承载。
     finalContent = ""
@@ -220,7 +230,8 @@ export function claudeToKiro(
   // we infer from tool presence (matches the official Kiro client, which only
   // emits agentTaskType / agentContinuationId in its agent-mode path).
   const isAgentMode =
-    options.agentMode ?? (kiroTools.length > 0 || currentToolResults.length > 0)
+    options.agentMode ??
+    (kiroTools.length > 0 || safeCurrentToolResults.length > 0)
 
   const payload: KiroPayload = {
     conversationState: {
@@ -249,10 +260,10 @@ export function claudeToKiro(
   }
 
   // 字段顺序与抓包一致：toolResults 在 tools 之前。
-  if (kiroTools.length > 0 || currentToolResults.length > 0) {
+  if (kiroTools.length > 0 || safeCurrentToolResults.length > 0) {
     const ctx: NonNullable<KiroUserInputMessage["userInputMessageContext"]> = {}
-    if (currentToolResults.length > 0) {
-      ctx.toolResults = currentToolResults
+    if (safeCurrentToolResults.length > 0) {
+      ctx.toolResults = safeCurrentToolResults
     }
     if (kiroTools.length > 0) {
       ctx.tools = kiroTools
@@ -461,6 +472,127 @@ function trimLeadingAssistantHistory(
   if (idx === 0) return history
   if (idx >= history.length) return []
   return history.slice(idx)
+}
+
+function sanitizeKiroHistoryToolAdjacency(
+  history: KiroHistoryMessage[]
+): KiroHistoryMessage[] {
+  const output: KiroHistoryMessage[] = []
+
+  for (const entry of history) {
+    if (entry.assistantResponseMessage) {
+      if (output.length === 0) {
+        continue
+      }
+      output.push(entry)
+      continue
+    }
+
+    const user = entry.userInputMessage
+    if (!user) continue
+
+    const previousAssistant =
+      output[output.length - 1]?.assistantResponseMessage
+    const allowedToolUseIds = new Set(
+      (previousAssistant?.toolUses || [])
+        .map((toolUse) => toolUse.toolUseId)
+        .filter((id) => id.length > 0)
+    )
+    const sanitizedUser = sanitizeKiroUserToolResults(user, allowedToolUseIds)
+    if (!sanitizedUser) continue
+
+    output.push({ userInputMessage: sanitizedUser })
+  }
+
+  return output
+}
+
+function sanitizeKiroUserToolResults(
+  user: KiroUserInputMessage,
+  allowedToolUseIds: ReadonlySet<string>
+): KiroUserInputMessage | undefined {
+  const context = user.userInputMessageContext
+  const toolResults = context?.toolResults || []
+  let nextContext: KiroUserInputMessageContext | undefined = context
+    ? { ...context }
+    : undefined
+
+  if (toolResults.length > 0 || allowedToolUseIds.size > 0) {
+    const filteredToolResults =
+      allowedToolUseIds.size > 0
+        ? toolResults.filter((result) =>
+            allowedToolUseIds.has(result.toolUseId)
+          )
+        : []
+    const existingIds = new Set(
+      filteredToolResults.map((result) => result.toolUseId)
+    )
+    const syntheticMissingResults = [...allowedToolUseIds]
+      .filter((toolUseId) => !existingIds.has(toolUseId))
+      .map(createSyntheticInterruptedKiroToolResult)
+    const nextToolResults = [...filteredToolResults, ...syntheticMissingResults]
+
+    nextContext = nextContext || {}
+    if (nextToolResults.length > 0) {
+      nextContext.toolResults = nextToolResults
+    } else {
+      delete nextContext.toolResults
+    }
+    if (!nextContext.tools?.length && !nextContext.toolResults?.length) {
+      nextContext = undefined
+    }
+  }
+
+  const sanitized: KiroUserInputMessage = {
+    ...user,
+    ...(nextContext ? { userInputMessageContext: nextContext } : {}),
+  }
+  if (!nextContext) {
+    delete sanitized.userInputMessageContext
+  }
+
+  if (!hasKiroUserPayload(sanitized)) {
+    return undefined
+  }
+  return sanitized
+}
+
+function sanitizeCurrentToolResultsForHistory(
+  toolResults: KiroToolResult[],
+  history: KiroHistoryMessage[]
+): KiroToolResult[] {
+  if (toolResults.length === 0) return toolResults
+  const lastAssistant = [...history]
+    .reverse()
+    .find((entry) => entry.assistantResponseMessage)?.assistantResponseMessage
+  const allowedToolUseIds = new Set(
+    (lastAssistant?.toolUses || [])
+      .map((toolUse) => toolUse.toolUseId)
+      .filter((id) => id.length > 0)
+  )
+  if (allowedToolUseIds.size === 0) return []
+  return toolResults.filter((result) => allowedToolUseIds.has(result.toolUseId))
+}
+
+function createSyntheticInterruptedKiroToolResult(
+  toolUseId: string
+): KiroToolResult {
+  return {
+    toolUseId,
+    content: [
+      {
+        text: "Tool execution was interrupted or result was lost due to context truncation.",
+      },
+    ],
+    status: "error",
+  }
+}
+
+function hasKiroUserPayload(user: KiroUserInputMessage): boolean {
+  if ((user.content || "").trim().length > 0) return true
+  if ((user.images || []).length > 0) return true
+  if ((user.userInputMessageContext?.toolResults || []).length > 0) return true
+  return false
 }
 
 function normalizeUserContent(

@@ -1,0 +1,380 @@
+import { Injectable, Logger } from "@nestjs/common"
+import * as crypto from "crypto"
+import * as fs from "fs"
+import * as path from "path"
+import { getAgentVibesToolResultsDir } from "../shared/agent-vibes-paths"
+import type {
+  ContextStoredToolResultReference,
+  ContextToolResultReplacementState,
+} from "./types"
+
+export interface ToolResultStorageWriteResult {
+  replacement: string
+  reference: ContextStoredToolResultReference
+}
+
+export type ToolResultStorageReadChunkResult =
+  | {
+      status: "success"
+      reference: ContextStoredToolResultReference
+      chunk: string
+      chunkNumber: number
+      chunkCount: number
+      nextPosition?: number
+    }
+  | {
+      status: "not_found"
+      documentId: string
+    }
+  | {
+      status: "position_out_of_range"
+      documentId: string
+      requestedPosition: number
+      chunkCount: number
+    }
+
+@Injectable()
+export class ToolResultStorageService {
+  private readonly logger = new Logger(ToolResultStorageService.name)
+  private readonly CHUNK_SIZE = 4_000
+  private readonly PREVIEW_CHARS = 4_000
+  private readonly METADATA_SUFFIX = ".metadata.json"
+
+  isToolResultDocumentId(documentId: string): boolean {
+    return documentId.startsWith("tool_result:")
+  }
+
+  buildDocumentId(toolUseId: string): string {
+    return `tool_result:${toolUseId}`
+  }
+
+  store(
+    conversationId: string,
+    toolUseId: string,
+    toolName: string,
+    content: string,
+    replacementState?: ContextToolResultReplacementState,
+    options?: { reason?: "per_tool" | "aggregate" }
+  ): ToolResultStorageWriteResult {
+    const storageRoot = this.getStorageRoot()
+    const safeConversationId = this.sanitizePathSegment(conversationId)
+    const safeToolUseId = this.sanitizePathSegment(toolUseId)
+    const contentType = this.detectContentType(content)
+    const extension = contentType === "json" ? "json" : "txt"
+    const relativePath = path.join(
+      safeConversationId,
+      `${safeToolUseId}.${extension}`
+    )
+    const absolutePath = path.join(storageRoot, relativePath)
+    const metadataPath = this.metadataPathForContentPath(absolutePath)
+    const createdAt = Date.now()
+    const reference: ContextStoredToolResultReference = {
+      toolUseId,
+      documentId: this.buildDocumentId(toolUseId),
+      relativePath,
+      toolName,
+      originalSizeChars: content.length,
+      originalLineCount: this.countLines(content),
+      previewChars: Math.min(this.PREVIEW_CHARS, content.length),
+      chunkSize: this.CHUNK_SIZE,
+      chunkCount: Math.max(1, Math.ceil(content.length / this.CHUNK_SIZE)),
+      contentType,
+      sha256: crypto.createHash("sha256").update(content).digest("hex"),
+      createdAt,
+    }
+
+    fs.mkdirSync(path.dirname(absolutePath), { recursive: true })
+    this.writeFileAtomic(absolutePath, content)
+    this.writeFileAtomic(metadataPath, JSON.stringify(reference, null, 2))
+
+    const replacement = this.buildReplacementText(
+      reference,
+      absolutePath,
+      content.slice(0, reference.previewChars)
+    )
+    this.recordReplacement(
+      replacementState,
+      toolUseId,
+      replacement,
+      reference,
+      options?.reason
+    )
+    return { replacement, reference }
+  }
+
+  readChunk(
+    conversationId: string,
+    documentId: string,
+    requestedPosition: number,
+    storedByToolUseId?: Record<string, ContextStoredToolResultReference>
+  ): ToolResultStorageReadChunkResult {
+    if (!this.isToolResultDocumentId(documentId)) {
+      return { status: "not_found", documentId }
+    }
+
+    const toolUseId = documentId.slice("tool_result:".length)
+    const reference =
+      storedByToolUseId?.[toolUseId] ||
+      this.resolveStoredReference(conversationId, toolUseId)
+    if (!reference) {
+      return { status: "not_found", documentId }
+    }
+
+    const absolutePath = this.pathForReference(reference)
+    if (!absolutePath || !fs.existsSync(absolutePath)) {
+      return { status: "not_found", documentId }
+    }
+
+    const content = fs.readFileSync(absolutePath, "utf8")
+    const chunkSize = Math.max(1, reference.chunkSize || this.CHUNK_SIZE)
+    const chunkCount = Math.max(1, Math.ceil(content.length / chunkSize))
+    const chunkIndex = requestedPosition <= 0 ? 0 : requestedPosition - 1
+    if (chunkIndex < 0 || chunkIndex >= chunkCount) {
+      return {
+        status: "position_out_of_range",
+        documentId,
+        requestedPosition,
+        chunkCount,
+      }
+    }
+
+    const chunkNumber = chunkIndex + 1
+    return {
+      status: "success",
+      reference: {
+        ...reference,
+        chunkCount,
+        originalSizeChars: content.length,
+        originalLineCount: this.countLines(content),
+      },
+      chunk: content.slice(
+        chunkIndex * chunkSize,
+        (chunkIndex + 1) * chunkSize
+      ),
+      chunkNumber,
+      chunkCount,
+      nextPosition: chunkNumber < chunkCount ? chunkNumber + 1 : undefined,
+    }
+  }
+
+  deleteConversation(conversationId: string): void {
+    const safeConversationId = this.sanitizePathSegment(conversationId)
+    fs.rmSync(path.join(this.getStorageRoot(), safeConversationId), {
+      recursive: true,
+      force: true,
+    })
+  }
+
+  private getStorageRoot(): string {
+    return getAgentVibesToolResultsDir()
+  }
+
+  private sanitizePathSegment(value: string): string {
+    const sanitized = value.replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 180)
+    if (sanitized.length > 0) {
+      return sanitized
+    }
+    return crypto.createHash("sha256").update(value).digest("hex").slice(0, 24)
+  }
+
+  private detectContentType(content: string): "text" | "json" {
+    const trimmed = content.trim()
+    if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
+      return "text"
+    }
+    try {
+      JSON.parse(trimmed)
+      return "json"
+    } catch {
+      return "text"
+    }
+  }
+
+  private countLines(content: string): number {
+    if (content.length === 0) return 0
+    return content.split(/\r?\n/).length
+  }
+
+  private writeFileAtomic(filePath: string, content: string): void {
+    const tempPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`
+    fs.writeFileSync(tempPath, content, "utf8")
+    fs.renameSync(tempPath, filePath)
+  }
+
+  private metadataPathForContentPath(contentPath: string): string {
+    return `${contentPath}${this.METADATA_SUFFIX}`
+  }
+
+  private pathForReference(
+    reference: ContextStoredToolResultReference
+  ): string | undefined {
+    const storageRoot = this.getStorageRoot()
+    const absolutePath = path.resolve(storageRoot, reference.relativePath)
+    const relative = path.relative(storageRoot, absolutePath)
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+      this.logger.warn(
+        `Rejected tool result reference outside storage root: ${reference.relativePath}`
+      )
+      return undefined
+    }
+    return absolutePath
+  }
+
+  private resolveStoredReference(
+    conversationId: string,
+    toolUseId: string
+  ): ContextStoredToolResultReference | undefined {
+    const safeConversationId = this.sanitizePathSegment(conversationId)
+    const safeToolUseId = this.sanitizePathSegment(toolUseId)
+    for (const extension of ["txt", "json"]) {
+      const contentPath = path.join(
+        this.getStorageRoot(),
+        safeConversationId,
+        `${safeToolUseId}.${extension}`
+      )
+      if (!fs.existsSync(contentPath)) continue
+
+      const metadataPath = this.metadataPathForContentPath(contentPath)
+      const metadata = this.readMetadata(metadataPath)
+      if (metadata) return metadata
+
+      const content = fs.readFileSync(contentPath, "utf8")
+      return {
+        toolUseId,
+        documentId: this.buildDocumentId(toolUseId),
+        relativePath: path.join(
+          safeConversationId,
+          `${safeToolUseId}.${extension}`
+        ),
+        toolName: "unknown_tool",
+        originalSizeChars: content.length,
+        originalLineCount: this.countLines(content),
+        previewChars: Math.min(this.PREVIEW_CHARS, content.length),
+        chunkSize: this.CHUNK_SIZE,
+        chunkCount: Math.max(1, Math.ceil(content.length / this.CHUNK_SIZE)),
+        contentType: extension === "json" ? "json" : "text",
+        sha256: crypto.createHash("sha256").update(content).digest("hex"),
+        createdAt: 0,
+      }
+    }
+    return undefined
+  }
+
+  private readMetadata(
+    metadataPath: string
+  ): ContextStoredToolResultReference | undefined {
+    try {
+      const parsed = JSON.parse(
+        fs.readFileSync(metadataPath, "utf8")
+      ) as Partial<ContextStoredToolResultReference>
+      if (
+        typeof parsed.toolUseId === "string" &&
+        typeof parsed.documentId === "string" &&
+        typeof parsed.relativePath === "string"
+      ) {
+        return {
+          toolUseId: parsed.toolUseId,
+          documentId: parsed.documentId,
+          relativePath: parsed.relativePath,
+          toolName:
+            typeof parsed.toolName === "string"
+              ? parsed.toolName
+              : "unknown_tool",
+          originalSizeChars:
+            typeof parsed.originalSizeChars === "number"
+              ? parsed.originalSizeChars
+              : 0,
+          originalLineCount:
+            typeof parsed.originalLineCount === "number"
+              ? parsed.originalLineCount
+              : 0,
+          previewChars:
+            typeof parsed.previewChars === "number"
+              ? parsed.previewChars
+              : this.PREVIEW_CHARS,
+          chunkSize:
+            typeof parsed.chunkSize === "number"
+              ? parsed.chunkSize
+              : this.CHUNK_SIZE,
+          chunkCount:
+            typeof parsed.chunkCount === "number" ? parsed.chunkCount : 1,
+          contentType: parsed.contentType === "json" ? "json" : "text",
+          sha256: typeof parsed.sha256 === "string" ? parsed.sha256 : "",
+          createdAt:
+            typeof parsed.createdAt === "number" ? parsed.createdAt : 0,
+        }
+      }
+    } catch {
+      return undefined
+    }
+    return undefined
+  }
+
+  private buildReplacementText(
+    reference: ContextStoredToolResultReference,
+    absolutePath: string,
+    preview: string
+  ): string {
+    const lines = [
+      "[tool_result stored]",
+      `Tool: ${reference.toolName}`,
+      `DocumentId: ${reference.documentId}`,
+      `StoredPath: ${absolutePath}`,
+      `OriginalSize: ${reference.originalSizeChars} chars, ${reference.originalLineCount} lines`,
+      `Sha256: ${reference.sha256}`,
+      `Chunk: 1/${reference.chunkCount}`,
+    ]
+
+    if (reference.chunkCount > 1) {
+      lines.push(
+        `Use view_content_chunk with document_id="${reference.documentId}" and position=2..${reference.chunkCount} to continue reading. Positions are 1-based; position=0 also returns the first chunk.`
+      )
+    }
+
+    lines.push("", "Preview:", preview || "[empty tool result]")
+    return lines.join("\n")
+  }
+
+  private recordReplacement(
+    replacementState: ContextToolResultReplacementState | undefined,
+    toolUseId: string,
+    replacement: string,
+    reference: ContextStoredToolResultReference,
+    reason: "per_tool" | "aggregate" | undefined
+  ): void {
+    if (!replacementState) return
+
+    const seen = new Set(replacementState.seenToolUseIds || [])
+    seen.add(toolUseId)
+    replacementState.seenToolUseIds = Array.from(seen)
+    replacementState.replacementByToolUseId = {
+      ...(replacementState.replacementByToolUseId || {}),
+      [toolUseId]: replacement,
+    }
+    replacementState.storedByToolUseId = {
+      ...(replacementState.storedByToolUseId || {}),
+      [toolUseId]: reference,
+    }
+    const existingRecords = replacementState.records || []
+    if (
+      !existingRecords.some(
+        (record) =>
+          record.kind === "tool-result" &&
+          record.toolUseId === toolUseId &&
+          record.replacement === replacement
+      )
+    ) {
+      replacementState.records = [
+        ...existingRecords,
+        {
+          kind: "tool-result",
+          toolUseId,
+          replacement,
+          documentId: reference.documentId,
+          reason,
+          createdAt: reference.createdAt,
+        },
+      ]
+    }
+  }
+}

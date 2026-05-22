@@ -426,6 +426,10 @@ type ParsedBackgroundTaskCompletion = NonNullable<
   ParsedCursorRequest["agentControlBackgroundTaskCompletions"]
 >[number]
 
+type ParsedAsyncAskCompletion = NonNullable<
+  ParsedCursorRequest["agentControlAsyncAskCompletion"]
+>
+
 function normalizeBackgroundTaskCompletions(
   raw: unknown
 ): ParsedBackgroundTaskCompletion[] {
@@ -454,6 +458,127 @@ function normalizeBackgroundTaskCompletions(
     })
   }
   return completions
+}
+
+function summarizeBackgroundTaskCompletionsForLog(
+  completions: ParsedBackgroundTaskCompletion[]
+): string {
+  const rendered = completions
+    .map((completion) => {
+      const fields = [
+        `taskId=${completion.taskId}`,
+        completion.kind !== undefined ? `kind=${completion.kind}` : "",
+        completion.status !== undefined ? `status=${completion.status}` : "",
+        completion.reason !== undefined ? `reason=${completion.reason}` : "",
+        completion.title ? `title=${completion.title}` : "",
+        completion.detail ? `detail=${completion.detail}` : "",
+        completion.outputPath ? `outputPath=${completion.outputPath}` : "",
+        completion.threadId ? `threadId=${completion.threadId}` : "",
+      ].filter(Boolean)
+      return `{${fields.join(", ")}}`
+    })
+    .join("; ")
+  return rendered.length > 800 ? `${rendered.slice(0, 800)}…` : rendered
+}
+
+function normalizeAsyncAskQuestionCompletionAction(
+  raw: unknown
+): ParsedAsyncAskCompletion | undefined {
+  if (!raw || typeof raw !== "object") return undefined
+  const asyncAction = raw as {
+    originalToolCallId?: string
+    originalArgs?: {
+      questions?: Array<{
+        id?: string
+        prompt?: string
+        question?: string
+        text?: string
+      }>
+      title?: string
+    }
+    result?: {
+      result?: {
+        case?: string
+        value?: unknown
+      }
+    }
+  }
+
+  const originalQuestionText = (() => {
+    const args = asyncAction.originalArgs
+    if (!args) return undefined
+    const parts: string[] = []
+    if (args.title) parts.push(args.title)
+    if (Array.isArray(args.questions)) {
+      for (const q of args.questions) {
+        const text = q.prompt || q.question || q.text || ""
+        if (text) parts.push(text)
+      }
+    }
+    const joined = parts.join(" / ").trim()
+    return joined || undefined
+  })()
+
+  const innerResult = asyncAction.result?.result
+  const innerCase = innerResult?.case
+  let resultCase: ParsedAsyncAskCompletion["resultCase"] = "unknown"
+  let answers: ParsedAsyncAskCompletion["answers"]
+  let rejectedReason: string | undefined
+  let errorMessage: string | undefined
+
+  if (innerCase === "success") {
+    resultCase = "success"
+    const successValue = innerResult?.value as
+      | {
+          answers?: Array<{
+            questionId?: string
+            selectedOptionIds?: string[]
+            freeformText?: string
+          }>
+        }
+      | undefined
+    if (Array.isArray(successValue?.answers)) {
+      answers = successValue.answers.map((a) => ({
+        questionId: a?.questionId || "",
+        selectedOptionIds: Array.isArray(a?.selectedOptionIds)
+          ? a.selectedOptionIds.filter(
+              (id): id is string => typeof id === "string"
+            )
+          : [],
+        freeformText:
+          typeof a?.freeformText === "string" && a.freeformText.length > 0
+            ? a.freeformText
+            : undefined,
+      }))
+    }
+  } else if (innerCase === "rejected") {
+    resultCase = "rejected"
+    const rejectedValue = innerResult?.value as { reason?: string } | undefined
+    rejectedReason =
+      typeof rejectedValue?.reason === "string"
+        ? rejectedValue.reason
+        : undefined
+  } else if (innerCase === "error") {
+    resultCase = "error"
+    const errorValue = innerResult?.value as
+      | { errorMessage?: string }
+      | undefined
+    errorMessage =
+      typeof errorValue?.errorMessage === "string"
+        ? errorValue.errorMessage
+        : undefined
+  } else if (innerCase === "async") {
+    resultCase = "async"
+  }
+
+  return {
+    originalToolCallId: asyncAction.originalToolCallId || "",
+    originalQuestionText,
+    resultCase,
+    answers,
+    rejectedReason,
+    errorMessage,
+  }
 }
 
 /**
@@ -1321,122 +1446,17 @@ export class CursorRequestParser {
           return makeControlMessage("executePlanAction", triggeringFields)
         }
         if (message.value.action.case === "asyncAskQuestionCompletionAction") {
-          const asyncAction = message.value.action.value as {
-            originalToolCallId?: string
-            originalArgs?: {
-              questions?: Array<{
-                id?: string
-                prompt?: string
-                question?: string
-                text?: string
-              }>
-              title?: string
-            }
-            result?: {
-              result?: {
-                case?: string
-                value?: unknown
-              }
-            }
-          }
-
-          // 把原始问题文本拼一行，方便回写到 user message。
-          const originalQuestionText = (() => {
-            const args = asyncAction.originalArgs
-            if (!args) return undefined
-            const parts: string[] = []
-            if (args.title) parts.push(args.title)
-            if (Array.isArray(args.questions)) {
-              for (const q of args.questions) {
-                const text = q.prompt || q.question || q.text || ""
-                if (text) parts.push(text)
-              }
-            }
-            const joined = parts.join(" / ").trim()
-            return joined || undefined
-          })()
-
-          const innerResult = asyncAction.result?.result
-          const innerCase = innerResult?.case
-          let resultCase:
-            | "success"
-            | "rejected"
-            | "error"
-            | "async"
-            | "unknown" = "unknown"
-          let answers:
-            | Array<{
-                questionId: string
-                selectedOptionIds: string[]
-                freeformText?: string
-              }>
-            | undefined
-          let rejectedReason: string | undefined
-          let errorMessage: string | undefined
-
-          if (innerCase === "success") {
-            resultCase = "success"
-            const successValue = innerResult?.value as
-              | {
-                  answers?: Array<{
-                    questionId?: string
-                    selectedOptionIds?: string[]
-                    freeformText?: string
-                  }>
-                }
-              | undefined
-            if (Array.isArray(successValue?.answers)) {
-              answers = successValue.answers.map((a) => ({
-                questionId: a?.questionId || "",
-                selectedOptionIds: Array.isArray(a?.selectedOptionIds)
-                  ? a.selectedOptionIds.filter(
-                      (id): id is string => typeof id === "string"
-                    )
-                  : [],
-                freeformText:
-                  typeof a?.freeformText === "string" &&
-                  a.freeformText.length > 0
-                    ? a.freeformText
-                    : undefined,
-              }))
-            }
-          } else if (innerCase === "rejected") {
-            resultCase = "rejected"
-            const rejectedValue = innerResult?.value as
-              | { reason?: string }
-              | undefined
-            rejectedReason =
-              typeof rejectedValue?.reason === "string"
-                ? rejectedValue.reason
-                : undefined
-          } else if (innerCase === "error") {
-            resultCase = "error"
-            const errorValue = innerResult?.value as
-              | { errorMessage?: string }
-              | undefined
-            errorMessage =
-              typeof errorValue?.errorMessage === "string"
-                ? errorValue.errorMessage
-                : undefined
-          } else if (innerCase === "async") {
-            // IDE 不应该回送嵌套 async，但保留以防协议兼容性。
-            resultCase = "async"
-          }
+          const completion = normalizeAsyncAskQuestionCompletionAction(
+            message.value.action.value
+          )
 
           this.logger.log(
-            `收到 conversationAction.asyncAskQuestionCompletionAction toolCallId=${asyncAction.originalToolCallId || "(none)"} case=${resultCase} answers=${answers?.length ?? 0}`
+            `收到 conversationAction.asyncAskQuestionCompletionAction toolCallId=${completion?.originalToolCallId || "(none)"} case=${completion?.resultCase || "unknown"} answers=${completion?.answers?.length ?? 0}`
           )
           return makeControlMessage("asyncAskQuestionCompletionAction", {
             ...triggeringFields,
-            toolCallId: asyncAction.originalToolCallId || "",
-            asyncAskCompletion: {
-              originalToolCallId: asyncAction.originalToolCallId || "",
-              originalQuestionText,
-              resultCase,
-              answers,
-              rejectedReason,
-              errorMessage,
-            },
+            toolCallId: completion?.originalToolCallId || "",
+            asyncAskCompletion: completion,
           })
         }
         if (message.value.action.case === "cancelSubagentAction") {
@@ -1459,7 +1479,7 @@ export class CursorRequestParser {
             bgTask.completions
           )
           this.logger.log(
-            `收到 conversationAction.backgroundTaskCompletionAction completions=${completions.length}`
+            `收到 conversationAction.backgroundTaskCompletionAction completions=${completions.length}${completions.length ? ` ${summarizeBackgroundTaskCompletionsForLog(completions)}` : ""}`
           )
           return makeControlMessage("backgroundTaskCompletionAction", {
             ...triggeringFields,
@@ -2384,16 +2404,17 @@ export class CursorRequestParser {
                 model,
               })
             case "asyncAskQuestionCompletionAction": {
-              const asyncAction = action.action.value as {
-                originalToolCallId?: string
-              }
+              const completion = normalizeAsyncAskQuestionCompletionAction(
+                action.action.value
+              )
               this.logger.log(
-                `AgentRunRequest asyncAskQuestionCompletionAction: conversationId=${conversationId || "(none)"} toolCallId=${asyncAction.originalToolCallId || "(none)"}`
+                `AgentRunRequest asyncAskQuestionCompletionAction: conversationId=${conversationId || "(none)"} toolCallId=${completion?.originalToolCallId || "(none)"} case=${completion?.resultCase || "unknown"} answers=${completion?.answers?.length ?? 0}`
               )
               return makeControlMessage("asyncAskQuestionCompletionAction", {
                 conversationId,
                 model,
-                toolCallId: asyncAction.originalToolCallId || "",
+                toolCallId: completion?.originalToolCallId || "",
+                asyncAskCompletion: completion,
               })
             }
             case "cancelSubagentAction": {
@@ -2417,7 +2438,7 @@ export class CursorRequestParser {
                 bgTask.completions
               )
               this.logger.log(
-                `AgentRunRequest backgroundTaskCompletionAction: conversationId=${conversationId || "(none)"} completions=${completions.length}`
+                `AgentRunRequest backgroundTaskCompletionAction: conversationId=${conversationId || "(none)"} completions=${completions.length}${completions.length ? ` ${summarizeBackgroundTaskCompletionsForLog(completions)}` : ""}`
               )
               return makeControlMessage("backgroundTaskCompletionAction", {
                 conversationId,

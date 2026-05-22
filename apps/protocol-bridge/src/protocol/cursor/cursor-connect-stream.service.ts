@@ -13,6 +13,7 @@ import {
   type ContextCompactRunnerSummaryProvider,
   type ContextCompactionCandidate,
   type ContextCompactionResult,
+  ContextProjectionBudgetExceededError,
   ContextHookExecutorService,
   type ContextInvestigationMemoryEntry,
   ContextManagerService,
@@ -21,6 +22,7 @@ import {
   type ContextRequestBudget,
   type ContextProjectionBudget,
   type ContextSessionMemoryEntry,
+  type ContextToolResultReplacementState,
   type ContextUsageSnapshot,
   detectPromptTooLong,
   extractText,
@@ -32,6 +34,7 @@ import {
   type SubAgentMemoryFormatInput,
   TokenCounterService,
   ToolIntegrityService,
+  ToolResultStorageService,
   UnifiedMessage,
 } from "../../context"
 import {
@@ -486,6 +489,17 @@ interface ActiveToolCall {
   modelCallId: string
 }
 
+interface HistoryToolMetadata {
+  toolName: string
+  input: Record<string, unknown>
+}
+
+interface HistoryToolResultCandidate extends HistoryToolMetadata {
+  toolUseId: string
+  content: string
+  size: number
+}
+
 type ToolDispatchOutcome = "waiting_for_result" | "completed_inline"
 
 type AssistantTurnCompletionMode = "initial" | "continuation"
@@ -841,6 +855,11 @@ export class CursorConnectStreamService {
   private readonly LARGE_TOOL_RESULT_HEAD_LINES = 220
   private readonly LARGE_TOOL_RESULT_TAIL_LINES = 120
   private readonly LARGE_TOOL_RESULT_SAMPLE_MAX_CHARS = 24_000
+  private readonly INFLATING_READONLY_TOOL_RESULT_MAX_LINES = 24
+  private readonly INFLATING_READONLY_TOOL_RESULT_MAX_CHARS = 4_000
+  private readonly INFLATING_READONLY_TOOL_STORAGE_THRESHOLD_CHARS = 4_000
+  private readonly GENERIC_TOOL_RESULT_STORAGE_THRESHOLD_CHARS = 50_000
+  private readonly AGGREGATE_TOOL_RESULT_STORAGE_BUDGET_CHARS = 200_000
   private readonly LARGE_READ_FILE_SIZE_BYTES = 256 * 1024
   private readonly OFFICIAL_VIEW_FILE_MAX_LINES = 800
   private readonly OFFICIAL_VIEW_FILE_MAX_RESULT_TOKENS = 18_000
@@ -941,6 +960,7 @@ export class CursorConnectStreamService {
     private readonly subagentTaskRegistry: SubagentTaskRegistry,
     private readonly subagentTranscriptStore: SubagentTranscriptStore,
     private readonly contextHookExecutor: ContextHookExecutorService,
+    private readonly toolResultStorage: ToolResultStorageService,
     private readonly webSearchService: WebSearchService
   ) {
     // Register provider adapter cleanup on session expiry/deletion.
@@ -2057,15 +2077,10 @@ export class CursorConnectStreamService {
    *   - lets the IDE chat view render the user's response in-line so
    *     subsequent agent turns can see it.
    */
-  // The handler is `async *` for parity with the other `handle*Action`
-  // siblings (so callers can `yield*` it through the BiDi stream), but
-  // none of its current work needs to await — yields and grpc envelope
-  // builders are all synchronous. Keep the type signature stable to
-  // preserve the protocol contract.
-  // eslint-disable-next-line @typescript-eslint/require-await
   private async *handleAsyncAskQuestionCompletionAction(
     conversationId: string,
-    parsed: ParsedCursorRequest
+    parsed: ParsedCursorRequest,
+    streamId?: string
   ): AsyncGenerator<Buffer, boolean> {
     const completion = parsed.agentControlAsyncAskCompletion
     const toolCallId =
@@ -2080,49 +2095,7 @@ export class CursorConnectStreamService {
       return false
     }
 
-    // Render the user's response as a single line so we can append it to
-    // the conversation history. We deliberately keep the format short and
-    // grep-friendly (matches how the IDE itself renders queued-answer
-    // bubbles).
-    const renderedAnswer = (() => {
-      switch (completion.resultCase) {
-        case "success": {
-          const parts: string[] = []
-          for (const a of completion.answers || []) {
-            const segments: string[] = []
-            if (a.selectedOptionIds.length > 0) {
-              segments.push(a.selectedOptionIds.join(", "))
-            }
-            if (a.freeformText && a.freeformText.length > 0) {
-              segments.push(a.freeformText)
-            }
-            const rendered = segments.join(" — ").trim()
-            if (rendered) {
-              parts.push(
-                a.questionId ? `${a.questionId}: ${rendered}` : rendered
-              )
-            }
-          }
-          if (parts.length === 0) {
-            return "[ask_question answered]"
-          }
-          return `[ask_question answered] ${parts.join(" | ")}`
-        }
-        case "rejected":
-          return `[ask_question rejected] ${
-            completion.rejectedReason || "(no reason)"
-          }`
-        case "error":
-          return `[ask_question error] ${
-            completion.errorMessage || "(no message)"
-          }`
-        case "async":
-          // IDE shouldn't echo a nested async result, but be defensive.
-          return "[ask_question async] (still pending)"
-        default:
-          return "[ask_question answered] (unknown result)"
-      }
-    })()
+    const renderedAnswer = this.renderAsyncAskCompletionAnswer(completion)
 
     const messageId = `async_ask_completion_${
       toolCallId || crypto.randomUUID()
@@ -2170,7 +2143,136 @@ export class CursorConnectStreamService {
       }
     }
 
-    return false
+    return yield* this.continueAgentFromControlUserMessage(
+      conversationId,
+      parsed,
+      renderedAnswer,
+      streamId,
+      "async ask completion"
+    )
+  }
+
+  private renderAsyncAskCompletionAnswer(
+    completion: NonNullable<
+      ParsedCursorRequest["agentControlAsyncAskCompletion"]
+    >
+  ): string {
+    switch (completion.resultCase) {
+      case "success": {
+        const parts: string[] = []
+        for (const a of completion.answers || []) {
+          const segments: string[] = []
+          if (a.selectedOptionIds.length > 0) {
+            segments.push(a.selectedOptionIds.join(", "))
+          }
+          if (a.freeformText && a.freeformText.length > 0) {
+            segments.push(a.freeformText)
+          }
+          const rendered = segments.join(" — ").trim()
+          if (rendered) {
+            parts.push(a.questionId ? `${a.questionId}: ${rendered}` : rendered)
+          }
+        }
+        if (parts.length === 0) {
+          return "[ask_question answered]"
+        }
+        return `[ask_question answered] ${parts.join(" | ")}`
+      }
+      case "rejected":
+        return `[ask_question rejected] ${
+          completion.rejectedReason || "(no reason)"
+        }`
+      case "error":
+        return `[ask_question error] ${
+          completion.errorMessage || "(no message)"
+        }`
+      case "async":
+        return "[ask_question async] (still pending)"
+      default:
+        return "[ask_question answered] (unknown result)"
+    }
+  }
+
+  private buildControlContinuationRequest(
+    session: ChatSession,
+    parsed: ParsedCursorRequest,
+    newMessage: string
+  ): ParsedCursorRequest {
+    return {
+      ...parsed,
+      conversation: [],
+      newMessage,
+      model: parsed.model?.trim() || session.model,
+      thinkingLevel: session.thinkingLevel,
+      thinkingDetailsRequested: session.thinkingDetailsRequested,
+      unifiedMode: "AGENT",
+      isAgentic: true,
+      supportedTools: session.supportedTools || [],
+      useWeb: session.useWeb,
+      conversationId: session.conversationId,
+      projectContext: session.projectContext,
+      codeChunks: session.codeChunks,
+      cursorRules: session.cursorRules,
+      selectedCursorRulePaths: session.selectedCursorRulePaths,
+      selectedCursorRuleNames: session.selectedCursorRuleNames,
+      cursorCommands: session.cursorCommands,
+      customSystemPrompt: session.customSystemPrompt,
+      explicitContext: session.explicitContext,
+      contextTokenLimit: session.contextTokenLimit,
+      contextMaxMode: session.contextMaxMode,
+      usedContextTokens: session.usedContextTokens,
+      requestedMaxOutputTokens: session.requestedMaxOutputTokens,
+      requestedModelParameters: session.requestedModelParameters,
+      requestContextEnv: session.requestContextEnv,
+      attachedImages: [],
+      toolResults: [],
+      isAgentControlMessage: false,
+      agentControlType: undefined,
+      mcpToolDefs: session.mcpToolDefs,
+    }
+  }
+
+  private async *continueAgentFromControlUserMessage(
+    conversationId: string,
+    parsed: ParsedCursorRequest,
+    newMessage: string,
+    streamId: string | undefined,
+    reason: string
+  ): AsyncGenerator<Buffer, boolean> {
+    const session = this.sessionManager.getSession(conversationId)
+    if (!session) {
+      this.logger.warn(
+        `Cannot continue from ${reason}: session not found (${conversationId})`
+      )
+      return false
+    }
+    if (!newMessage.trim()) {
+      this.logger.warn(
+        `Cannot continue from ${reason}: empty synthetic user message (${conversationId})`
+      )
+      return false
+    }
+
+    this.logger.log(
+      `Continuing agent from ${reason}: conversation=${conversationId}`
+    )
+    const continuationParsed = this.buildControlContinuationRequest(
+      session,
+      parsed,
+      newMessage
+    )
+    yield* this.handleChatMessage(conversationId, continuationParsed, streamId)
+
+    const sessionAfter = this.sessionManager.getSession(conversationId)
+    if (this.hasPendingStreamWork(sessionAfter)) {
+      this.logger.log(
+        `Control continuation waiting for ${this.describePendingStreamWork(
+          sessionAfter
+        )}`
+      )
+      return false
+    }
+    return true
   }
 
   /**
@@ -4111,7 +4213,11 @@ export class CursorConnectStreamService {
 
     const normalizedMessages = this.normalizeHistoryForBackend(
       repairedMessages,
-      `restart recovery: ${session.conversationId}`
+      `restart recovery: ${session.conversationId}`,
+      {
+        conversationId: session.conversationId,
+        replacementState: session.contextState.toolResultReplacementState,
+      }
     )
     this.sessionManager.replaceMessages(
       session.conversationId,
@@ -4122,10 +4228,28 @@ export class CursorConnectStreamService {
   private normalizeHistoryForBackend(
     messages: Array<{ role: "user" | "assistant"; content: MessageContent }>,
     contextLabel: string,
-    options?: { pendingToolUseIds?: string[] }
+    options?: {
+      pendingToolUseIds?: string[]
+      conversationId?: string
+      replacementState?: ContextToolResultReplacementState
+    }
   ): Array<{ role: "user" | "assistant"; content: MessageContent }> {
-    const stripped =
-      this.stripTransientAssistantInfrastructureMessages(messages)
+    const compacted = this.compactInflatingReadonlyToolHistory(messages, {
+      conversationId: options?.conversationId,
+      replacementState: options?.replacementState,
+    })
+    const stripped = this.stripTransientAssistantInfrastructureMessages(
+      compacted.messages
+    )
+    if (
+      compacted.compactedToolInputs > 0 ||
+      compacted.compactedToolResults > 0
+    ) {
+      this.logger.warn(
+        `History projection (${contextLabel}) compacted ${compacted.compactedToolInputs} inflated tool input(s), ` +
+          `${compacted.compactedToolResults} inflated tool result(s)`
+      )
+    }
     if (stripped.removedMessages > 0) {
       this.logger.warn(
         `History projection (${contextLabel}) removed ${stripped.removedMessages} transient assistant infrastructure message(s)`
@@ -4152,6 +4276,743 @@ export class CursorConnectStreamService {
       role: "user" | "assistant"
       content: MessageContent
     }>
+  }
+
+  private cloneHistoryValue(value: unknown): unknown {
+    try {
+      return structuredClone(value)
+    } catch {
+      try {
+        return JSON.parse(JSON.stringify(value)) as unknown
+      } catch {
+        return value
+      }
+    }
+  }
+
+  private cloneHistoryRecord(
+    input: Record<string, unknown> | undefined
+  ): Record<string, unknown> {
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      return {}
+    }
+    const cloned = this.cloneHistoryValue(input)
+    return cloned && typeof cloned === "object" && !Array.isArray(cloned)
+      ? (cloned as Record<string, unknown>)
+      : {}
+  }
+
+  private stringifyHistoryForComparison(value: unknown): string {
+    try {
+      return JSON.stringify(value)
+    } catch {
+      return ""
+    }
+  }
+
+  private removeInflatedHistoryFields(
+    input: Record<string, unknown>
+  ): Record<string, unknown> {
+    const next = this.cloneHistoryRecord(input)
+    for (const key of [
+      "documents",
+      "results",
+      "rules",
+      "available_skills",
+      "search_hits",
+      "files",
+      "file_results",
+      "client_side_tool_v2",
+      "fix_lints_replay",
+      "before_diagnostics_total",
+      "after_diagnostics_total",
+      "beforeDiagnosticsTotal",
+      "afterDiagnosticsTotal",
+    ]) {
+      delete next[key]
+    }
+    return next
+  }
+
+  private pickHistoryFields(
+    input: Record<string, unknown>,
+    keys: string[]
+  ): Record<string, unknown> {
+    const next: Record<string, unknown> = {}
+    for (const key of keys) {
+      if (!Object.prototype.hasOwnProperty.call(input, key)) continue
+      next[key] = this.cloneHistoryValue(input[key])
+    }
+    return next
+  }
+
+  private compactToolInputForHistory(
+    toolName: string,
+    input: Record<string, unknown> | undefined
+  ): Record<string, unknown> {
+    const source = this.cloneHistoryRecord(input)
+    const family = this.normalizeDeferredToolFamily(toolName)
+
+    if (family === "read_project") {
+      return this.pickHistoryFields(source, ["key", "path"])
+    }
+
+    if (family === "fetch_rules") {
+      return this.pickHistoryFields(source, [
+        "skill_name",
+        "skillName",
+        "query",
+        "path",
+      ])
+    }
+
+    if (
+      family === "semantic_search" ||
+      family === "deep_search" ||
+      family === "search_symbols" ||
+      family === "go_to_definition"
+    ) {
+      return this.pickHistoryFields(source, [
+        "query",
+        "search_term",
+        "symbol",
+        "path",
+        "targetDirectories",
+        "target_directories",
+      ])
+    }
+
+    if (family === "read_semsearch_files") {
+      return this.pickHistoryFields(source, ["file_paths", "paths", "files"])
+    }
+
+    if (family === "fix_lints") {
+      return this.pickHistoryFields(source, ["paths", "path"])
+    }
+
+    return this.removeInflatedHistoryFields(source)
+  }
+
+  private compactLineOrientedReadonlyToolResult(
+    content: string,
+    options?: { maxLines?: number; maxChars?: number }
+  ): string {
+    if (!content) return content
+    if (content.includes("[history compacted:")) return content
+
+    const maxLines =
+      options?.maxLines ?? this.INFLATING_READONLY_TOOL_RESULT_MAX_LINES
+    const maxChars =
+      options?.maxChars ?? this.INFLATING_READONLY_TOOL_RESULT_MAX_CHARS
+    const lines = content.split(/\r?\n/)
+    if (content.length <= maxChars && lines.length <= maxLines) {
+      return content
+    }
+
+    let head = lines.slice(0, maxLines).join("\n")
+    if (head.length > maxChars) {
+      head = head.slice(0, maxChars).trimEnd()
+    }
+    const omittedLines = Math.max(lines.length - maxLines, 0)
+    const omittedChars = Math.max(content.length - head.length, 0)
+    return [
+      head,
+      `[history compacted: omitted ${omittedLines} line(s), ${omittedChars} char(s)]`,
+    ]
+      .filter(Boolean)
+      .join("\n")
+  }
+
+  private compactReadProjectResultForHistory(content: string): string {
+    if (!content || content.includes("[history compacted:")) return content
+    if (content.length <= this.INFLATING_READONLY_TOOL_RESULT_MAX_CHARS) {
+      return content
+    }
+
+    const lines = content.split(/\r?\n/)
+    const firstLine = lines[0] || "[read_project success]"
+    const body = lines.slice(1).join("\n").trim()
+    const sections = body
+      .split(/\n{2}---\n{2}/)
+      .map((section) => section.trim())
+      .filter(Boolean)
+    if (sections.length === 0) {
+      return this.compactLineOrientedReadonlyToolResult(content)
+    }
+
+    const compactSections = sections.slice(0, 8).map((section) => {
+      const sectionLines = section.split(/\r?\n/)
+      const pathLine = sectionLines[0] || "Path: (unknown)"
+      const sectionBody = sectionLines.slice(1).join("\n").trim()
+      const preview =
+        sectionBody.length > 900
+          ? `${sectionBody.slice(0, 900).trimEnd()}\n[document preview truncated]`
+          : sectionBody
+      return [pathLine, preview].filter(Boolean).join("\n")
+    })
+    const compactContent = [firstLine, compactSections.join("\n\n---\n\n")]
+      .filter(Boolean)
+      .join("\n\n")
+    const omittedSections = Math.max(
+      sections.length - compactSections.length,
+      0
+    )
+    const omittedChars = Math.max(content.length - compactContent.length, 0)
+
+    return [
+      compactContent,
+      `[history compacted: omitted ${omittedSections} document(s), ${omittedChars} char(s)]`,
+    ]
+      .filter(Boolean)
+      .join("\n\n")
+  }
+
+  private compactReadonlyToolResultForHistory(
+    toolName: string,
+    content: string,
+    toolInput?: Record<string, unknown>
+  ): string {
+    const family = this.normalizeDeferredToolFamily(toolName)
+    if (family === "read_project") {
+      return this.compactReadProjectResultForHistory(content)
+    }
+    if (
+      family === "semantic_search" ||
+      family === "deep_search" ||
+      family === "search_symbols" ||
+      family === "go_to_definition" ||
+      (family === "fetch_rules" &&
+        !this.pickFirstString(toolInput || {}, ["skill_name", "skillName"]))
+    ) {
+      return this.compactLineOrientedReadonlyToolResult(content)
+    }
+    return content
+  }
+
+  private isStoredToolResultReferenceContent(content: string): boolean {
+    return content.includes("[tool_result stored]")
+  }
+
+  private isClearedToolResultContent(content: string): boolean {
+    return content.includes("[Old tool result content cleared]")
+  }
+
+  private normalizeEmptyToolResultContent(
+    toolName: string,
+    content: string
+  ): string {
+    return content.trim().length === 0
+      ? `(${toolName || "tool"} completed with no output)`
+      : content
+  }
+
+  private rememberToolResultReplacement(
+    replacementState: ContextToolResultReplacementState | undefined,
+    toolUseId: string,
+    replacement: string,
+    reason: "empty" | "microcompact" = "empty"
+  ): void {
+    if (!replacementState || !toolUseId) return
+    const seen = new Set(replacementState.seenToolUseIds || [])
+    seen.add(toolUseId)
+    replacementState.seenToolUseIds = Array.from(seen)
+    replacementState.replacementByToolUseId = {
+      ...(replacementState.replacementByToolUseId || {}),
+      [toolUseId]: replacement,
+    }
+    const records = replacementState.records || []
+    if (
+      !records.some(
+        (record) =>
+          record.kind === "tool-result" &&
+          record.toolUseId === toolUseId &&
+          record.replacement === replacement
+      )
+    ) {
+      replacementState.records = [
+        ...records,
+        {
+          kind: "tool-result",
+          toolUseId,
+          replacement,
+          reason,
+          createdAt: Date.now(),
+        },
+      ]
+    }
+  }
+
+  private markToolResultSeen(
+    replacementState: ContextToolResultReplacementState | undefined,
+    toolUseId: string
+  ): void {
+    if (!replacementState || !toolUseId) return
+    const seen = new Set(replacementState.seenToolUseIds || [])
+    if (seen.has(toolUseId)) return
+    seen.add(toolUseId)
+    replacementState.seenToolUseIds = Array.from(seen)
+  }
+
+  private hasToolResultSeen(
+    replacementState: ContextToolResultReplacementState | undefined,
+    toolUseId: string
+  ): boolean {
+    return !!replacementState?.seenToolUseIds?.includes(toolUseId)
+  }
+
+  private isInflatingReadonlyToolResult(
+    toolName: string,
+    toolInput?: Record<string, unknown>
+  ): boolean {
+    const family = this.normalizeDeferredToolFamily(toolName)
+    return (
+      family === "read_project" ||
+      family === "semantic_search" ||
+      family === "deep_search" ||
+      family === "search_symbols" ||
+      family === "go_to_definition" ||
+      family === "read_semsearch_files" ||
+      (family === "fetch_rules" &&
+        !this.pickFirstString(toolInput || {}, ["skill_name", "skillName"]))
+    )
+  }
+
+  private shouldStoreToolResultForHistory(
+    toolName: string,
+    content: string,
+    toolInput?: Record<string, unknown>
+  ): boolean {
+    if (
+      !content ||
+      this.isStoredToolResultReferenceContent(content) ||
+      this.isClearedToolResultContent(content)
+    ) {
+      return false
+    }
+
+    if (this.isInflatingReadonlyToolResult(toolName, toolInput)) {
+      const lineCount = content.split(/\r?\n/).length
+      return (
+        content.length > this.INFLATING_READONLY_TOOL_STORAGE_THRESHOLD_CHARS ||
+        lineCount > this.INFLATING_READONLY_TOOL_RESULT_MAX_LINES
+      )
+    }
+
+    return content.length > this.GENERIC_TOOL_RESULT_STORAGE_THRESHOLD_CHARS
+  }
+
+  private storeToolResultForHistory(
+    conversationId: string | undefined,
+    toolUseId: string,
+    toolName: string,
+    content: string,
+    toolInput?: Record<string, unknown>,
+    replacementState?: ContextToolResultReplacementState,
+    options?: {
+      force?: boolean
+      reason?: "per_tool" | "aggregate"
+      freezeSeen?: boolean
+    }
+  ): string {
+    const normalizedContent = this.normalizeEmptyToolResultContent(
+      toolName,
+      content
+    )
+    if (normalizedContent !== content) {
+      this.rememberToolResultReplacement(
+        replacementState,
+        toolUseId,
+        normalizedContent,
+        "empty"
+      )
+      return normalizedContent
+    }
+
+    if (!conversationId || !toolUseId || !normalizedContent) {
+      return this.compactReadonlyToolResultForHistory(
+        toolName,
+        normalizedContent,
+        toolInput
+      )
+    }
+    if (
+      this.isStoredToolResultReferenceContent(normalizedContent) ||
+      this.isClearedToolResultContent(normalizedContent)
+    ) {
+      return normalizedContent
+    }
+
+    const existingReplacement =
+      replacementState?.replacementByToolUseId?.[toolUseId]
+    if (existingReplacement) {
+      return existingReplacement
+    }
+    if (
+      options?.freezeSeen !== false &&
+      this.hasToolResultSeen(replacementState, toolUseId)
+    ) {
+      return normalizedContent
+    }
+
+    if (
+      !options?.force &&
+      !this.shouldStoreToolResultForHistory(
+        toolName,
+        normalizedContent,
+        toolInput
+      )
+    ) {
+      return normalizedContent
+    }
+
+    try {
+      return this.toolResultStorage.store(
+        conversationId,
+        toolUseId,
+        toolName,
+        normalizedContent,
+        replacementState,
+        { reason: options?.reason || "per_tool" }
+      ).replacement
+    } catch (error) {
+      this.logger.warn(
+        `Failed to store tool result ${toolUseId} for history: ${String(error)}`
+      )
+      return this.compactReadonlyToolResultForHistory(
+        toolName,
+        normalizedContent,
+        toolInput
+      )
+    }
+  }
+
+  private collectAggregateToolResultBudgetGroups(
+    messages: Array<{ role: "user" | "assistant"; content: MessageContent }>
+  ): HistoryToolResultCandidate[][] {
+    const toolUsesById = new Map<string, HistoryToolMetadata>()
+    const groups: HistoryToolResultCandidate[][] = []
+    let currentGroup: HistoryToolResultCandidate[] = []
+    const flush = () => {
+      if (currentGroup.length > 0) {
+        groups.push(currentGroup)
+        currentGroup = []
+      }
+    }
+
+    for (const message of messages) {
+      if (!Array.isArray(message.content)) {
+        continue
+      }
+
+      if (message.role === "assistant") {
+        flush()
+        for (const block of message.content) {
+          if (!this.isLooseRecord(block) || block.type !== "tool_use") continue
+          const id = typeof block.id === "string" ? block.id : ""
+          if (!id) continue
+          const toolName =
+            typeof block.name === "string" && block.name
+              ? block.name
+              : "unknown_tool"
+          const input =
+            block.input &&
+            typeof block.input === "object" &&
+            !Array.isArray(block.input)
+              ? (block.input as Record<string, unknown>)
+              : {}
+          toolUsesById.set(id, { toolName, input })
+        }
+        continue
+      }
+
+      for (const block of message.content) {
+        if (!this.isLooseRecord(block) || block.type !== "tool_result") {
+          continue
+        }
+        const toolUseId =
+          typeof block.tool_use_id === "string" ? block.tool_use_id : ""
+        const content = typeof block.content === "string" ? block.content : ""
+        if (
+          !toolUseId ||
+          !content ||
+          this.isStoredToolResultReferenceContent(content) ||
+          this.isClearedToolResultContent(content)
+        ) {
+          continue
+        }
+        const pairedTool = toolUsesById.get(toolUseId)
+        if (!pairedTool) continue
+        currentGroup.push({
+          toolUseId,
+          toolName: pairedTool.toolName,
+          input: pairedTool.input,
+          content,
+          size: content.length,
+        })
+      }
+    }
+    flush()
+    return groups
+  }
+
+  private selectAggregateToolResultsToStore(
+    fresh: HistoryToolResultCandidate[],
+    frozenSize: number,
+    limit: number
+  ): HistoryToolResultCandidate[] {
+    let remaining = frozenSize + fresh.reduce((sum, item) => sum + item.size, 0)
+    if (remaining <= limit) return []
+
+    const selected: HistoryToolResultCandidate[] = []
+    for (const candidate of [...fresh].sort((a, b) => b.size - a.size)) {
+      if (remaining <= limit) break
+      selected.push(candidate)
+      remaining -= candidate.size
+    }
+    return selected
+  }
+
+  private applyToolResultReplacementMap(
+    messages: Array<{ role: "user" | "assistant"; content: MessageContent }>,
+    replacementByToolUseId: ReadonlyMap<string, string>
+  ): Array<{ role: "user" | "assistant"; content: MessageContent }> {
+    return messages.map((message) => {
+      if (message.role !== "user" || !Array.isArray(message.content)) {
+        return message
+      }
+      let touched = false
+      const content = message.content.map((block) => {
+        if (!this.isLooseRecord(block) || block.type !== "tool_result") {
+          return block
+        }
+        const toolUseId =
+          typeof block.tool_use_id === "string" ? block.tool_use_id : ""
+        const replacement = replacementByToolUseId.get(toolUseId)
+        if (replacement === undefined) {
+          return block
+        }
+        touched = true
+        return { ...block, content: replacement }
+      })
+      return touched
+        ? { ...message, content: content as MessageContent }
+        : message
+    })
+  }
+
+  private enforceAggregateToolResultBudgetForHistory(
+    messages: Array<{ role: "user" | "assistant"; content: MessageContent }>,
+    options?: {
+      conversationId?: string
+      replacementState?: ContextToolResultReplacementState
+    }
+  ): {
+    messages: Array<{ role: "user" | "assistant"; content: MessageContent }>
+    changed: boolean
+    storedToolResults: number
+  } {
+    const replacementState = options?.replacementState
+    const conversationId = options?.conversationId
+    if (!replacementState || !conversationId) {
+      return { messages, changed: false, storedToolResults: 0 }
+    }
+
+    const replacementMap = new Map<string, string>()
+    let storedToolResults = 0
+    for (const group of this.collectAggregateToolResultBudgetGroups(messages)) {
+      const fresh: HistoryToolResultCandidate[] = []
+      let frozenSize = 0
+      for (const candidate of group) {
+        const replacement =
+          replacementState.replacementByToolUseId?.[candidate.toolUseId]
+        if (replacement !== undefined) {
+          replacementMap.set(candidate.toolUseId, replacement)
+          continue
+        }
+        if (this.hasToolResultSeen(replacementState, candidate.toolUseId)) {
+          frozenSize += candidate.size
+          continue
+        }
+        fresh.push(candidate)
+      }
+
+      const selected = this.selectAggregateToolResultsToStore(
+        fresh,
+        frozenSize,
+        this.AGGREGATE_TOOL_RESULT_STORAGE_BUDGET_CHARS
+      )
+      const selectedIds = new Set(selected.map((item) => item.toolUseId))
+      for (const candidate of fresh) {
+        if (!selectedIds.has(candidate.toolUseId)) {
+          this.markToolResultSeen(replacementState, candidate.toolUseId)
+        }
+      }
+
+      for (const candidate of selected) {
+        const replacement = this.storeToolResultForHistory(
+          conversationId,
+          candidate.toolUseId,
+          candidate.toolName,
+          candidate.content,
+          candidate.input,
+          replacementState,
+          { force: true, reason: "aggregate", freezeSeen: false }
+        )
+        this.markToolResultSeen(replacementState, candidate.toolUseId)
+        if (replacement !== candidate.content) {
+          replacementMap.set(candidate.toolUseId, replacement)
+          storedToolResults++
+        }
+      }
+    }
+
+    if (replacementMap.size === 0) {
+      return { messages, changed: false, storedToolResults }
+    }
+    return {
+      messages: this.applyToolResultReplacementMap(messages, replacementMap),
+      changed: true,
+      storedToolResults,
+    }
+  }
+
+  private compactInflatingReadonlyToolHistory(
+    messages: Array<{
+      role: "user" | "assistant"
+      content: MessageContent
+    }>,
+    options?: {
+      conversationId?: string
+      replacementState?: ContextToolResultReplacementState
+    }
+  ): {
+    messages: Array<{ role: "user" | "assistant"; content: MessageContent }>
+    compactedToolInputs: number
+    compactedToolResults: number
+  } {
+    let changed = false
+    let compactedToolInputs = 0
+    let compactedToolResults = 0
+    const toolUsesById = new Map<
+      string,
+      { toolName: string; input: Record<string, unknown> }
+    >()
+
+    const nextMessages = messages.map((message) => {
+      if (!Array.isArray(message.content)) {
+        return message
+      }
+
+      let contentChanged = false
+      const nextContent = message.content.map((block) => {
+        if (!this.isLooseRecord(block)) {
+          return block
+        }
+
+        if (message.role === "assistant" && block.type === "tool_use") {
+          const id = typeof block.id === "string" ? block.id : ""
+          const toolName =
+            typeof block.name === "string" && block.name
+              ? block.name
+              : "unknown_tool"
+          const input =
+            block.input &&
+            typeof block.input === "object" &&
+            !Array.isArray(block.input)
+              ? (block.input as Record<string, unknown>)
+              : {}
+          const compactInput = this.compactToolInputForHistory(toolName, input)
+          toolUsesById.set(id, { toolName, input: compactInput })
+
+          if (
+            this.stringifyHistoryForComparison(compactInput) ===
+            this.stringifyHistoryForComparison(input)
+          ) {
+            return block
+          }
+
+          contentChanged = true
+          compactedToolInputs++
+          return {
+            ...block,
+            input: compactInput,
+          }
+        }
+
+        if (message.role === "user" && block.type === "tool_result") {
+          const toolUseId =
+            typeof block.tool_use_id === "string" ? block.tool_use_id : ""
+          const pairedTool = toolUsesById.get(toolUseId)
+          if (!pairedTool || typeof block.content !== "string") {
+            return block
+          }
+          const existingReplacement =
+            options?.replacementState?.replacementByToolUseId?.[toolUseId]
+          const frozenUnreplaced =
+            !existingReplacement &&
+            this.hasToolResultSeen(options?.replacementState, toolUseId)
+          const compactContent = frozenUnreplaced
+            ? block.content
+            : existingReplacement
+              ? existingReplacement
+              : this.storeToolResultForHistory(
+                  options?.conversationId,
+                  toolUseId,
+                  pairedTool.toolName,
+                  block.content,
+                  pairedTool.input,
+                  options?.replacementState
+                )
+
+          const fallbackCompactContent =
+            compactContent === block.content && !frozenUnreplaced
+              ? this.compactReadonlyToolResultForHistory(
+                  pairedTool.toolName,
+                  block.content,
+                  pairedTool.input
+                )
+              : compactContent
+          if (fallbackCompactContent === block.content) {
+            return block
+          }
+
+          contentChanged = true
+          compactedToolResults++
+          return {
+            ...block,
+            content: fallbackCompactContent,
+          }
+        }
+
+        return block
+      })
+
+      if (!contentChanged) {
+        return message
+      }
+
+      changed = true
+      return {
+        ...message,
+        content: nextContent as MessageContent,
+      }
+    })
+
+    const afterPerToolPass = changed ? nextMessages : messages
+    const aggregate = this.enforceAggregateToolResultBudgetForHistory(
+      afterPerToolPass,
+      options
+    )
+    if (aggregate.changed) {
+      changed = true
+      compactedToolResults += aggregate.storedToolResults
+    }
+
+    return {
+      messages: changed ? aggregate.messages : messages,
+      compactedToolInputs,
+      compactedToolResults,
+    }
   }
 
   private queuePendingContextSummaryUiUpdate(
@@ -5278,7 +6139,11 @@ ${raw}
   private removeToolCallPairFromHistory(
     messages: Array<{ role: "user" | "assistant"; content: MessageContent }>,
     toolUseId: string,
-    pendingToolUseIds?: string[]
+    pendingToolUseIds?: string[],
+    options?: {
+      conversationId?: string
+      replacementState?: ContextToolResultReplacementState
+    }
   ): {
     messages: Array<{ role: "user" | "assistant"; content: MessageContent }>
     removedToolUses: number
@@ -5340,7 +6205,11 @@ ${raw}
     const normalized = this.normalizeHistoryForBackend(
       compacted,
       `cloud code protocol recovery: ${toolUseId}`,
-      { pendingToolUseIds }
+      {
+        pendingToolUseIds,
+        conversationId: options?.conversationId,
+        replacementState: options?.replacementState,
+      }
     )
 
     return {
@@ -5385,7 +6254,11 @@ ${raw}
       const cleaned = this.removeToolCallPairFromHistory(
         session.messages,
         typedPayload.toolUseId,
-        Array.from(session.pendingToolCalls.keys())
+        Array.from(session.pendingToolCalls.keys()),
+        {
+          conversationId,
+          replacementState: session.contextState.toolResultReplacementState,
+        }
       )
 
       const removedPending =
@@ -6551,7 +7424,6 @@ ${raw}
     }
 
     const family = this.normalizeDeferredToolFamily(toolName)
-
     if (family === "web_search") {
       const query =
         this.pickFirstString(toolInput, [
@@ -11981,6 +12853,57 @@ ${raw}
       }
     }
 
+    if (this.toolResultStorage.isToolResultDocumentId(documentId)) {
+      const storedToolRefs =
+        this.sessionManager.getContextState(conversationId)
+          ?.toolResultReplacementState?.storedByToolUseId
+      const chunkResult = this.toolResultStorage.readChunk(
+        conversationId,
+        documentId,
+        requestedPosition,
+        storedToolRefs
+      )
+      if (chunkResult.status === "success") {
+        const lines = [
+          "[view_content_chunk success]",
+          `DocumentId: ${chunkResult.reference.documentId}`,
+          `Type: tool_result`,
+          `Tool: ${chunkResult.reference.toolName}`,
+          `Chunk: ${chunkResult.chunkNumber}/${chunkResult.chunkCount}`,
+        ]
+        if (chunkResult.nextPosition) {
+          lines.push(`Next chunk position: ${chunkResult.nextPosition}`)
+        }
+        lines.push("", chunkResult.chunk || "[empty tool result chunk]")
+
+        input.document_id = chunkResult.reference.documentId
+        input.documentId = chunkResult.reference.documentId
+        input.position = chunkResult.chunkNumber
+        input.chunkIndex = chunkResult.chunkNumber - 1
+
+        return {
+          content: lines.join("\n"),
+          state: { status: "success" },
+        }
+      }
+
+      if (chunkResult.status === "position_out_of_range") {
+        return {
+          content:
+            `[view_content_chunk error] position ${requestedPosition} is out of range. ` +
+            `Available positions: 1-${chunkResult.chunkCount} (or 0 for the first chunk).`,
+          state: { status: "error", message: "position out of range" },
+        }
+      }
+
+      return {
+        content:
+          `[view_content_chunk error] Unknown DocumentId: ${documentId}. ` +
+          "The stored tool result is missing or expired.",
+        state: { status: "error", message: "unknown document_id" },
+      }
+    }
+
     const storedDoc = this.getLegacyWebDocument(conversationId, documentId)
     if (!storedDoc) {
       return {
@@ -14706,6 +15629,162 @@ ${raw}
     return [...byAgentId.values()]
   }
 
+  private isTerminalBackgroundTaskCompletion(
+    completion: NonNullable<
+      ParsedCursorRequest["agentControlBackgroundTaskCompletions"]
+    >[number]
+  ): boolean {
+    if (completion.reason === 2) return false
+    if (completion.status === 1 || completion.status === 2) return true
+    if (completion.status === 3) return true
+    return completion.reason === 1
+  }
+
+  private describeBackgroundTaskKind(kind?: number): string {
+    switch (kind) {
+      case 1:
+        return "shell"
+      case 2:
+        return "subagent"
+      case 0:
+      case undefined:
+        return "unspecified"
+      default:
+        return `unknown(${kind})`
+    }
+  }
+
+  private describeBackgroundTaskStatus(status?: number): string {
+    switch (status) {
+      case 1:
+        return "success"
+      case 2:
+        return "error"
+      case 3:
+        return "aborted"
+      case 0:
+      case undefined:
+        return "unspecified"
+      default:
+        return `unknown(${status})`
+    }
+  }
+
+  private truncateBackgroundTaskText(text: string, maxChars = 12000): string {
+    if (text.length <= maxChars) return text
+    return `${text.slice(0, maxChars)}\n[truncated ${text.length - maxChars} chars]`
+  }
+
+  private backgroundCompletionMatchesSubagent(
+    completion: NonNullable<
+      ParsedCursorRequest["agentControlBackgroundTaskCompletions"]
+    >[number],
+    metadata: SubagentTaskMetadata
+  ): boolean {
+    if (completion.taskId === metadata.agentId) return true
+    if (completion.threadId === metadata.agentId) return true
+    if (
+      completion.outputPath &&
+      this.extractSubagentIdFromCompletionPath(completion.outputPath) ===
+        metadata.agentId
+    ) {
+      return true
+    }
+    return false
+  }
+
+  private renderGenericBackgroundCompletion(
+    completion: NonNullable<
+      ParsedCursorRequest["agentControlBackgroundTaskCompletions"]
+    >[number]
+  ): string {
+    const lines = [
+      "[background_task completed]",
+      `taskId: ${completion.taskId}`,
+      `kind: ${this.describeBackgroundTaskKind(completion.kind)}`,
+      `status: ${this.describeBackgroundTaskStatus(completion.status)}`,
+    ]
+    if (completion.title) lines.push(`title: ${completion.title}`)
+    if (completion.detail) lines.push(`detail: ${completion.detail}`)
+    if (completion.outputPath)
+      lines.push(`output_path: ${completion.outputPath}`)
+    if (completion.threadId) lines.push(`thread_id: ${completion.threadId}`)
+    return this.truncateBackgroundTaskText(lines.join("\n"), 4000)
+  }
+
+  private async collectBackgroundShellCompletionMessages(
+    conversationId: string,
+    completions: NonNullable<
+      ParsedCursorRequest["agentControlBackgroundTaskCompletions"]
+    >
+  ): Promise<{
+    messages: string[]
+    handledTaskIds: Set<string>
+  }> {
+    const messages: string[] = []
+    const handledTaskIds = new Set<string>()
+
+    for (const completion of completions) {
+      if (!this.isTerminalBackgroundTaskCompletion(completion)) continue
+      const candidateIds = [
+        completion.taskId,
+        completion.threadId || "",
+      ].filter((id) => id.trim().length > 0)
+      let command: SessionBackgroundCommand | undefined
+      for (const candidateId of candidateIds) {
+        command = this.sessionManager.getBackgroundCommand(
+          conversationId,
+          candidateId
+        )
+        if (command) break
+      }
+      if (!command) {
+        if (completion.kind === 1) {
+          messages.push(this.renderGenericBackgroundCompletion(completion))
+          handledTaskIds.add(completion.taskId)
+        }
+        continue
+      }
+
+      command =
+        (await this.refreshBackgroundCommandTerminalOutput(
+          conversationId,
+          command.commandId
+        )) || command
+      if (command.status === "running") {
+        const status = completion.status === 1 ? 0 : 1
+        this.sessionManager.setBackgroundCommandExit(
+          conversationId,
+          command.commandId,
+          status,
+          completion.status === 3
+        )
+        command =
+          this.sessionManager.getBackgroundCommand(
+            conversationId,
+            command.commandId
+          ) || command
+      }
+
+      const rendered = await this.executeInlineCommandStatus(conversationId, {
+        CommandId: command.commandId,
+        OutputCharacterCount: 12000,
+      })
+      messages.push(
+        this.truncateBackgroundTaskText(
+          rendered.content.replace(
+            "[command_status success]",
+            "[background_shell completed]"
+          )
+        )
+      )
+      handledTaskIds.add(completion.taskId)
+      if (completion.threadId) handledTaskIds.add(completion.threadId)
+    }
+
+    return { messages, handledTaskIds }
+  }
+
   private updateBackgroundTaskSuccessHistory(
     session: ChatSession,
     parentToolCallId: string,
@@ -14752,17 +15831,21 @@ ${raw}
     }
   }
 
-  private *handleBackgroundTaskCompletionAction(
+  private async *handleBackgroundTaskCompletionAction(
     conversationId: string,
-    parsed: ParsedCursorRequest
-  ): Generator<Buffer> {
+    parsed: ParsedCursorRequest,
+    streamId?: string
+  ): AsyncGenerator<Buffer, boolean> {
     const session = this.sessionManager.getSession(conversationId)
-    if (!session) return
+    if (!session) return false
 
+    const completions = parsed.agentControlBackgroundTaskCompletions || []
     const metadataList = this.resolveBackgroundCompletionMetadata(
       conversationId,
       parsed
     )
+    const completionMessages: string[] = []
+    const handledTaskIds = new Set<string>()
     for (const metadata of metadataList) {
       const parentToolCallId = metadata.parentToolCallId
       if (!parentToolCallId) continue
@@ -14825,7 +15908,75 @@ ${raw}
         "",
         { taskSuccess }
       )
+
+      completionMessages.push(
+        this.truncateBackgroundTaskText(
+          [
+            `[background_subagent ${metadata.status}]`,
+            `agentId: ${metadata.agentId}`,
+            `agentType: ${metadata.agentType}`,
+            `parentToolCallId: ${parentToolCallId}`,
+            `durationMs: ${durationMs}`,
+            `transcript: ${transcriptPath}`,
+            `result: ${resultPath}`,
+            "",
+            resultText,
+          ].join("\n")
+        )
+      )
+
+      for (const completion of completions) {
+        if (this.backgroundCompletionMatchesSubagent(completion, metadata)) {
+          handledTaskIds.add(completion.taskId)
+          if (completion.threadId) handledTaskIds.add(completion.threadId)
+        }
+      }
     }
+
+    const shellCompletion = await this.collectBackgroundShellCompletionMessages(
+      conversationId,
+      completions
+    )
+    for (const message of shellCompletion.messages) {
+      completionMessages.push(message)
+    }
+    for (const taskId of shellCompletion.handledTaskIds) {
+      handledTaskIds.add(taskId)
+    }
+
+    for (const completion of completions) {
+      if (!this.isTerminalBackgroundTaskCompletion(completion)) continue
+      if (handledTaskIds.has(completion.taskId)) continue
+      if (completion.threadId && handledTaskIds.has(completion.threadId))
+        continue
+      completionMessages.push(
+        this.renderGenericBackgroundCompletion(completion)
+      )
+      handledTaskIds.add(completion.taskId)
+    }
+
+    if (completionMessages.length === 0) {
+      this.logger.log(
+        `Background task completion produced no terminal notification: conversation=${conversationId} completions=${completions.length}`
+      )
+      return false
+    }
+
+    const continuationMessage = this.truncateBackgroundTaskText(
+      ["[background_task_completion]", ...completionMessages].join("\n\n"),
+      16000
+    )
+    yield this.grpcService.createUserMessageAppendedResponse(
+      continuationMessage,
+      `background_task_completion_${crypto.randomUUID()}`
+    )
+    return yield* this.continueAgentFromControlUserMessage(
+      conversationId,
+      parsed,
+      continuationMessage,
+      streamId,
+      "background task completion"
+    )
   }
 
   /**
@@ -18737,12 +19888,17 @@ ${raw}
 
   private async *failPendingToolCallsWithProtocolError(
     conversationId: string,
-    reason: string
+    reason: string,
+    candidateToolCallIds?: string[]
   ): AsyncGenerator<Buffer> {
     const session = this.sessionManager.getSession(conversationId)
     if (!session) return
 
-    const pendingIds = Array.from(session.pendingToolCalls.keys())
+    const pendingIds = (
+      candidateToolCallIds?.length
+        ? Array.from(new Set(candidateToolCallIds))
+        : Array.from(session.pendingToolCalls.keys())
+    ).filter((pendingId) => session.pendingToolCalls.has(pendingId))
     if (pendingIds.length === 0) {
       this.logger.error(
         `Protocol error with no pending tool calls to fail: ${reason}`
@@ -18785,6 +19941,75 @@ ${raw}
         { status: "error", message: reason }
       )
     }
+  }
+
+  private getPendingToolCallIdsForStream(
+    conversationId: string,
+    streamId: string,
+    candidateToolCallIds: string[]
+  ): string[] {
+    const session = this.sessionManager.getSession(conversationId)
+    if (!session) return []
+
+    return candidateToolCallIds.filter((toolCallId) => {
+      const pending = session.pendingToolCalls.get(toolCallId)
+      return pending?.streamId === streamId
+    })
+  }
+
+  private async *recoverPendingToolCallsAfterInputEof(
+    conversationId: string,
+    streamId: string,
+    candidateToolCallIds: string[]
+  ): AsyncGenerator<Buffer, number> {
+    let stillPending = this.getPendingToolCallIdsForStream(
+      conversationId,
+      streamId,
+      candidateToolCallIds
+    )
+    if (stillPending.length === 0) return 0
+
+    const deadline = Date.now() + this.PENDING_TOOL_RESUME_GRACE_MS
+    this.logger.warn(
+      `BiDi input stream ended with ${stillPending.length} pending tool call(s); ` +
+        `waiting up to ${this.PENDING_TOOL_RESUME_GRACE_MS}ms for resumeAction before failing: ` +
+        `${stillPending.join(", ")}`
+    )
+
+    while (Date.now() < deadline) {
+      const waitMs = Math.min(5_000, Math.max(0, deadline - Date.now()))
+      if (waitMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, waitMs))
+        yield this.grpcService.createServerHeartbeatResponse()
+      }
+
+      stillPending = this.getPendingToolCallIdsForStream(
+        conversationId,
+        streamId,
+        candidateToolCallIds
+      )
+      if (stillPending.length === 0) return 0
+    }
+
+    stillPending = this.getPendingToolCallIdsForStream(
+      conversationId,
+      streamId,
+      candidateToolCallIds
+    )
+    if (stillPending.length === 0) return 0
+
+    const reason =
+      "client input stream closed before pending tool results were received"
+    this.logger.warn(
+      `No resumeAction/tool result arrived after input EOF grace period; ` +
+        `failing ${stillPending.length} pending tool call(s): ${stillPending.join(", ")}`
+    )
+    yield* this.failPendingToolCallsWithProtocolError(
+      conversationId,
+      reason,
+      stillPending
+    )
+    return stillPending.length
   }
 
   private async *handleDeferredToolInteractionResponse(
@@ -20079,13 +21304,17 @@ ${raw}
         : this.normalizeDeferredToolFamily(canonicalToolName)
     const historyToolName =
       canonicalInvocation.historyToolName || canonicalToolName
+    const historyToolInput = this.compactToolInputForHistory(
+      historyToolName,
+      canonicalInvocation.historyToolInput || input
+    )
 
     return {
       activeToolCall: toolCall,
       canonicalToolName,
       input,
       historyToolName,
-      historyToolInput: canonicalInvocation.historyToolInput || input,
+      historyToolInput,
       codexToolCallType: this.resolveCodexToolCallType(
         historyToolName,
         canonicalToolName,
@@ -21084,30 +22313,51 @@ ${raw}
       toolDefinitions,
       model: session.model,
     })
-    const promptMessages = this.truncateMessagesForBackend(
-      session,
-      route.backend,
-      {
-        maxTokens: budget.maxTokens,
-        systemPromptTokens: budget.systemPromptTokens,
-        autoCompactTokenLimit: budget.autoCompactTokenLimit,
-      },
-      {
-        contextLabel: `tool continuation preflight: ${conversationId}`,
-        model: route.model,
-        pendingToolUseIds,
-        strategy: "reactive",
-        dryRun: true,
-      }
+    const availableHistoryBudgetTokens = Math.max(
+      1,
+      budget.maxTokens - budget.systemPromptTokens
     )
+    let promptMessages: Array<{
+      role: "user" | "assistant"
+      content: MessageContent
+    }>
+    try {
+      promptMessages = this.truncateMessagesForBackend(
+        session,
+        route.backend,
+        {
+          maxTokens: budget.maxTokens,
+          systemPromptTokens: budget.systemPromptTokens,
+          autoCompactTokenLimit: budget.autoCompactTokenLimit,
+          predictiveCompactTokenLimit: budget.predictiveCompactTokenLimit,
+        },
+        {
+          contextLabel: `tool continuation preflight: ${conversationId}`,
+          model: route.model,
+          pendingToolUseIds,
+          strategy: "reactive",
+          dryRun: true,
+        }
+      )
+    } catch (error) {
+      if (error instanceof ContextProjectionBudgetExceededError) {
+        this.logger.warn(
+          `Tool continuation preflight exceeded context budget for ${conversationId}: ` +
+            `projected=${error.estimatedTokens}, budget=${error.maxTokens}; ` +
+            "continuing so the compact runner can prepare the request"
+        )
+        return {
+          promptTokens: error.estimatedTokens,
+          availableHistoryBudgetTokens: Math.max(1, error.maxTokens),
+        }
+      }
+      throw error
+    }
     return {
       promptTokens: promptMessages.length
         ? this.tokenCounter.countMessages(promptMessages as UnifiedMessage[])
         : 0,
-      availableHistoryBudgetTokens: Math.max(
-        1,
-        budget.maxTokens - budget.systemPromptTokens
-      ),
+      availableHistoryBudgetTokens,
     }
   }
 
@@ -22320,7 +23570,8 @@ ${raw}
             const shouldEndStream =
               yield* this.handleAsyncAskQuestionCompletionAction(
                 conversationId,
-                parsed
+                parsed,
+                streamId
               )
             if (shouldEndStream) {
               return
@@ -22352,10 +23603,25 @@ ${raw}
             this.logger.log(
               `ConversationAction.backgroundTaskCompletion: ${conversationId}`
             )
-            yield* this.handleBackgroundTaskCompletionAction(
-              conversationId,
-              parsed
-            )
+            const shouldEndStream =
+              yield* this.handleBackgroundTaskCompletionAction(
+                conversationId,
+                parsed,
+                streamId
+              )
+            if (shouldEndStream) {
+              return
+            }
+            const sessionAfterBackgroundCompletion =
+              this.sessionManager.getSession(conversationId)
+            if (this.hasPendingStreamWork(sessionAfterBackgroundCompletion)) {
+              this.logger.log(
+                `Background task completion waiting for ${this.describePendingStreamWork(
+                  sessionAfterBackgroundCompletion
+                )}`
+              )
+              continue
+            }
             yield this.grpcService.createServerHeartbeatResponse()
             yield this.grpcService.createAgentTurnEndedResponse()
             return
@@ -22729,6 +23995,12 @@ ${raw}
               `resumeAction: no pending tool calls remain, proceeding as new turn`
             )
           }
+          if (!parsed.isResumeAction && sessionBeforeRun?.restartRecovery) {
+            this.sessionManager.clearRestartRecovery(conversationId!)
+            this.logger.warn(
+              `Cleared stale restart recovery for ${conversationId} on a new user turn`
+            )
+          }
           if (sessionBeforeRun && sessionBeforeRun.pendingToolCalls.size > 0) {
             const currentPendingIds = Array.from(
               sessionBeforeRun.pendingToolCalls.keys()
@@ -22783,7 +24055,7 @@ ${raw}
         const pendingIdsAtStreamEnd = sessionAtStreamEnd
           ? Array.from(sessionAtStreamEnd.pendingToolCalls.keys())
           : []
-        if (pendingIdsAtStreamEnd.length > 0) {
+        if (pendingIdsAtStreamEnd.length > 0 && streamId) {
           // Cursor may close/replace an AgentService/Run HTTP/2 stream after
           // receiving ExecServerMessage while the IDE is still executing the
           // tool. The follow-up can arrive on a fresh resumeAction stream,
@@ -22793,10 +24065,26 @@ ${raw}
           // Explicit aborts still flow through execThrow/cancelAction. New
           // user-message turns with stale pending tools are handled above
           // before the next model request starts.
-          this.logger.warn(
-            `BiDi stream ended with ${pendingIdsAtStreamEnd.length} pending tool call(s); ` +
-              `keeping pending state for resumeAction: ${pendingIdsAtStreamEnd.join(", ")}`
+          yield* this.recoverPendingToolCallsAfterInputEof(
+            conversationId,
+            streamId,
+            pendingIdsAtStreamEnd
           )
+          const remainingPendingIds = this.getPendingToolCallIdsForStream(
+            conversationId,
+            streamId,
+            Array.from(
+              this.sessionManager
+                .getSession(conversationId)
+                ?.pendingToolCalls.keys() ?? []
+            )
+          )
+          if (remainingPendingIds.length > 0) {
+            this.logger.warn(
+              `BiDi stream ended with ${remainingPendingIds.length} pending tool call(s); ` +
+                `keeping pending state for resumeAction: ${remainingPendingIds.join(", ")}`
+            )
+          }
         }
       }
 
@@ -22928,7 +24216,11 @@ ${raw}
     rawMessages = this.normalizeHistoryForBackend(
       rawMessages,
       `chat pre-truncation: ${conversationId}`,
-      { pendingToolUseIds }
+      {
+        pendingToolUseIds,
+        conversationId,
+        replacementState: session.contextState.toolResultReplacementState,
+      }
     )
     this.sessionManager.replaceMessages(conversationId, rawMessages)
     session = this.sessionManager.getSession(conversationId) || session
@@ -23787,6 +25079,14 @@ ${raw}
         pendingToolCall.toolInput,
         rawToolResultContent
       )
+      const historyShellToolResultContent = this.storeToolResultForHistory(
+        conversationId,
+        toolCallId,
+        pendingToolCall.toolName,
+        adaptedToolResultContent,
+        pendingToolCall.toolInput,
+        session.contextState.toolResultReplacementState
+      )
 
       yield* this.emitToolCompletedAndStep(
         conversationId,
@@ -23822,7 +25122,7 @@ ${raw}
         toolCallId,
         pendingToolCall.toolName,
         pendingToolCall.toolInput,
-        adaptedToolResultContent,
+        historyShellToolResultContent,
         undefined,
         pendingToolCall.codexToolCallType || "function"
       )
@@ -23856,6 +25156,19 @@ ${raw}
       ) {
         this.logger.log(
           `Deferring ${route.backend} shell continuation until ${remainingPendingToolUseIds.length} pending tool result(s) arrive`
+        )
+        return
+      }
+
+      if (
+        !this.sessionManager.claimAssistantToolBatchContinuation(
+          conversationId,
+          route.backend,
+          toolCallId
+        )
+      ) {
+        this.logger.log(
+          `Skipping duplicate ${route.backend} shell continuation for settled batch after ${toolCallId}`
         )
         return
       }
@@ -23901,6 +25214,9 @@ ${raw}
         `shell continuation: ${conversationId}`,
         {
           pendingToolUseIds: remainingPendingToolUseIds,
+          conversationId,
+          replacementState:
+            activeSession.contextState.toolResultReplacementState,
         }
       )
       this.sessionManager.replaceMessages(
@@ -25286,15 +26602,26 @@ ${raw}
       pendingToolCall.historyToolName || pendingToolCall.toolName
     const historyToolInput =
       pendingToolCall.historyToolInput || pendingToolCall.toolInput
-    const historyToolResultContent = this.formatToolResultForHistory(
+    let historyToolResultContent = this.formatToolResultForHistory(
       historyToolName,
       historyToolInput,
       toolResultContent,
       toolResultState,
       extraData
     )
-    const historyToolResultPayload =
+    let historyToolResultPayload: string | Array<Record<string, unknown>> =
       toolResult.inlineHistoryContent ?? historyToolResultContent
+    if (typeof historyToolResultPayload === "string") {
+      historyToolResultPayload = this.storeToolResultForHistory(
+        conversationId,
+        toolCallId,
+        historyToolName,
+        historyToolResultPayload,
+        historyToolInput,
+        session.contextState.toolResultReplacementState
+      )
+      historyToolResultContent = historyToolResultPayload
+    }
     const historyToolStructuredContent = this.buildStructuredHistoryToolResult(
       pendingToolCall,
       historyToolResultContent,
@@ -25373,6 +26700,19 @@ ${raw}
         return
       }
 
+      if (
+        !this.sessionManager.claimAssistantToolBatchContinuation(
+          conversationId,
+          route.backend,
+          toolCallId
+        )
+      ) {
+        this.logger.log(
+          `Skipping duplicate ${route.backend} tool continuation for settled batch after ${toolCallId}`
+        )
+        return
+      }
+
       let activeSession =
         this.cleanSessionHistoryForTransientAssistantInfrastructureMessages(
           session,
@@ -25421,6 +26761,9 @@ ${raw}
         `tool continuation: ${conversationId}`,
         {
           pendingToolUseIds: remainingPendingToolUseIds,
+          conversationId,
+          replacementState:
+            activeSession.contextState.toolResultReplacementState,
         }
       )
       this.sessionManager.replaceMessages(

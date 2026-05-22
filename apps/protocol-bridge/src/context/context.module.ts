@@ -15,6 +15,7 @@ import { TokenCounterService } from "./token-counter.service"
 import { SessionMemoryCompactionService } from "./session-memory-compaction.service"
 import { ToolIntegrityService } from "./tool-integrity.service"
 import { ToolResultCompactionService } from "./tool-result-compaction.service"
+import { ToolResultStorageService } from "./tool-result-storage.service"
 
 /**
  * Context Module
@@ -45,6 +46,7 @@ import { ToolResultCompactionService } from "./tool-result-compaction.service"
     CodexContextAdapterService,
     ToolIntegrityService,
     ToolResultCompactionService,
+    ToolResultStorageService,
     ContextAttachmentBuilderService,
     ContextCompactRunnerService,
     ContextProjectionService,
@@ -63,6 +65,7 @@ import { ToolResultCompactionService } from "./tool-result-compaction.service"
     CodexContextAdapterService,
     ToolIntegrityService,
     ToolResultCompactionService,
+    ToolResultStorageService,
     ContextAttachmentBuilderService,
     ContextCompactRunnerService,
     ContextProjectionService,
