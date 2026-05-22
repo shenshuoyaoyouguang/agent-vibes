@@ -18,6 +18,8 @@ import { KnowledgeBaseService } from "./knowledge-base.service"
 import { KvStorageService } from "./kv-storage.service"
 import { SemanticSearchProviderService } from "./semantic-search-provider.service"
 import { ChatSessionManager } from "./session/chat-session.service"
+import { SessionContextIntegrityService } from "./session/session-context-integrity.service"
+import { ToolExecutionCoordinatorService } from "./session/tool-execution-coordinator.service"
 import { CursorSkillsManager } from "./skills"
 import { SubagentLoaderService } from "./subagents/subagent-loader.service"
 import { SubagentRegistryService } from "./subagents/subagent-registry.service"
@@ -46,6 +48,8 @@ import { WebSearchAdapterFactory, WebSearchService } from "./web-search"
   ],
   providers: [
     ChatSessionManager,
+    ToolExecutionCoordinatorService,
+    SessionContextIntegrityService,
     ClientSideToolV2ExecutorService,
     AntigravityIdeSyncService,
     CursorAuthService,
@@ -68,6 +72,8 @@ import { WebSearchAdapterFactory, WebSearchService } from "./web-search"
     CursorAuthService,
     CursorConnectStreamService,
     ChatSessionManager,
+    ToolExecutionCoordinatorService,
+    SessionContextIntegrityService,
     SubagentRegistryService,
     SubagentExecBridgeService,
     SubagentTaskRegistry,

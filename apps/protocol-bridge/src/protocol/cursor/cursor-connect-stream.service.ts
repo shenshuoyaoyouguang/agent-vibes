@@ -18,6 +18,7 @@ import {
   type ContextInvestigationMemoryEntry,
   ContextManagerService,
   ContextNativeManagementService,
+  ContextPipelineService,
   ContextRequestPlannerService,
   type ContextRequestBudget,
   type ContextProjectionBudget,
@@ -115,6 +116,7 @@ import {
   SessionTopLevelAgentTurnState,
   SubAgentContext,
 } from "./session/chat-session.service"
+import { ToolExecutionCoordinatorService } from "./session/tool-execution-coordinator.service"
 import { type CursorSkillMetadata, CursorSkillsManager } from "./skills"
 import { SubagentBackgroundWorker } from "./subagents/subagent-background-worker.service"
 import {
@@ -903,7 +905,6 @@ export class CursorConnectStreamService {
   private readonly TOP_LEVEL_AGENT_CONTINUATION_COMPLETION_THRESHOLD = 0.9
   private readonly TOP_LEVEL_AGENT_SUMMARY_MEMORY_LIMIT = 8
   private readonly TOOL_BATCH_SUMMARY_DETAILS_LIMIT = 6
-  private readonly PENDING_TOOL_RESUME_GRACE_MS = 15_000
   private readonly LEGACY_WEB_DOCUMENT_CHUNK_SIZE = 4_000
   private readonly MAX_LEGACY_WEB_DOCUMENTS_PER_CONVERSATION = 12
   private readonly EMPTY_CONTEXT_ATTACHMENT_SNAPSHOT: ContextAttachmentSnapshot =
@@ -934,6 +935,7 @@ export class CursorConnectStreamService {
 
   constructor(
     private readonly sessionManager: ChatSessionManager,
+    private readonly toolExecutionCoordinator: ToolExecutionCoordinatorService,
     private readonly grpcService: CursorGrpcService,
     private readonly googleService: GoogleService,
     private readonly imageGenerationService: ImageGenerationService,
@@ -947,6 +949,7 @@ export class CursorConnectStreamService {
     private readonly codexContextAdapter: CodexContextAdapterService,
     private readonly contextRequestPlanner: ContextRequestPlannerService,
     private readonly contextNativeManagement: ContextNativeManagementService,
+    private readonly contextPipeline: ContextPipelineService,
     private readonly clientSideToolV2Executor: ClientSideToolV2ExecutorService,
     private readonly semanticSearchProvider: SemanticSearchProviderService,
     private readonly tokenCounter: TokenCounterService,
@@ -4647,43 +4650,33 @@ export class CursorConnectStreamService {
     if (existingReplacement) {
       return existingReplacement
     }
-    if (
-      options?.freezeSeen !== false &&
-      this.hasToolResultSeen(replacementState, toolUseId)
-    ) {
-      return normalizedContent
+
+    const thresholdChars = this.isInflatingReadonlyToolResult(
+      toolName,
+      toolInput
+    )
+      ? this.INFLATING_READONLY_TOOL_STORAGE_THRESHOLD_CHARS
+      : this.GENERIC_TOOL_RESULT_STORAGE_THRESHOLD_CHARS
+    const processed = this.toolResultStorage.processToolResultForHistory({
+      conversationId,
+      toolUseId,
+      toolName,
+      content: normalizedContent,
+      replacementState,
+      force: options?.force,
+      reason: options?.reason || "per_tool",
+      thresholdChars,
+    })
+
+    if (processed !== normalizedContent) {
+      return processed
     }
 
-    if (
-      !options?.force &&
-      !this.shouldStoreToolResultForHistory(
-        toolName,
-        normalizedContent,
-        toolInput
-      )
-    ) {
-      return normalizedContent
-    }
-
-    try {
-      return this.toolResultStorage.store(
-        conversationId,
-        toolUseId,
-        toolName,
-        normalizedContent,
-        replacementState,
-        { reason: options?.reason || "per_tool" }
-      ).replacement
-    } catch (error) {
-      this.logger.warn(
-        `Failed to store tool result ${toolUseId} for history: ${String(error)}`
-      )
-      return this.compactReadonlyToolResultForHistory(
-        toolName,
-        normalizedContent,
-        toolInput
-      )
-    }
+    return this.compactReadonlyToolResultForHistory(
+      toolName,
+      normalizedContent,
+      toolInput
+    )
   }
 
   private collectAggregateToolResultBudgetGroups(
@@ -4821,16 +4814,12 @@ export class CursorConnectStreamService {
     let storedToolResults = 0
     for (const group of this.collectAggregateToolResultBudgetGroups(messages)) {
       const fresh: HistoryToolResultCandidate[] = []
-      let frozenSize = 0
+      const frozenSize = 0
       for (const candidate of group) {
         const replacement =
           replacementState.replacementByToolUseId?.[candidate.toolUseId]
         if (replacement !== undefined) {
           replacementMap.set(candidate.toolUseId, replacement)
-          continue
-        }
-        if (this.hasToolResultSeen(replacementState, candidate.toolUseId)) {
-          frozenSize += candidate.size
           continue
         }
         fresh.push(candidate)
@@ -4948,24 +4937,19 @@ export class CursorConnectStreamService {
           }
           const existingReplacement =
             options?.replacementState?.replacementByToolUseId?.[toolUseId]
-          const frozenUnreplaced =
-            !existingReplacement &&
-            this.hasToolResultSeen(options?.replacementState, toolUseId)
-          const compactContent = frozenUnreplaced
-            ? block.content
-            : existingReplacement
-              ? existingReplacement
-              : this.storeToolResultForHistory(
-                  options?.conversationId,
-                  toolUseId,
-                  pairedTool.toolName,
-                  block.content,
-                  pairedTool.input,
-                  options?.replacementState
-                )
+          const compactContent = existingReplacement
+            ? existingReplacement
+            : this.storeToolResultForHistory(
+                options?.conversationId,
+                toolUseId,
+                pairedTool.toolName,
+                block.content,
+                pairedTool.input,
+                options?.replacementState
+              )
 
           const fallbackCompactContent =
-            compactContent === block.content && !frozenUnreplaced
+            compactContent === block.content
               ? this.compactReadonlyToolResultForHistory(
                   pairedTool.toolName,
                   block.content,
@@ -5314,6 +5298,32 @@ export class CursorConnectStreamService {
   }
 
   private async prepareContextWithCompactRunner(
+    session: ChatSession,
+    route: ModelRouteResult,
+    budget: ContextProjectionBudget,
+    options: {
+      contextLabel: string
+      model?: string
+      pendingToolUseIds?: string[]
+      toolDefinitions?: ToolDefinition[]
+      strategy: "auto" | "manual" | "reactive"
+      hookUserMessage?: string
+    }
+  ): Promise<void> {
+    return this.contextPipeline.runMutation(
+      session.conversationId,
+      options.contextLabel,
+      () =>
+        this.prepareContextWithCompactRunnerUnlocked(
+          session,
+          route,
+          budget,
+          options
+        )
+    )
+  }
+
+  private async prepareContextWithCompactRunnerUnlocked(
     session: ChatSession,
     route: ModelRouteResult,
     budget: ContextProjectionBudget,
@@ -19957,59 +19967,132 @@ ${raw}
     })
   }
 
+  private isBridgeLocalInputEofFallbackTool(toolName: string): boolean {
+    return this.toolExecutionCoordinator.isBridgeLocalInputEofFallbackTool(
+      toolName
+    )
+  }
+
+  private async executeBridgeLocalInputEofFallbackTool(
+    conversationId: string,
+    pendingToolCall: PendingToolCall
+  ): Promise<{
+    content: string
+    state: { status: ToolResultStatus; message?: string }
+    extraData?: ToolCompletedExtraData
+  } | null> {
+    const input = { ...(pendingToolCall.toolInput || {}) }
+    switch (pendingToolCall.toolName.trim().toLowerCase()) {
+      case "read_file":
+      case "read_file_v2":
+        return this.executeInlineSubAgentReadFile(conversationId, input)
+      case "list_directory":
+      case "list_dir":
+        return this.executeInlineSubAgentListDirectory(conversationId, input)
+      case "grep_search":
+        return this.executeInlineSubAgentGrepSearch(conversationId, input)
+      case "view_content_chunk":
+        return this.executeInlineViewContentChunk(conversationId, input)
+      default:
+        return null
+    }
+  }
+
   private async *recoverPendingToolCallsAfterInputEof(
     conversationId: string,
     streamId: string,
     candidateToolCallIds: string[]
   ): AsyncGenerator<Buffer, number> {
-    let stillPending = this.getPendingToolCallIdsForStream(
-      conversationId,
-      streamId,
-      candidateToolCallIds
-    )
-    if (stillPending.length === 0) return 0
+    const processedFallbackIds = new Set<string>()
+    let unresolvedCount = 0
 
-    const deadline = Date.now() + this.PENDING_TOOL_RESUME_GRACE_MS
-    this.logger.warn(
-      `BiDi input stream ended with ${stillPending.length} pending tool call(s); ` +
-        `waiting up to ${this.PENDING_TOOL_RESUME_GRACE_MS}ms for resumeAction before failing: ` +
-        `${stillPending.join(", ")}`
-    )
-
-    while (Date.now() < deadline) {
-      const waitMs = Math.min(5_000, Math.max(0, deadline - Date.now()))
-      if (waitMs > 0) {
-        await new Promise((resolve) => setTimeout(resolve, waitMs))
-        yield this.grpcService.createServerHeartbeatResponse()
-      }
-
-      stillPending = this.getPendingToolCallIdsForStream(
+    for (let pass = 0; pass < 16; pass++) {
+      const stillPending = this.getPendingToolCallIdsForStream(
         conversationId,
         streamId,
         candidateToolCallIds
       )
       if (stillPending.length === 0) return 0
+
+      const session = this.sessionManager.getSession(conversationId)
+      if (!session) return stillPending.length
+
+      const recoveryPlan =
+        this.toolExecutionCoordinator.buildInputEofRecoveryPlan(
+          conversationId,
+          streamId,
+          stillPending
+        )
+      const localFallbackIds = recoveryPlan.bridgeLocalToolCallIds.filter(
+        (toolCallId) => !processedFallbackIds.has(toolCallId)
+      )
+
+      if (localFallbackIds.length === 0) {
+        unresolvedCount = recoveryPlan.unresolvedToolCallIds.length
+        this.logger.warn(
+          `BiDi input stream ended with ${stillPending.length} pending tool call(s); ` +
+            `closing transport stream and preserving client-owned pending state for resumeAction: ` +
+            `${stillPending.join(", ")}`
+        )
+
+        // A plain request-input EOF is a Cursor transport boundary. Client-owned
+        // tools stay pending under the execution coordinator so a later
+        // resumeAction can resolve the state without synthetic failure
+        // tool_results corrupting the transcript.
+        return unresolvedCount
+      }
+
+      this.logger.warn(
+        `BiDi input stream ended with ${stillPending.length} pending tool call(s); ` +
+          `resolving ${localFallbackIds.length} bridge-local read-only tool(s) ` +
+          `in-process before closing: ${localFallbackIds.join(", ")}`
+      )
+
+      for (const toolCallId of localFallbackIds) {
+        const activeSession = this.sessionManager.getSession(conversationId)
+        const pendingToolCall = activeSession?.pendingToolCalls.get(toolCallId)
+        if (!pendingToolCall) {
+          processedFallbackIds.add(toolCallId)
+          continue
+        }
+
+        const result = await this.executeBridgeLocalInputEofFallbackTool(
+          conversationId,
+          pendingToolCall
+        )
+        processedFallbackIds.add(toolCallId)
+        if (!result) continue
+
+        yield* this.emitInlineToolResult(
+          conversationId,
+          toolCallId,
+          result.content,
+          result.state,
+          undefined,
+          "inline_tool_result",
+          result.extraData as ParsedToolResult["inlineExtraData"]
+        )
+      }
+
+      const refreshed = this.sessionManager.getSession(conversationId)
+      candidateToolCallIds = refreshed
+        ? Array.from(refreshed.pendingToolCalls.keys())
+        : []
+      if (candidateToolCallIds.length === 0) return 0
     }
 
-    stillPending = this.getPendingToolCallIdsForStream(
+    const remaining = this.getPendingToolCallIdsForStream(
       conversationId,
       streamId,
       candidateToolCallIds
     )
-    if (stillPending.length === 0) return 0
-
-    const reason =
-      "client input stream closed before pending tool results were received"
-    this.logger.warn(
-      `No resumeAction/tool result arrived after input EOF grace period; ` +
-        `failing ${stillPending.length} pending tool call(s): ${stillPending.join(", ")}`
-    )
-    yield* this.failPendingToolCallsWithProtocolError(
-      conversationId,
-      reason,
-      stillPending
-    )
-    return stillPending.length
+    if (remaining.length > 0) {
+      this.logger.warn(
+        `BiDi input EOF local recovery reached pass limit; preserving ` +
+          `${remaining.length} pending tool call(s): ${remaining.join(", ")}`
+      )
+    }
+    return remaining.length
   }
 
   private async *handleDeferredToolInteractionResponse(
@@ -22575,6 +22658,11 @@ ${raw}
       preparedTool.codexToolCallType
     )
 
+    this.toolExecutionCoordinator.registerPendingTool(
+      conversationId,
+      activeToolCall.id
+    )
+
     if (this.isEditToolInvocation(preparedTool.protocolToolName)) {
       const editInvocationSummary = this.summarizeEditInvocationForLogs(
         preparedTool.protocolToolInput as ToolInputWithPath,
@@ -22832,6 +22920,7 @@ ${raw}
       toolCall.id,
       execIdNumber
     )
+    this.toolExecutionCoordinator.markRunning(conversationId, toolCall.id)
     yield toolCallBuffer
   }
 
@@ -22858,6 +22947,7 @@ ${raw}
       toolCallId,
       readExecId
     )
+    this.toolExecutionCoordinator.markRunning(conversationId, toolCallId)
     this.logger.log(
       `Sending readArgs for edit tool ${toolCallId} on path "${editPath}" (串行协议第一步, execId=${readExecId})`
     )
@@ -23931,48 +24021,12 @@ ${raw}
             sessionBeforeRun &&
             sessionBeforeRun.pendingToolCalls.size > 0
           ) {
-            const pendingIds = Array.from(
-              sessionBeforeRun.pendingToolCalls.keys()
-            )
-            const nowMs = Date.now()
-            const freshPendingIds = pendingIds.filter((toolCallId) => {
-              const pending = sessionBeforeRun.pendingToolCalls.get(toolCallId)
-              const sentAtMs = pending?.sentAt?.getTime()
-              return (
-                typeof sentAtMs === "number" &&
-                Number.isFinite(sentAtMs) &&
-                nowMs - sentAtMs <= this.PENDING_TOOL_RESUME_GRACE_MS
-              )
-            })
-            const stalePendingIds = pendingIds.filter(
-              (toolCallId) => !freshPendingIds.includes(toolCallId)
-            )
-            if (stalePendingIds.length > 0) {
-              const clearedCount = this.interruptPendingToolCallsForRecovery(
-                conversationId!,
-                stalePendingIds,
-                "resumeAction arrived after pending tool result grace period"
-              )
-              this.logger.warn(
-                `Interrupted ${clearedCount} stale pending tool call(s) on resumeAction after ` +
-                  `${this.PENDING_TOOL_RESUME_GRACE_MS}ms grace period`
-              )
-            }
-            if (freshPendingIds.length === 0) {
-              const recoveredSession = this.sessionManager.getSession(
-                conversationId!
-              )
-              if (recoveredSession?.restartRecovery) {
-                yield* this.emitAgentFinalTextResponse(
-                  recoveredSession,
-                  recoveredSession.restartRecovery.notice
-                )
-                this.sessionManager.clearRestartRecovery(conversationId!)
-              }
-              return
-            }
-            // Rebind the pending tool calls to the current stream ID, since
-            // the tool results will arrive on this new stream.
+            // resumeAction is Cursor's reconnect path for tool calls whose
+            // ExecServerMessage was already delivered on an earlier stream. Tool
+            // execution duration is not bounded by the request-input EOF timing,
+            // so do not age out pending calls here. Staleness is resolved by
+            // explicit abort controls or by a later normal user turn before it
+            // starts a new model request.
             const reboundCount =
               this.sessionManager.rebindPendingToolCallsToCurrentStream(
                 conversationId!
@@ -23982,7 +24036,6 @@ ${raw}
                 `resumeAction: rebound ${reboundCount} pending tool call(s) to current stream`
               )
             }
-            // Re-check: if there are still pending tool calls on the CURRENT stream, wait
             const stillPending = this.sessionManager.getSession(conversationId!)
             if (stillPending && stillPending.pendingToolCalls.size > 0) {
               this.logger.log(
@@ -23990,7 +24043,6 @@ ${raw}
               )
               continue
             }
-            // No pending tool calls remain — fall through to handle as new turn
             this.logger.log(
               `resumeAction: no pending tool calls remain, proceeding as new turn`
             )
@@ -24420,7 +24472,6 @@ ${raw}
           ) as CodexExecutionRequest["messages"],
       })
 
-    yield* this.emitPendingContextSummaryUiUpdate(conversationId)
     this.logger.debug(`Added ${apiTools.length} tool definition(s) to request`)
 
     // Call backend API (routed based on model name)
@@ -24502,6 +24553,9 @@ ${raw}
           outcome.accumulatedText,
           outcome.finalUsage
         )
+      }
+      if (outcome.kind !== "waiting_for_results") {
+        yield* this.emitPendingContextSummaryUiUpdate(conversationId)
       }
     } catch (error) {
       if (error instanceof UpstreamRequestAbortedError) {
@@ -25062,6 +25116,7 @@ ${raw}
         : ""
 
       // NOW consume the pending tool call and complete it
+      this.toolExecutionCoordinator.markCompleted(conversationId, toolCallId)
       const pendingToolCall = this.sessionManager.consumePendingToolCall(
         conversationId,
         toolCallId
@@ -25293,8 +25348,6 @@ ${raw}
               }
             ) as CodexExecutionRequest["messages"],
         })
-
-      yield* this.emitPendingContextSummaryUiUpdate(conversationId)
 
       try {
         const stream = this.getBackendStream(route.model, {
@@ -25754,6 +25807,7 @@ ${raw}
     }
 
     // Get the pending tool call (this also removes it from pendingToolCalls)
+    this.toolExecutionCoordinator.markCompleted(conversationId, toolCallId)
     const pendingToolCall = this.sessionManager.consumePendingToolCall(
       conversationId,
       toolCallId
@@ -26870,8 +26924,6 @@ ${raw}
             ) as CodexExecutionRequest["messages"],
         })
 
-      yield* this.emitPendingContextSummaryUiUpdate(conversationId)
-
       // Stream the continuation - may include more tool calls (routed based on model)
       const stream = this.getBackendStream(route.model, {
         buildDtoForRoute: buildContinuationDtoForRoute,
@@ -27050,6 +27102,9 @@ ${raw}
           }
 
           if (retryOutcome.kind !== "empty") {
+            if (retryOutcome.kind !== "waiting_for_results") {
+              yield* this.emitPendingContextSummaryUiUpdate(conversationId)
+            }
             return
           }
         } catch (retryError) {
@@ -27094,9 +27149,13 @@ ${raw}
           outcome.accumulatedText || undefined,
           outcome.finalUsage
         )
+        yield* this.emitPendingContextSummaryUiUpdate(conversationId)
         return
       }
 
+      if (outcome.kind !== "waiting_for_results") {
+        yield* this.emitPendingContextSummaryUiUpdate(conversationId)
+      }
       return
     } catch (error) {
       if (error instanceof UpstreamRequestAbortedError) {

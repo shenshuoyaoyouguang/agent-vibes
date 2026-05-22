@@ -8,6 +8,17 @@ import type {
   ContextToolResultReplacementState,
 } from "./types"
 
+export interface ToolResultStorageProcessInput {
+  conversationId?: string
+  toolUseId: string
+  toolName: string
+  content: string
+  replacementState?: ContextToolResultReplacementState
+  force?: boolean
+  reason?: "per_tool" | "aggregate"
+  thresholdChars?: number
+}
+
 export interface ToolResultStorageWriteResult {
   replacement: string
   reference: ContextStoredToolResultReference
@@ -39,6 +50,117 @@ export class ToolResultStorageService {
   private readonly CHUNK_SIZE = 4_000
   private readonly PREVIEW_CHARS = 4_000
   private readonly METADATA_SUFFIX = ".metadata.json"
+
+  processToolResultForHistory(input: ToolResultStorageProcessInput): string {
+    const normalizedContent =
+      input.content.trim().length === 0
+        ? `(${input.toolName || "tool"} completed with no output)`
+        : input.content
+
+    if (this.isStoredToolResultReferenceContent(normalizedContent)) {
+      return normalizedContent
+    }
+
+    const existingReplacement =
+      input.replacementState?.replacementByToolUseId?.[input.toolUseId]
+    if (existingReplacement) {
+      return existingReplacement
+    }
+
+    const threshold = Math.max(1, input.thresholdChars ?? this.PREVIEW_CHARS)
+    if (
+      !input.force &&
+      normalizedContent.length <= threshold &&
+      !this.shouldStoreAggregateResult(
+        input.replacementState,
+        normalizedContent
+      )
+    ) {
+      this.markSeen(input.replacementState, input.toolUseId)
+      return normalizedContent
+    }
+
+    if (!input.conversationId || !input.toolUseId || !normalizedContent) {
+      this.markSeen(input.replacementState, input.toolUseId)
+      return normalizedContent
+    }
+
+    try {
+      return this.store(
+        input.conversationId,
+        input.toolUseId,
+        input.toolName,
+        normalizedContent,
+        input.replacementState,
+        { reason: input.reason || "per_tool" }
+      ).replacement
+    } catch (error) {
+      this.logger.warn(
+        `Failed to store tool result ${input.toolUseId}: ${String(error)}`
+      )
+      this.markSeen(input.replacementState, input.toolUseId)
+      return normalizedContent
+    }
+  }
+
+  pruneReplacementState(
+    replacementState: ContextToolResultReplacementState | undefined,
+    validToolUseIds: Iterable<string>,
+    conversationId?: string
+  ): { removedReplacements: number; removedStoredReferences: number } {
+    if (!replacementState) {
+      return { removedReplacements: 0, removedStoredReferences: 0 }
+    }
+
+    const valid = new Set(validToolUseIds)
+    const previousReplacementCount = Object.keys(
+      replacementState.replacementByToolUseId || {}
+    ).length
+    const previousStoredCount = Object.keys(
+      replacementState.storedByToolUseId || {}
+    ).length
+
+    replacementState.seenToolUseIds = (
+      replacementState.seenToolUseIds || []
+    ).filter((toolUseId) => valid.has(toolUseId))
+    replacementState.replacementByToolUseId = Object.fromEntries(
+      Object.entries(replacementState.replacementByToolUseId || {}).filter(
+        ([toolUseId]) => valid.has(toolUseId)
+      )
+    )
+    replacementState.storedByToolUseId = Object.fromEntries(
+      Object.entries(replacementState.storedByToolUseId || {}).filter(
+        ([toolUseId, reference]) =>
+          valid.has(toolUseId) &&
+          (!conversationId ||
+            this.hasStoredToolResult(conversationId, toolUseId, reference))
+      )
+    )
+    replacementState.records = (replacementState.records || []).filter(
+      (record) => valid.has(record.toolUseId)
+    )
+
+    return {
+      removedReplacements:
+        previousReplacementCount -
+        Object.keys(replacementState.replacementByToolUseId).length,
+      removedStoredReferences:
+        previousStoredCount -
+        Object.keys(replacementState.storedByToolUseId).length,
+    }
+  }
+
+  hasStoredToolResult(
+    conversationId: string,
+    toolUseId: string,
+    reference?: ContextStoredToolResultReference
+  ): boolean {
+    const resolvedReference =
+      reference || this.resolveStoredReference(conversationId, toolUseId)
+    if (!resolvedReference) return false
+    const absolutePath = this.pathForReference(resolvedReference)
+    return !!absolutePath && fs.existsSync(absolutePath)
+  }
 
   isToolResultDocumentId(documentId: string): boolean {
     return documentId.startsWith("tool_result:")
@@ -163,6 +285,28 @@ export class ToolResultStorageService {
       recursive: true,
       force: true,
     })
+  }
+
+  private isStoredToolResultReferenceContent(content: string): boolean {
+    return content.includes("[tool_result stored]")
+  }
+
+  private shouldStoreAggregateResult(
+    replacementState: ContextToolResultReplacementState | undefined,
+    content: string
+  ): boolean {
+    const seenCount = replacementState?.seenToolUseIds?.length || 0
+    return seenCount >= 3 && content.length > Math.floor(this.PREVIEW_CHARS / 2)
+  }
+
+  private markSeen(
+    replacementState: ContextToolResultReplacementState | undefined,
+    toolUseId: string
+  ): void {
+    if (!replacementState || !toolUseId) return
+    const seen = new Set(replacementState.seenToolUseIds || [])
+    seen.add(toolUseId)
+    replacementState.seenToolUseIds = Array.from(seen)
   }
 
   private getStorageRoot(): string {

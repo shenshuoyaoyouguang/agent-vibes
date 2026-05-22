@@ -38,6 +38,13 @@ import { PersistenceService } from "../../../persistence"
 import { ParsedCursorRequest } from "../tools/cursor-request-parser"
 import type { DeferredToolDescriptor } from "../tools/cursor-tool-mapper"
 import type { EditFailureSelection } from "../tools/tool-protocol-helpers"
+import { SessionContextIntegrityService } from "./session-context-integrity.service"
+import type {
+  PendingToolExecutionState,
+  ToolExecutionOwner,
+  ToolExecutionRecoveryReason,
+  ToolExecutionStatus,
+} from "./tool-execution-types"
 
 /**
  * Content block types for messages
@@ -560,6 +567,8 @@ export interface ChatSession {
   // Tracks the current assistant tool batch. Once the batch is settled, it is
   // kept until the next batch starts so exactly one tool result can claim the
   // follow-up continuation.
+  toolExecutionOrderCounter: number
+
   activeAssistantToolBatch?: {
     id: string
     backend: BackendType
@@ -569,7 +578,7 @@ export interface ChatSession {
   }
 }
 
-export interface PendingToolCall {
+export interface PendingToolCall extends PendingToolExecutionState {
   toolCallId: string
   toolName: string
   toolInput: Record<string, unknown>
@@ -759,7 +768,7 @@ export interface SubAgentToolResult {
   resultCase: string
 }
 
-interface PersistedPendingToolCall {
+interface PersistedPendingToolCall extends PendingToolExecutionState {
   toolCallId: string
   toolName: string
   toolInput: Record<string, unknown>
@@ -872,7 +881,7 @@ interface PersistedTopLevelAgentTurnState {
 }
 
 interface PersistedChatSessionV1 {
-  version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13
+  version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14
   conversationId: string
   messages: SessionMessage[]
   messageRecords?: ContextTranscriptRecord[]
@@ -951,6 +960,7 @@ interface PersistedChatSessionV1 {
    * synthesis path.
    */
   subAgentContexts?: PersistedSubAgentContext[]
+  toolExecutionOrderCounter?: number
   restartRecovery?: PersistedSessionRestartRecovery
 }
 
@@ -985,7 +995,8 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
 
   constructor(
     private readonly persistence: PersistenceService,
-    private readonly toolResultStorage: ToolResultStorageService
+    private readonly toolResultStorage: ToolResultStorageService,
+    private readonly sessionContextIntegrity: SessionContextIntegrityService
   ) {}
 
   onModuleInit(): void {
@@ -1440,7 +1451,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
 
   private serializeSession(session: ChatSession): PersistedChatSessionV1 {
     return {
-      version: 13,
+      version: 14,
       conversationId: session.conversationId,
       messages: session.messages,
       messageRecords: session.messageRecords,
@@ -1546,6 +1557,10 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
           editFailureContext: toolCall.editFailureContext,
           editNoopReason: toolCall.editNoopReason,
           beforeContent: toolCall.beforeContent,
+          executionOwner: toolCall.executionOwner,
+          executionStatus: toolCall.executionStatus,
+          executionRecoveryReason: toolCall.executionRecoveryReason,
+          executionOrder: toolCall.executionOrder,
           shellStreamOutput: toolCall.shellStreamOutput
             ? {
                 stdout: [...toolCall.shellStreamOutput.stdout],
@@ -1615,6 +1630,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       execId: session.execId,
       interactionQueryId: session.interactionQueryId,
       todos: [...session.todos],
+      toolExecutionOrderCounter: session.toolExecutionOrderCounter,
       subAgentContexts:
         session.subAgentContexts.size > 0
           ? Array.from(session.subAgentContexts.values()).map((ctx) =>
@@ -2362,7 +2378,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     const baseMessages = Array.isArray(persisted.messages)
       ? persisted.messages
       : []
-    const messageRecords =
+    let messageRecords =
       Array.isArray(persisted.messageRecords) &&
       persisted.messageRecords.length > 0
         ? persisted.messageRecords
@@ -2518,6 +2534,28 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
           }
         : this.createContextState(messageRecords)
     this.syncContextRecordsFromMessageRecords(contextState, messageRecords)
+    const persistedPendingToolUseIds = Array.isArray(persisted.pendingToolCalls)
+      ? persisted.pendingToolCalls
+          .map((toolCall) => toolCall.toolCallId)
+          .filter((toolCallId) => toolCallId.trim().length > 0)
+      : []
+    const integrityRepair =
+      this.sessionContextIntegrity.repairLoadedSessionState({
+        conversationId: persisted.conversationId,
+        messageRecords,
+        contextState,
+        pendingToolUseIds: persistedPendingToolUseIds,
+      })
+    if (integrityRepair.changed) {
+      messageRecords = integrityRepair.messageRecords
+      contextState.records = integrityRepair.contextRecords
+      this.syncContextRecordsFromMessageRecords(contextState, messageRecords)
+      this.logger.warn(
+        `Repaired loaded session transcript ${persisted.conversationId}: ` +
+          `injected=${integrityRepair.injectedToolResults}, ` +
+          `removedToolResults=${integrityRepair.removedToolResults}`
+      )
+    }
     if (contextState.lastAppliedCompaction) {
       contextState.lastAppliedCompaction = {
         ...contextState.lastAppliedCompaction,
@@ -2831,6 +2869,11 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       currentStreamId: crypto.randomUUID(),
       editPathHolderByPath: new Map(),
       editPathQueueByPath: new Map(),
+      toolExecutionOrderCounter:
+        typeof persisted.toolExecutionOrderCounter === "number" &&
+        Number.isFinite(persisted.toolExecutionOrderCounter)
+          ? Math.max(0, Math.floor(persisted.toolExecutionOrderCounter))
+          : 0,
       projectContext: persisted.projectContext,
       codeChunks: persisted.codeChunks,
       // Cursor rules are request-scoped and re-sent by Cursor on each
@@ -2991,6 +3034,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       currentStreamId: crypto.randomUUID(),
       editPathHolderByPath: new Map(),
       editPathQueueByPath: new Map(),
+      toolExecutionOrderCounter: 0,
       projectContext: initialRequest?.projectContext,
       codeChunks: initialRequest?.codeChunks,
       cursorRules: initialRequest?.cursorRules,
@@ -3946,6 +3990,8 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
         execIds: new Set(),
         beforeContent,
         streamId: session.currentStreamId,
+        executionStatus: "pending",
+        executionOrder: ++session.toolExecutionOrderCounter,
         subagentOwner,
       })
       session.lastActivityAt = new Date()
@@ -4328,6 +4374,41 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     session.lastActivityAt = new Date()
     pending.startedEmitted = true
     this.schedulePersist(conversationId)
+  }
+
+  updatePendingToolExecution(
+    conversationId: string,
+    toolCallId: string,
+    update: {
+      executionOwner?: ToolExecutionOwner
+      executionStatus?: ToolExecutionStatus
+      executionRecoveryReason?: ToolExecutionRecoveryReason
+      executionOrder?: number
+    }
+  ): boolean {
+    const session = this.getSession(conversationId)
+    if (!session) return false
+    const pending = session.pendingToolCalls.get(toolCallId)
+    if (!pending) return false
+
+    if (update.executionOwner) {
+      pending.executionOwner = update.executionOwner
+    }
+    if (update.executionStatus) {
+      pending.executionStatus = update.executionStatus
+    }
+    if (update.executionRecoveryReason) {
+      pending.executionRecoveryReason = update.executionRecoveryReason
+    }
+    if (
+      typeof update.executionOrder === "number" &&
+      Number.isFinite(update.executionOrder)
+    ) {
+      pending.executionOrder = Math.max(0, Math.floor(update.executionOrder))
+    }
+    session.lastActivityAt = new Date()
+    this.schedulePersist(conversationId)
+    return true
   }
 
   getPendingToolCallIdByExecId(

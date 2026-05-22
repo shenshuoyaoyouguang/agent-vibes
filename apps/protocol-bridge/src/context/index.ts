@@ -60,6 +60,7 @@ export type {
   ContextNativeEditStrategy,
   ContextNativeManagementConfig,
 } from "./context-native-management.service"
+export { ContextPipelineService } from "./context-pipeline.service"
 export { ContextProjectionService } from "./context-projection.service"
 export { ContextRequestPlannerService } from "./context-request-planner.service"
 export type {
@@ -109,6 +110,7 @@ export type { ToolProtocolNormalizationResult } from "./tool-protocol-normalizer
 export { ToolResultCompactionService } from "./tool-result-compaction.service"
 export { ToolResultStorageService } from "./tool-result-storage.service"
 export type {
+  ToolResultStorageProcessInput,
   ToolResultStorageReadChunkResult,
   ToolResultStorageWriteResult,
 } from "./tool-result-storage.service"

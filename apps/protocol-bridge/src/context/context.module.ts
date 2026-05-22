@@ -7,6 +7,7 @@ import { ContextHookExecutorService } from "./context-hook-executor.service"
 import { ContextManagerService } from "./context-manager.service"
 import { ContextNativeCacheEditService } from "./context-native-cache-edit.service"
 import { ContextNativeManagementService } from "./context-native-management.service"
+import { ContextPipelineService } from "./context-pipeline.service"
 import { ContextProjectionService } from "./context-projection.service"
 import { ContextRequestPlannerService } from "./context-request-planner.service"
 import { ContextTelemetryService } from "./context-telemetry.service"
@@ -49,6 +50,7 @@ import { ToolResultStorageService } from "./tool-result-storage.service"
     ToolResultStorageService,
     ContextAttachmentBuilderService,
     ContextCompactRunnerService,
+    ContextPipelineService,
     ContextProjectionService,
     ContextTelemetryService,
     ContextUsageLedgerService,
@@ -68,6 +70,7 @@ import { ToolResultStorageService } from "./tool-result-storage.service"
     ToolResultStorageService,
     ContextAttachmentBuilderService,
     ContextCompactRunnerService,
+    ContextPipelineService,
     ContextProjectionService,
     ContextTelemetryService,
     ContextUsageLedgerService,
