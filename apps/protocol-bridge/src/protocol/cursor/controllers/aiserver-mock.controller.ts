@@ -27,6 +27,7 @@ import {
   AvailableModelsResponse_ModelPickerDisplayConfiguration_RoutedModelViewConfigSchema,
   AvailableModelsResponse_ModelPickerDisplayConfiguration_RoutedModelViewConfig_RoutedModelViewToNamedViewToggleSchema,
   AvailableModelsScope,
+  BackgroundComposerSource,
   BootstrapStatsigRequestSchema,
   BootstrapStatsigResponseSchema,
   CheckFeatureStatusRequestSchema,
@@ -36,6 +37,8 @@ import {
   CheckFeaturesStatusResponse_FeatureStatusSchema,
   CheckQueuePositionResponseSchema,
   CheckUsageBasedPriceResponseSchema,
+  DeletePendingFollowupRequestSchema,
+  DeletePendingFollowupResponseSchema,
   FindBugsResponseSchema,
   GetCloudSetupBlockersResponseSchema,
   GetCurrentPeriodUsageResponseSchema,
@@ -61,8 +64,12 @@ import {
   KnowledgeBaseRemoveResponseSchema,
   KnowledgeBaseUpdateRequestSchema,
   KnowledgeBaseUpdateResponseSchema,
+  ListBackgroundComposersResponseSchema,
+  ListPendingFollowupsRequestSchema,
+  ListPendingFollowupsResponseSchema,
   NameTabRequestSchema,
   NameTabResponseSchema,
+  PendingFollowupSchema,
   PrivacyCheckResponseSchema,
   ReportAgentFeedbackResponseSchema,
   SubmitSpansResponseSchema,
@@ -95,7 +102,10 @@ import {
   resolveCursorDefaultSelection,
   selectPreferredCursorModelName,
 } from "../cursor-model-protocol"
+import { CursorConnectStreamService } from "../cursor-connect-stream.service"
 import { KnowledgeBaseService } from "../knowledge-base.service"
+import { SessionLifecycleService } from "../session/session-lifecycle.service"
+import { SessionStreamService } from "../session/session-stream.service"
 
 const ENABLED_CURSOR_FEATURES = new Set<string>([
   "react_shell_tool",
@@ -262,7 +272,10 @@ export class AiserverMockController {
     private readonly kiroService: KiroService,
     private readonly modelRouter: ModelRouterService,
     private readonly openaiCompatService: OpenaiCompatService,
-    private readonly knowledgeBaseService: KnowledgeBaseService
+    private readonly knowledgeBaseService: KnowledgeBaseService,
+    private readonly sessionManager: SessionLifecycleService,
+    private readonly sessionStream: SessionStreamService,
+    private readonly streamService: CursorConnectStreamService
   ) {}
 
   private isGptBackendAvailable(): boolean {
@@ -401,7 +414,17 @@ export class AiserverMockController {
         includeCodex: this.isGptBackendAvailable(),
         codexModelTier: this.getCursorGptModelTier(),
         excludeMaxNamedModels: options?.excludeMaxNamedModels ?? false,
-        extraModels: this.anthropicApiService.getCursorDisplayModels(),
+        // Static GEMINI_CURSOR_DISPLAY_MODELS only enumerates the IDs we
+        // hard-coded. Antigravity Cloud Code keeps adding Gemini models
+        // (e.g. gemini-3.5-flash-low, gemini-pro-agent); inject whatever the
+        // worker discovered at runtime so they show up in Cursor's model
+        // picker. getCursorDisplayModels' dedup keeps the first occurrence,
+        // so curated static entries still win and dynamic ones only fill
+        // the gaps.
+        extraModels: [
+          ...this.anthropicApiService.getCursorDisplayModels(),
+          ...this.googleModelCache.getCursorDisplayModels(),
+        ],
       }),
       options?.additionalModelNames
     )
@@ -629,6 +652,108 @@ export class AiserverMockController {
           }
         ),
       }
+    )
+  }
+
+  // ── AiService: PendingFollowup reconcile ──
+  //
+  // The IDE's queued-followup panel is a server-authoritative list:
+  // on reconnect / supersede / cross-device sync, the IDE asks
+  // `ListPendingFollowups` to learn which async ask_question calls
+  // the bridge is still tracking, and renders one "queued" entry per
+  // returned PendingFollowup. The bridge is the source of truth —
+  // any followup the bridge no longer remembers is dropped from the
+  // IDE's local state. This is what closes the queued-badge leak
+  // path 1:13:51 / 1:18:47 produced before deadlines + reconcile
+  // were wired in.
+
+  @Post("aiserver.v1.AiService/ListPendingFollowups")
+  handleListPendingFollowups(
+    @Req() req: FastifyRequest,
+    @Res() res: FastifyReply
+  ): void {
+    let bcId: string | undefined
+    const body = req?.body
+    if (body instanceof Uint8Array || Buffer.isBuffer(body)) {
+      try {
+        const request = fromBinary(
+          ListPendingFollowupsRequestSchema,
+          new Uint8Array(body)
+        )
+        bcId = request.bcId
+      } catch (err) {
+        this.logger.warn(
+          `ListPendingFollowups: failed to parse request body: ${(err as Error).message}`
+        )
+      }
+    }
+
+    const followups = this.sessionStream.listAsyncAskFollowups(bcId)
+    const response = create(ListPendingFollowupsResponseSchema, {
+      pendingFollowups: followups.map((f) =>
+        create(PendingFollowupSchema, {
+          followupId: f.followupId,
+          text: f.text,
+          richText: "",
+          createdAtMs: BigInt(f.createdAtMs),
+          source: BackgroundComposerSource.UNSPECIFIED,
+          cursorCommands: [],
+          cursorCommandsExplicitlySet: false,
+          pastChats: [],
+          pastChatsExplicitlySet: false,
+          blobData: [],
+        })
+      ),
+    })
+    this.logger.log(
+      `ListPendingFollowups: bcId=${bcId ?? "(any)"} returned=${followups.length}`
+    )
+    this.sendProto(res, ListPendingFollowupsResponseSchema, response)
+  }
+
+  @Post("aiserver.v1.AiService/DeletePendingFollowup")
+  handleDeletePendingFollowup(
+    @Req() req: FastifyRequest,
+    @Res() res: FastifyReply
+  ): void {
+    let followupId: string | undefined
+    const body = req?.body
+    if (body instanceof Uint8Array || Buffer.isBuffer(body)) {
+      try {
+        const request = fromBinary(
+          DeletePendingFollowupRequestSchema,
+          new Uint8Array(body)
+        )
+        followupId = request.followupId
+      } catch (err) {
+        this.logger.warn(
+          `DeletePendingFollowup: failed to parse request body: ${(err as Error).message}`
+        )
+      }
+    }
+
+    if (followupId) {
+      const found = this.sessionStream.findAsyncAskFollowupById(followupId)
+      if (found) {
+        this.streamService.expireAsyncAskQuestion(
+          found.conversationId,
+          found.queryId,
+          "user_deleted"
+        )
+        this.logger.log(
+          `DeletePendingFollowup: followupId=${followupId} cleared from ${found.conversationId}`
+        )
+      } else {
+        this.logger.warn(
+          `DeletePendingFollowup: followupId=${followupId} not found in any in-memory session`
+        )
+      }
+    }
+
+    this.sendProto(
+      res,
+      DeletePendingFollowupResponseSchema,
+      create(DeletePendingFollowupResponseSchema, {})
     )
   }
 
@@ -1515,6 +1640,17 @@ export class AiserverMockController {
   )
   handleGetBackgroundComposerUserSettings(@Res() res: FastifyReply): void {
     this.sendEmpty(res)
+  }
+
+  @Post("aiserver.v1.BackgroundComposerService/ListBackgroundComposers")
+  handleListBackgroundComposers(@Res() res: FastifyReply): void {
+    const response = create(ListBackgroundComposersResponseSchema, {
+      composers: [],
+      didLoadStatus: true,
+      hasMore: false,
+      participants: [],
+    })
+    this.sendProto(res, ListBackgroundComposersResponseSchema, response)
   }
 
   @Post("aiserver.v1.BackgroundComposerService/GetGithubAccessTokenForRepos")

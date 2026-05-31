@@ -103,53 +103,6 @@ export class ToolResultStorageService {
     }
   }
 
-  pruneReplacementState(
-    replacementState: ContextToolResultReplacementState | undefined,
-    validToolUseIds: Iterable<string>,
-    conversationId?: string
-  ): { removedReplacements: number; removedStoredReferences: number } {
-    if (!replacementState) {
-      return { removedReplacements: 0, removedStoredReferences: 0 }
-    }
-
-    const valid = new Set(validToolUseIds)
-    const previousReplacementCount = Object.keys(
-      replacementState.replacementByToolUseId || {}
-    ).length
-    const previousStoredCount = Object.keys(
-      replacementState.storedByToolUseId || {}
-    ).length
-
-    replacementState.seenToolUseIds = (
-      replacementState.seenToolUseIds || []
-    ).filter((toolUseId) => valid.has(toolUseId))
-    replacementState.replacementByToolUseId = Object.fromEntries(
-      Object.entries(replacementState.replacementByToolUseId || {}).filter(
-        ([toolUseId]) => valid.has(toolUseId)
-      )
-    )
-    replacementState.storedByToolUseId = Object.fromEntries(
-      Object.entries(replacementState.storedByToolUseId || {}).filter(
-        ([toolUseId, reference]) =>
-          valid.has(toolUseId) &&
-          (!conversationId ||
-            this.hasStoredToolResult(conversationId, toolUseId, reference))
-      )
-    )
-    replacementState.records = (replacementState.records || []).filter(
-      (record) => valid.has(record.toolUseId)
-    )
-
-    return {
-      removedReplacements:
-        previousReplacementCount -
-        Object.keys(replacementState.replacementByToolUseId).length,
-      removedStoredReferences:
-        previousStoredCount -
-        Object.keys(replacementState.storedByToolUseId).length,
-    }
-  }
-
   hasStoredToolResult(
     conversationId: string,
     toolUseId: string,
@@ -285,6 +238,53 @@ export class ToolResultStorageService {
       recursive: true,
       force: true,
     })
+  }
+
+  /**
+   * Wipe every per-conversation directory under the tool-results root,
+   * including orphan directories whose conversation has already been
+   * removed from the SQLite sessions table. Returns the number of
+   * top-level entries that were deleted so the caller can report a
+   * progress count.
+   *
+   * The root directory itself is preserved (and recreated if it was
+   * missing) so subsequent writes don't have to re-mkdir on every
+   * tool result.
+   */
+  clearAll(): { clearedDirCount: number } {
+    const root = this.getStorageRoot()
+    let clearedDirCount = 0
+    let entries: string[] = []
+    try {
+      entries = fs.existsSync(root) ? fs.readdirSync(root) : []
+    } catch (error) {
+      this.logger.warn(
+        `Failed to enumerate tool-results root ${root}: ${String(error)}`
+      )
+      return { clearedDirCount }
+    }
+
+    for (const entry of entries) {
+      const target = path.join(root, entry)
+      try {
+        fs.rmSync(target, { recursive: true, force: true })
+        clearedDirCount++
+      } catch (error) {
+        this.logger.warn(
+          `Failed to remove tool-results entry ${target}: ${String(error)}`
+        )
+      }
+    }
+
+    try {
+      fs.mkdirSync(root, { recursive: true })
+    } catch (error) {
+      this.logger.warn(
+        `Failed to recreate tool-results root ${root}: ${String(error)}`
+      )
+    }
+
+    return { clearedDirCount }
   }
 
   private isStoredToolResultReferenceContent(content: string): boolean {
@@ -470,8 +470,16 @@ export class ToolResultStorageService {
     ]
 
     if (reference.chunkCount > 1) {
+      // The full output was archived to disk; this hint must NOT name a
+      // specific "continue reading" tool. The bridge-internal documentId
+      // (`tool_result:<toolUseId>`) is not addressable by Antigravity's
+      // `view_content_chunk` (which only knows DocumentIds produced by
+      // `read_url_content`), and Cursor's protocol has no chunk-readout
+      // tool at all. Surface the fact ("archived, N chunks") and tell the
+      // model to re-invoke the original tool if it needs to look again —
+      // this is the only continuation that is correct on every backend.
       lines.push(
-        `Use view_content_chunk with document_id="${reference.documentId}" and position=2..${reference.chunkCount} to continue reading. Positions are 1-based; position=0 also returns the first chunk.`
+        `Note: this tool's full output (${reference.originalSizeChars} chars, ${reference.chunkCount} chunks) was archived on disk. To re-examine the full content, re-invoke the same tool with the same arguments; the bridge will return a fresh result.`
       )
     }
 

@@ -3,10 +3,6 @@ import { findRoundAlignedTruncationIndex } from "./api-round-grouping"
 import { ContextTelemetryService } from "./context-telemetry.service"
 import { TokenCounterService } from "./token-counter.service"
 import {
-  enforceToolProtocol,
-  type EnforceToolProtocolOptions,
-} from "./tool-protocol-integrity"
-import {
   ToolPair,
   UnifiedMessage,
   isToolResultBlock,
@@ -15,14 +11,21 @@ import {
 } from "./types"
 
 /**
- * Result of sanitizeMessages operation
+ * Tool-protocol mode used by integrity-aware truncation helpers.
+ *
+ * - `strict-adjacent` (default for backends that require tool_result to follow
+ *   its tool_use in the previous assistant message immediately).
+ * - `global` (the bridge's normal storage view, where tool_result may match
+ *   any earlier assistant tool_use across the transcript).
  */
-export interface SanitizeResult {
-  messages: UnifiedMessage[]
-  removedOrphanToolUses: number
-  removedOrphanToolResults: number
-  removedEmptyMessages: number
-  mergedConsecutiveMessages: number
+export interface EnforceToolProtocolOptions {
+  mode?: "strict-adjacent" | "global"
+  /**
+   * Tool-use IDs whose results are not yet committed to the transcript but
+   * are legitimately tracked elsewhere (e.g. ledger). Truncation paths
+   * must keep these tool_use blocks rather than treating them as orphans.
+   */
+  pendingToolUseIds?: Iterable<string>
 }
 
 /**
@@ -444,61 +447,6 @@ export class ToolIntegrityService {
   }
 
   /**
-   * Validate that messages have proper tool integrity
-   * Returns list of issues found
-   */
-  validateIntegrity(messages: UnifiedMessage[]): string[] {
-    const issues: string[] = []
-    const toolPairs = this.buildToolPairMap(messages)
-
-    // Collect all tool IDs
-    const allToolUseIds = new Set<string>()
-    const allToolResultIds = new Set<string>()
-
-    for (const msg of messages) {
-      for (const id of this.extractToolUseIds(msg)) {
-        allToolUseIds.add(id)
-      }
-      for (const id of this.extractToolResultIds(msg)) {
-        allToolResultIds.add(id)
-      }
-    }
-
-    // Check for orphaned tool_results
-    for (const id of allToolResultIds) {
-      if (!allToolUseIds.has(id)) {
-        issues.push(`Orphaned tool_result: ${id} (no matching tool_use)`)
-      }
-    }
-
-    // Check for tool_uses without results (warning, not error)
-    for (const id of allToolUseIds) {
-      if (!allToolResultIds.has(id)) {
-        const pair = toolPairs.get(id)
-        if (pair) {
-          issues.push(
-            `Tool_use without result: ${id} (${pair.tool_name}) - may be pending`
-          )
-        }
-      }
-    }
-
-    // Check message order: tool_use should come before its tool_result
-    for (const [id, pair] of toolPairs) {
-      if (
-        pair.tool_result_message_index !== null &&
-        pair.tool_result_message_index <= pair.tool_use_message_index
-      ) {
-        issues.push(
-          `Tool order violation: result for ${id} appears before or at same index as use`
-        )
-      }
-    }
-
-    return issues
-  }
-
-  /**
    * Extract messages with tool integrity preserved while staying within the
    * requested token budget.
    */
@@ -591,71 +539,5 @@ export class ToolIntegrityService {
     }
 
     return orphans
-  }
-
-  /**
-   * Sanitize messages to ensure tool protocol integrity.
-   *
-   * This is the single entry point for post-truncation repair:
-   * 1. Preserve pending tool_use blocks that may still be waiting on results
-   * 2. Reverse cleanup: remove tool_result blocks without matching tool_use
-   * 3. Remove messages that become empty after cleanup
-   * 4. Merge consecutive same-role messages (invalid for most backends)
-   */
-  sanitizeMessages(
-    messages: UnifiedMessage[],
-    options?: EnforceToolProtocolOptions
-  ): SanitizeResult {
-    if (messages.length === 0) {
-      return {
-        messages: [],
-        removedOrphanToolUses: 0,
-        removedOrphanToolResults: 0,
-        removedEmptyMessages: 0,
-        mergedConsecutiveMessages: 0,
-      }
-    }
-
-    // Delegate all repair logic to the unified tool protocol integrity helper
-    const guardResult = enforceToolProtocol(
-      messages as Array<
-        UnifiedMessage & { role: "user" | "assistant"; content: unknown }
-      >,
-      {
-        mode: options?.mode ?? "global",
-        pendingToolUseIds: options?.pendingToolUseIds,
-      }
-    )
-
-    const result: SanitizeResult = {
-      messages: guardResult.messages as UnifiedMessage[],
-      // "removedOrphanToolUses" is repurposed: counts synthetic tool_result injected
-      removedOrphanToolUses: guardResult.injectedToolResults,
-      removedOrphanToolResults: guardResult.removedToolResults,
-      removedEmptyMessages: guardResult.removedEmptyMessages,
-      mergedConsecutiveMessages: 0,
-    }
-
-    if (guardResult.changed) {
-      this.logger.warn(
-        `Sanitized messages: injected ${result.removedOrphanToolUses} synthetic tool_result for orphan tool_use, ` +
-          `removed ${result.removedOrphanToolResults} orphan tool_result, ` +
-          `${result.removedEmptyMessages} empty message(s)`
-      )
-      if (guardResult.removedToolResults > 0) {
-        this.telemetry.recordEvent({
-          event: "integrity.orphan_tool_result_removed",
-          delta: guardResult.removedToolResults,
-        })
-      }
-      if (guardResult.injectedToolResults > 0) {
-        this.telemetry.recordEvent({
-          event: "integrity.synthetic_tool_result_injected",
-          delta: guardResult.injectedToolResults,
-        })
-      }
-    }
-
-    return result
   }
 }

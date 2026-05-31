@@ -479,6 +479,35 @@
         border-color: color-mix(in srgb, var(--bad) 45%, transparent);
         color: #fff;
       }
+      .endpoint-status {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 1px 8px;
+        border-radius: 999px;
+        background: color-mix(in srgb, var(--fg-3) 12%, transparent);
+        color: var(--fg-2);
+        font-size: var(--text-xs);
+        font-weight: 600;
+        white-space: nowrap;
+      }
+      .endpoint-status-good {
+        color: var(--good);
+        background: color-mix(in srgb, var(--good) 16%, transparent);
+      }
+      .endpoint-status-warn {
+        color: var(--warn);
+        background: color-mix(in srgb, var(--warn) 16%, transparent);
+      }
+      .endpoint-status-busy {
+        color: var(--focus);
+        background: color-mix(in srgb, var(--focus) 16%, transparent);
+      }
+      .endpoint-actions {
+        display: flex;
+        gap: var(--sp-1);
+        align-items: center;
+      }
       .account-actions {
         display: flex;
         align-items: center;
@@ -796,6 +825,13 @@
       .toggle.on .toggle-track::after {
         transform: translateX(14px);
         background: #fff;
+      }
+      .toggle.on.toggle-good .toggle-track {
+        background: var(--good);
+        border-color: var(--good);
+      }
+      .toggle.on.toggle-good .toggle-label {
+        color: var(--good);
       }
       .toggle-label {
         font-size: var(--text-sm);
@@ -1329,6 +1365,14 @@
         <button
           type="button"
           class="tab"
+          data-tab="endpoints"
+          data-i18n="tab.endpoints"
+        >
+          API
+        </button>
+        <button
+          type="button"
+          class="tab"
           data-tab="accounts"
           data-i18n="tab.accounts"
         >
@@ -1436,15 +1480,6 @@
           </div>
           <div class="btn-row" id="hero-actions"></div>
         </div>
-        <!-- Backends: cards with actions -->
-        <div class="section">
-          <div class="section-head">
-            <span class="section-title" data-i18n="section.backends"
-              >Backends</span
-            >
-          </div>
-          <div class="backends" id="overview-backends"></div>
-        </div>
       </div>
 
       <!-- ── Accounts ── -->
@@ -1477,6 +1512,38 @@
               Select an account to view details
             </div>
           </div>
+        </div>
+      </div>
+
+      <!-- ── API Endpoints ── -->
+      <div id="pane-endpoints" class="pane">
+        <div class="section">
+          <div class="section-head">
+            <span class="section-title" data-i18n="endpoints.title"
+              >API Endpoints</span
+            >
+            <button
+              type="button"
+              class="btn btn-ghost"
+              onclick="refreshEndpointsTab()"
+              title="Refresh"
+              data-i18n="refresh"
+            >
+              Refresh
+            </button>
+          </div>
+          <div
+            style="
+              color: var(--fg-2);
+              font-size: var(--text-sm);
+              margin-bottom: var(--sp-4);
+            "
+            data-i18n="endpoints.subtitle"
+          >
+            HTTP endpoints exposed by this bridge. Copy a URL, run a
+            connectivity test, or wire it into the matching client.
+          </div>
+          <div id="endpoints-list"></div>
         </div>
       </div>
 
@@ -1900,7 +1967,7 @@
           barCls: "ch-bar-cl",
           beCls: "be-cl",
           color: "#f87171",
-          mode: "form",
+          mode: "claude-oauth",
           sync: [{ label: "Sync Claude", cmd: "agentVibes.syncClaude" }],
           fields: [
             { key: "label", label: "Label", type: "text" },
@@ -2116,6 +2183,9 @@
           if (t.dataset.tab === "accounts") {
             refreshPoolStatus(false, false)
           }
+          if (t.dataset.tab === "endpoints") {
+            refreshEndpointsTab()
+          }
           if (t.dataset.tab === "analytics") {
             if (!hasAnalyticsCache()) restoreAnalyticsCache()
             refreshUsageSummary()
@@ -2143,8 +2213,17 @@
             KEY_MODEL_FILTERS[1].label = L("model.claudeOpus")
           }
           renderStatus(m.data)
+          // API Endpoints tab reflects forwarding state in real time,
+          // so re-render it on every status push when the pane is active.
+          renderEndpointsTabIfActive()
           if (isAnalyticsPaneActive()) {
             refreshUsageSummary()
+          }
+        }
+        if (m.type === "commandFinished") {
+          var pending = getPendingCommand()
+          if (pending && (!m.command || m.command === pending.command)) {
+            clearPendingCommand(true)
           }
         }
         if (m.type === "accountsUpdate") {
@@ -2154,7 +2233,6 @@
           ACCT_PROVIDER_GROUPS[1].label = L("group.openai")
           ACCT_PROVIDER_GROUPS[2].label = L("group.anthropic")
           renderAccounts(m.data)
-          renderBackendSummary(m.data)
         }
         if (m.type === "settingsUpdate") renderSettings(m.data)
         if (m.type === "logsUpdate") {
@@ -2193,6 +2271,9 @@
         if (m.type === "oauthStatus") handleOAuthStatus(m.data)
         if (m.type === "codexOAuthStatus") handleCodexOAuthStatus(m.data)
         if (m.type === "kiroOAuthStatus") handleKiroOAuthStatus(m.data)
+        if (m.type === "claudeOAuthStatus") handleClaudeOAuthStatus(m.data)
+        if (m.type === "claudeIntegrationUpdate")
+          handleClaudeIntegrationUpdate(m.data)
         if (m.type === "kiroQuotaUpdate") handleKiroQuotaUpdate(m.data)
         if (m.type === "contextTelemetryUpdate")
           handleContextTelemetryUpdate(m.data)
@@ -2236,6 +2317,10 @@
             label: L("action.disableForwarding"),
             tone: "secondary",
           },
+          "agentVibes.clearCache": {
+            label: L("action.clearCache"),
+            tone: "secondary",
+          },
         }
       }
       var ACTION_TIMEOUTS = {
@@ -2244,6 +2329,7 @@
         "agentVibes.restartServer": 60000,
         "agentVibes.enableForwarding": 45000,
         "agentVibes.disableForwarding": 45000,
+        "agentVibes.clearCache": 60000,
       }
 
       function esc(v) {
@@ -2315,11 +2401,30 @@
         }
       }
 
+      // Hard ceiling: even if reconcilePendingCommand never sees a state
+      // flip and no commandFinished message arrives (e.g. backend command
+      // never resolves because user dismissed a confirmation dialog),
+      // the pending lock must release so buttons become clickable again.
+      // We pad the per-command timeout with a small grace window so the
+      // ACTION_TIMEOUTS soft deadline still fires first when the system
+      // is healthy.
+      var PENDING_HARD_TIMEOUT_GRACE_MS = 5000
+
       function startPendingPoll() {
         if (window.__cmdPollTimer) return
         window.__cmdPollTimer = setInterval(function () {
-          if (!window.__pendingCommand) {
+          var pending = window.__pendingCommand
+          if (!pending) {
             clearPendingCommand(false)
+            return
+          }
+          var hardLimit =
+            getPendingTimeout(pending.command) + PENDING_HARD_TIMEOUT_GRACE_MS
+          if (Date.now() - pending.startedAt >= hardLimit) {
+            // Last-resort release: reconcilePendingCommand never observed
+            // a terminal state and no commandFinished arrived. Surface
+            // the buttons again rather than trapping the user.
+            clearPendingCommand(true)
             return
           }
           vscode.postMessage({ type: "getAll" })
@@ -2355,22 +2460,14 @@
         var pending = getPendingCommand()
         if (!pending || !status) return null
 
+        // Server start/stop is independent from Cursor IDE forwarding —
+        // forwarding is its own user-driven action managed in the
+        // Clients tab. Don't auto-chain enable/disable forwarding into
+        // startServer/stopServer completion.
         switch (pending.command) {
           case "agentVibes.stopServer":
-            if (status.bridge === "Running" || status.bridge === "starting") {
-              return "agentVibes.stopServer"
-            }
-            if (pending.initialForwarding && status.forwarding) {
-              return "agentVibes.disableForwarding"
-            }
             return "agentVibes.stopServer"
           case "agentVibes.startServer":
-            if (status.bridge !== "Running") {
-              return "agentVibes.startServer"
-            }
-            if (!status.forwarding) {
-              return "agentVibes.enableForwarding"
-            }
             return "agentVibes.startServer"
           case "agentVibes.restartServer":
             return "agentVibes.restartServer"
@@ -2396,15 +2493,10 @@
         var done = false
         switch (pending.command) {
           case "agentVibes.stopServer":
-            done =
-              status.bridge !== "Running" &&
-              status.bridge !== "starting" &&
-              (!pending.initialForwarding || !status.forwarding)
+            done = status.bridge !== "Running" && status.bridge !== "starting"
             break
           case "agentVibes.startServer":
-            done =
-              status.bridge === "error" ||
-              (status.bridge === "Running" && status.forwarding)
+            done = status.bridge === "error" || status.bridge === "Running"
             break
           case "agentVibes.restartServer":
             done =
@@ -2412,10 +2504,13 @@
               (pending.sawBridgeLeaveRunning && status.bridge === "Running")
             break
           case "agentVibes.enableForwarding":
-            done = !!status.forwarding
-            break
           case "agentVibes.disableForwarding":
-            done = !status.forwarding
+            done =
+              !!status.forwarding ===
+              (pending.command === "agentVibes.enableForwarding")
+            break
+          case "agentVibes.clearCache":
+            done = false
             break
         }
 
@@ -2506,6 +2601,12 @@
             tone: isRunning ? "primary" : "secondary",
           })
         }
+
+        baseActions.push({
+          label: L("action.clearCache"),
+          command: "agentVibes.clearCache",
+          tone: "secondary",
+        })
 
         if (
           pendingDisplayCommand &&
@@ -2687,84 +2788,6 @@
         const text = String(value).trim()
         if (!text) return "--"
         return text.charAt(0).toLowerCase() === "v" ? text : "v" + text
-      }
-
-      // ── Overview: backends ──
-      function renderBackendSummary(data) {
-        const el = document.getElementById("overview-backends")
-        // Model mapping per backend
-        const BACKEND_MODELS = {
-          antigravity: [L("model.gemini"), L("model.claudeOpus")],
-          codex: [L("model.gpt"), L("model.codex")],
-          "openai-compat": [L("model.custom")],
-          "claude-api": [L("model.claudeOpus")],
-          kiro: [L("model.claudeSonnet"), L("model.claudeOpus")],
-        }
-        let h = ""
-        for (const [k, d] of Object.entries(CH)) {
-          const n = getChannelState(data, k).accounts.length
-          // Build action buttons like sidebar
-          let btns = ""
-          if (d.sync && d.sync.length > 0) {
-            for (const s of d.sync) {
-              btns +=
-                '<button class="btn btn-primary" onclick="runCmd(\'' +
-                s.cmd +
-                "')\">" +
-                esc(s.label) +
-                "</button>"
-            }
-          }
-
-          // Model tags
-          let modelTags = ""
-          if (n > 0 && BACKEND_MODELS[k]) {
-            modelTags = '<div style="display:flex;flex-wrap:wrap;gap:6px">'
-            for (const m of BACKEND_MODELS[k]) {
-              modelTags +=
-                '<span class="setting-badge setting-badge-ok">' +
-                esc(m) +
-                "</span>"
-            }
-            modelTags += "</div>"
-          }
-
-          h +=
-            '<div class="be ' +
-            d.beCls +
-            '">' +
-            '<div class="be-top">' +
-            '<span class="be-name" style="cursor:pointer" onclick="switchTab(\'accounts\')">' +
-            esc(d.label) +
-            "</span>" +
-            '<button type="button" class="btn" onclick="openDlg(\'' +
-            k +
-            '\')" title="' +
-            esc(L("backend.addAccountTitle")) +
-            '" style="padding:0 8px;font-size:14px;font-weight:700;background:' +
-            d.color +
-            ';color:#000;border:none">+</button>' +
-            "</div>" +
-            (n === 0
-              ? '<div class="be-status">' +
-                esc(L("backend.notConfigured")) +
-                "</div>"
-              : "") +
-            modelTags +
-            (btns || n > 0
-              ? '<div class="btn-row" style="margin-top:0">' +
-                btns +
-                (n > 0
-                  ? '<span class="be-status">' +
-                    esc(formatL(L("backend.accountCount"), { n: n })) +
-                    "</span>"
-                  : "") +
-                "</div>"
-              : "") +
-            "</div>"
-        }
-        el.innerHTML = h
-        renderOverviewHealth()
       }
 
       // ── Accounts tab ──
@@ -3422,20 +3445,32 @@
         h += '<div style="display:flex;gap:var(--sp-2);margin-top:var(--sp-3)">'
         if (d.sync && d.sync.length > 0) {
           for (var si = 0; si < d.sync.length; si++) {
+            var syncTitle =
+              selectedChannel === "claude-api" &&
+              d.sync[si].cmd === "agentVibes.syncClaude"
+                ? "Import credentials from ~/.claude/settings.json"
+                : ""
             h +=
-              '<button class="btn btn-secondary" onclick="runCmd(\'' +
+              '<button class="btn btn-secondary" ' +
+              (syncTitle ? 'title="' + esc(syncTitle) + '" ' : "") +
+              "onclick=\"runCmd('" +
               d.sync[si].cmd +
               "')\">" +
               esc(d.sync[si].label) +
               "</button>"
           }
         }
+        // Kiro: one-click force-login. Push an EXISTING pool account's
+        // credentials into a selected local Kiro login store.
         h +=
           '<button type="button" class="btn btn-primary" onclick="openDlg(\'' +
           selectedChannel +
           "')\">" +
           esc(L("accounts.add")) +
           "</button>"
+        // Claude Code CLI bridge wiring lives in the dedicated Clients
+        // tab; the channel detail here only manages upstream Claude API
+        // accounts.
         // Register button hidden
         // if (selectedChannel === 'codex') {
         //   h += '<button class="btn btn-secondary" onclick="switchCodexSubView(\'register\')" style="background:var(--focus);color:#fff;border:none">Register</button>';
@@ -3449,6 +3484,9 @@
             : '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1 8s2.5-5 7-5 7 5 7 5-2.5 5-7 5-7-5-7-5z"/><circle cx="8" cy="8" r="2.5"/><line x1="2" y1="14" x2="14" y2="2"/></svg>') +
           "</button>"
         h += "</div>"
+
+        // CC CLI integration status moved to the Clients tab.
+
         h += "</div>"
 
         // Account list (paginated)
@@ -3582,6 +3620,34 @@
                 esc(L("accounts.cliTitle")) +
                 '">' +
                 esc(L("accounts.cli")) +
+                "</button>"
+            }
+            if (selectedChannel === "kiro" && acct.authMethod !== "api_key") {
+              h +=
+                '<button type="button" class="btn btn-secondary account-action-btn" onclick="forceKiroIdeLogin(' +
+                i +
+                ')" title="' +
+                esc(
+                  L(
+                    "accounts.kiroForceLoginTitle",
+                    "Sign the local Kiro IDE in as this account"
+                  )
+                ) +
+                '">' +
+                esc(L("accounts.kiroForceLogin", "Login IDE")) +
+                "</button>"
+              h +=
+                '<button type="button" class="btn btn-secondary account-action-btn" onclick="forceKiroCliLogin(' +
+                i +
+                ')" title="' +
+                esc(
+                  L(
+                    "accounts.kiroForceCliLoginTitle",
+                    "Sign the local Kiro CLI in as this account"
+                  )
+                ) +
+                '">' +
+                esc(L("accounts.kiroForceCliLogin", "Login CLI")) +
                 "</button>"
             }
             h +=
@@ -3878,6 +3944,9 @@
                 esc(item.value) +
                 "</span>"
             } else if (item.type === "actions") {
+              if (item.value !== undefined) {
+                ch += '<span class="setting-val">' + esc(item.value) + "</span>"
+              }
               ch += '<div class="setting-actions">'
               if (item.actions) {
                 for (var ai = 0; ai < item.actions.length; ai++) {
@@ -4038,6 +4107,13 @@
           )
           kiroOAuthTab = "oauth"
           renderKiroDlg()
+        } else if (d.mode === "claude-oauth") {
+          title.textContent = formatL(
+            L(dlgMode === "edit" ? "dlg.editAccount" : "dlg.addAccount"),
+            { channel: d.label }
+          )
+          claudeOAuthTab = "oauth"
+          renderClaudeDlg()
         } else if (d.mode === "sync") {
           title.textContent = formatL(
             L(dlgMode === "edit" ? "dlg.editToken" : "dlg.addToken"),
@@ -4375,6 +4451,586 @@
         }
       }
 
+      // ── Claude Code CLI OAuth Dialog ──
+      // Tab values:
+      //   "oauth"  = Anthropic OAuth + PKCE redirect flow (new account written
+      //              into claude-api-accounts.json with refresh_token)
+      //   "apikey" = manual API-key form (legacy / third-party Claude relays)
+      var claudeOAuthTab = "oauth"
+
+      function renderClaudeDlg() {
+        var fields = document.getElementById("dlg-fields")
+        var okBtn = document.getElementById("dlg-ok")
+        var d = CH["claude-api"]
+        var isOAuth = claudeOAuthTab === "oauth"
+        var h = ""
+
+        h += '<div class="oauth-tabs">'
+        h +=
+          '<button type="button" class="oauth-tab' +
+          (isOAuth ? " active" : "") +
+          '" onclick="switchClaudeOAuthTab(\'oauth\')">' +
+          esc("Anthropic OAuth") +
+          "</button>"
+        h +=
+          '<button type="button" class="oauth-tab' +
+          (!isOAuth ? " active" : "") +
+          '" onclick="switchClaudeOAuthTab(\'apikey\')">' +
+          esc("API Key") +
+          "</button>"
+        h += "</div>"
+
+        h += '<div class="dlg-body">'
+
+        if (isOAuth) {
+          h += '<div style="padding:var(--sp-3) 0">'
+          h +=
+            '<div style="font-size:var(--text-sm);color:var(--fg-2);line-height:1.6">'
+          h +=
+            "Sign in with Claude.ai to add a Claude Code CLI OAuth account. A browser window will open for you to approve access; the bridge writes the resulting tokens into claude-api-accounts.json and refreshes them automatically."
+          h += "</div>"
+          h +=
+            '<div id="claude-oauth-status" style="margin-top:var(--sp-3)"></div>'
+          h += "</div>"
+
+          okBtn.textContent = L("oauth.startAuth")
+          okBtn.disabled = false
+          okBtn.onclick = startClaudeOAuth
+        } else {
+          // API Key paste tab — reuse the existing claude-api fields[]
+          var fh = ""
+          for (var i = 0; i < d.fields.length; i++) {
+            var f = d.fields[i]
+            var currentValue = ""
+            if (
+              dlgInitialData &&
+              dlgInitialData[f.key] !== undefined &&
+              dlgInitialData[f.key] !== null
+            ) {
+              currentValue = String(dlgInitialData[f.key])
+            } else if (
+              f.key === "proxyUrl" &&
+              lastStatusData &&
+              lastStatusData.defaultProxyUrl
+            ) {
+              currentValue = String(lastStatusData.defaultProxyUrl)
+            } else if (
+              f.defaultValue !== undefined &&
+              f.defaultValue !== null
+            ) {
+              currentValue = String(f.defaultValue)
+            }
+            fh +=
+              '<div class="field"><label>' +
+              esc(f.label) +
+              "</label>" +
+              '<input type="' +
+              f.type +
+              '" id="f-' +
+              f.key +
+              '" placeholder="' +
+              esc(f.ph || "") +
+              '" value="' +
+              esc(currentValue) +
+              '" /></div>'
+          }
+          h += fh
+
+          okBtn.textContent = dlgMode === "edit" ? L("dlg.save") : L("dlg.add")
+          okBtn.disabled = false
+          okBtn.onclick = submitDlg
+        }
+
+        h += "</div>"
+        fields.innerHTML = h
+      }
+
+      function switchClaudeOAuthTab(tab) {
+        claudeOAuthTab = tab
+        renderClaudeDlg()
+        if (tab === "apikey") {
+          setTimeout(function () {
+            var el = document.querySelector("#dlg-fields input")
+            if (el) el.focus()
+          }, 80)
+        }
+      }
+
+      function startClaudeOAuth() {
+        var btn = document.getElementById("dlg-ok")
+        if (btn) {
+          btn.disabled = true
+          btn.textContent = L("oauth.openingBrowser")
+        }
+        vscode.postMessage({ type: "startClaudeOAuth" })
+      }
+
+      function handleClaudeOAuthStatus(data) {
+        var el = document.getElementById("claude-oauth-status")
+        if (!el) return
+        var btn = document.getElementById("dlg-ok")
+        if (data.status === "loading") {
+          el.innerHTML =
+            '<div style="color:var(--fg-2);font-size:var(--text-sm)">' +
+            esc(data.message || L("oauth.waiting")) +
+            "</div>"
+        } else if (data.status === "success") {
+          el.innerHTML =
+            '<div style="color:var(--good);font-size:var(--text-sm)">' +
+            esc(data.message || "Account saved") +
+            "</div>"
+          if (btn) {
+            btn.disabled = false
+            btn.textContent = L("dlg.add")
+            btn.onclick = function () {
+              closeDlg()
+            }
+          }
+          setTimeout(function () {
+            closeDlg()
+          }, 2000)
+        } else if (data.status === "error") {
+          el.innerHTML =
+            '<div style="color:var(--bad);font-size:var(--text-sm)">' +
+            esc(data.message || "Authorization failed") +
+            "</div>"
+          if (btn) {
+            btn.disabled = false
+            btn.textContent = L("oauth.retry")
+            btn.onclick = startClaudeOAuth
+          }
+        }
+      }
+
+      // ── Claude Code CLI Integration (settings.json wiring) ──
+      // The bridge owns the file-IO; this side just renders state and
+      // posts user actions through to the panel.
+
+      var claudeIntegrationState = {
+        loaded: false,
+        connected: false,
+        settingsPath: "",
+        managedBridgeUrl: "",
+        managedAt: "",
+        backupExists: false,
+        settingsExists: false,
+        envWritten: null, // { baseUrl, apiKeyMasked, apiKeyLength, authTokenMasked, ... }
+        authConflict: false,
+        bridgeApiKeyConfigured: false,
+        bridgeApiKeyMatch: "unknown", // "match" | "mismatch" | "no-guard" | "unknown"
+        operation: "", // "connect" | "disconnect" | ""
+        statusLoading: false,
+        lastMessage: "",
+        lastMessageKind: "", // "loading" | "success" | "error" | ""
+      }
+
+      function renderEndpointsTabIfActive() {
+        var endpointsPane = document.getElementById("pane-endpoints")
+        if (endpointsPane && endpointsPane.classList.contains("active")) {
+          renderEndpointsTab()
+        }
+      }
+
+      function refreshEndpointsTab() {
+        claudeIntegrationRefresh()
+      }
+
+      function claudeIntegrationRefresh() {
+        claudeIntegrationState.statusLoading = true
+        renderEndpointsTabIfActive()
+        vscode.postMessage({ type: "claudeIntegrationStatus" })
+      }
+
+      // ── API Endpoints tab ──
+      // Plain list of HTTP endpoints the bridge exposes. Each row is a
+      // single line: name + mono URL on the left, status + action
+      // buttons on the right. Rows are separated by a 1px bottom
+      // border — no card chrome, no colored side stripes.
+      function renderEndpointsTab() {
+        var listEl = document.getElementById("endpoints-list")
+        if (!listEl) return
+
+        var s = claudeIntegrationState || {}
+        var fwd = !!(lastStatusData && lastStatusData.forwarding)
+        var bridgeRunning = !!(
+          lastStatusData && lastStatusData.bridge === "Running"
+        )
+        var bridgeUrl = (
+          s.managedBridgeUrl || "https://localhost:2026"
+        ).replace(/\/+$/, "")
+
+        function statusBadge(text, kind) {
+          var cls = "endpoint-status"
+          if (kind) cls += " endpoint-status-" + esc(kind)
+          return '<span class="' + cls + '">' + esc(text) + "</span>"
+        }
+
+        function endpointActionBtn(label, onClick, tone, state) {
+          var loading = !!(state && state.loading)
+          var disabled = !!(state && state.disabled) || loading
+          var classes = "btn btn-" + (tone || "ghost")
+          if (loading) classes += " btn-loading"
+          var content = loading
+            ? '<span class="btn-spinner"></span>' + esc(label)
+            : esc(label)
+          return (
+            '<button type="button" class="' +
+            classes +
+            '" onclick="' +
+            onClick +
+            '"' +
+            (disabled ? " disabled" : "") +
+            ">" +
+            content +
+            "</button>"
+          )
+        }
+
+        // Single toggle switch that doubles as wired/unwired status and
+        // action — replaces the older "status badge + Unwire button" pair.
+        // opts: { on, label, onClick, kind?: 'good', state?: { loading, disabled } }
+        function endpointToggle(opts) {
+          var on = !!opts.on
+          var loading = !!(opts.state && opts.state.loading)
+          var disabled = !!(opts.state && opts.state.disabled) && !loading
+          var classes = "toggle"
+          if (on) classes += " on"
+          if (opts.kind) classes += " toggle-" + esc(opts.kind)
+          if (loading) classes += " pending"
+          else if (disabled) classes += " disabled"
+          var clickAttr =
+            loading || disabled ? "" : ' onclick="' + opts.onClick + '"'
+          return (
+            '<label class="' +
+            classes +
+            '" role="switch" aria-checked="' +
+            (on ? "true" : "false") +
+            '"' +
+            clickAttr +
+            ">" +
+            '<span class="toggle-label">' +
+            esc(opts.label) +
+            "</span>" +
+            '<div class="toggle-track"></div>' +
+            "</label>"
+          )
+        }
+
+        function endpointRow(opts) {
+          var out = '<div style="border-bottom:1px solid var(--border)">'
+          out +=
+            '<div style="display:flex;align-items:center;gap:var(--sp-4);' +
+            'padding:var(--sp-3) 0">'
+          // Left column: name / url / desc
+          out += '<div style="flex:1;min-width:0">'
+          out +=
+            '<div style="display:flex;align-items:baseline;gap:var(--sp-3);' +
+            'flex-wrap:wrap">' +
+            '<span style="font-weight:600;font-size:var(--text-sm)">' +
+            esc(opts.name) +
+            "</span>" +
+            '<span style="font-family:var(--font-mono, monospace);' +
+            "font-size:var(--text-xs);color:var(--fg-2);overflow:hidden;" +
+            'text-overflow:ellipsis;white-space:nowrap;cursor:pointer" ' +
+            'title="' +
+            esc(L("endpoints.action.copy", "Copy")) +
+            '" onclick="endpointCopy(\'' +
+            esc(opts.url) +
+            "')\">" +
+            esc(opts.url) +
+            "</span>" +
+            "</div>"
+          if (opts.desc) {
+            out +=
+              '<div style="color:var(--fg-3);font-size:var(--text-xs);' +
+              'margin-top:2px">' +
+              esc(opts.desc) +
+              "</div>"
+          }
+          out += "</div>"
+          // Right column: status + action buttons
+          out +=
+            '<div style="display:flex;align-items:center;gap:var(--sp-3);' +
+            'flex-shrink:0">'
+          // Skip the status badge when status is empty — the toggle button
+          // (passed via opts.actions) doubles as the status indicator.
+          if (opts.status) {
+            out += statusBadge(opts.status, opts.statusKind)
+          }
+          if (opts.actions) {
+            out += '<div class="endpoint-actions">' + opts.actions + "</div>"
+          }
+          out += "</div>"
+          out += "</div>"
+          out += "</div>"
+          return out
+        }
+
+        function copyBtn(url) {
+          return endpointActionBtn(
+            L("endpoints.action.copy", "Copy"),
+            "endpointCopy('" + esc(url) + "')",
+            "ghost"
+          )
+        }
+        function testBtn(url) {
+          return endpointActionBtn(
+            L("endpoints.action.test", "Test"),
+            "endpointTest('" + esc(url) + "')",
+            "ghost"
+          )
+        }
+
+        var html = ""
+
+        // ── Health probe ──
+        var healthUrl = bridgeUrl + "/health"
+        html += endpointRow({
+          name: L("endpoints.health.name", "Health Check"),
+          desc: L(
+            "endpoints.health.desc",
+            "Liveness probe — returns bridge runtime status as JSON."
+          ),
+          url: healthUrl,
+          status: bridgeRunning
+            ? L("endpoints.status.online", "Online")
+            : L("endpoints.status.offline", "Offline"),
+          statusKind: bridgeRunning ? "good" : "",
+          actions: copyBtn(healthUrl) + testBtn(healthUrl),
+        })
+
+        // ── Cursor IDE ──
+        // A single toggle replaces the old "Wired badge + Unwire button"
+        // pair. The toggle itself is the status indicator: green/on means
+        // wired, off means ready, disabled means the bridge isn't running.
+        var cursorActions = ""
+        if (!bridgeRunning) {
+          cursorActions += endpointToggle({
+            on: false,
+            label: L("clients.status.wire", "Wire"),
+            onClick: "",
+            state: { disabled: true },
+          })
+        } else if (fwd) {
+          cursorActions += endpointToggle({
+            on: true,
+            kind: "good",
+            label: L("clients.status.wired", "Wired"),
+            onClick:
+              "vscode.postMessage({type:'runCommand'," +
+              "command:'agentVibes.disableForwarding'})",
+          })
+        } else {
+          cursorActions += endpointToggle({
+            on: false,
+            label: L("clients.status.wire", "Wire"),
+            onClick:
+              "vscode.postMessage({type:'runCommand'," +
+              "command:'agentVibes.enableForwarding'})",
+          })
+        }
+        cursorActions += copyBtn(bridgeUrl) + testBtn(bridgeUrl + "/health")
+        html += endpointRow({
+          name: L("endpoints.cursor.name", "Cursor IDE Protocol"),
+          desc: L(
+            "endpoints.cursor.desc",
+            "ConnectRPC drop-in for api*.cursor.sh — implements agent.v1.AgentService and aiserver.v1.AiService. Wiring edits /etc/hosts so Cursor IDE traffic lands here."
+          ),
+          url: bridgeUrl + "/{agent,aiserver}.v1.*",
+          actions: cursorActions,
+        })
+
+        // ── Anthropic / Claude CLI ──
+        // A single toggle replaces the old "status badge + Apply/Unwire"
+        // pair. While a connect/disconnect is in flight the toggle goes
+        // into the .pending state (no extra spinner row).
+        var anthropicUrl = bridgeUrl + "/v1/messages"
+        var ccLoaded = !!s.loaded
+        var ccWired = !!s.connected
+        var ccOperation = s.operation || ""
+        var ccBusy = ccOperation === "connect" || ccOperation === "disconnect"
+        var anthropicActions = ""
+        if (ccOperation === "connect") {
+          anthropicActions += endpointToggle({
+            on: true,
+            kind: "good",
+            label: L("endpoints.status.connecting", "Connecting…"),
+            onClick: "",
+            state: { loading: true },
+          })
+        } else if (ccOperation === "disconnect") {
+          anthropicActions += endpointToggle({
+            on: false,
+            label: L("endpoints.status.disconnecting", "Disconnecting…"),
+            onClick: "",
+            state: { loading: true },
+          })
+        } else if (s.statusLoading) {
+          anthropicActions += endpointToggle({
+            on: ccWired,
+            kind: ccWired ? "good" : undefined,
+            label: L("endpoints.status.checking", "Checking…"),
+            onClick: "",
+            state: { loading: true },
+          })
+        } else if (!bridgeRunning) {
+          anthropicActions += endpointToggle({
+            on: false,
+            label: L("clients.status.wire", "Wire"),
+            onClick: "",
+            state: { disabled: true },
+          })
+        } else if (!ccLoaded) {
+          anthropicActions += endpointToggle({
+            on: false,
+            label: L("endpoints.status.checking", "Checking…"),
+            onClick: "claudeIntegrationRefresh()",
+            state: { loading: true },
+          })
+        } else if (ccWired) {
+          anthropicActions += endpointToggle({
+            on: true,
+            kind: "good",
+            label: L("clients.status.wired", "Wired"),
+            onClick: "claudeIntegrationDisconnect()",
+            state: { disabled: ccBusy },
+          })
+        } else {
+          anthropicActions += endpointToggle({
+            on: false,
+            label: L("clients.status.wire", "Wire"),
+            onClick: "claudeIntegrationConnect()",
+            state: { disabled: ccBusy },
+          })
+        }
+        anthropicActions += copyBtn(anthropicUrl) + testBtn(anthropicUrl)
+        html += endpointRow({
+          name: L("endpoints.anthropic.name", "Anthropic API"),
+          desc: L(
+            "endpoints.anthropic.desc",
+            "Drop-in replacement for api.anthropic.com. Used by Claude Code CLI and any Anthropic-compatible SDK."
+          ),
+          url: anthropicUrl,
+          actions: anthropicActions,
+        })
+
+        // ── Codex CLI (OpenAI Responses) ──
+        var codexUrl = bridgeUrl + "/v1/responses"
+        html += endpointRow({
+          name: L("endpoints.openai.name", "OpenAI API"),
+          desc: L(
+            "endpoints.codex.desc",
+            "OpenAI Responses API compatibility — planned."
+          ),
+          url: codexUrl,
+          status: L("clients.status.comingSoon", "Coming soon"),
+          statusKind: "warn",
+          actions: copyBtn(codexUrl),
+        })
+
+        // ── Gemini CLI ──
+        // Gemini CLI hits /v1beta/models/{model}:generateContent (and the
+        // streaming variant); show the pattern instead of just /v1beta/models
+        // (which is "list models" and would look invented).
+        var geminiUrl = bridgeUrl + "/v1beta/models/{model}:generateContent"
+        html += endpointRow({
+          name: L("endpoints.google.name", "Google API"),
+          desc: L(
+            "endpoints.gemini.desc",
+            "Drop-in for generativelanguage.googleapis.com. Used by Gemini CLI / google-genai SDK — planned."
+          ),
+          url: geminiUrl,
+          status: L("clients.status.comingSoon", "Coming soon"),
+          statusKind: "warn",
+          actions: copyBtn(geminiUrl),
+        })
+
+        // Surface inline status when the live wire/unwire state machine
+        // has a message to deliver.
+        if (s.lastMessage) {
+          var msgColor =
+            s.lastMessageKind === "success"
+              ? "var(--good)"
+              : s.lastMessageKind === "error"
+                ? "var(--bad)"
+                : "var(--fg-2)"
+          html =
+            '<div style="color:' +
+            msgColor +
+            ';font-size:var(--text-xs);margin-bottom:var(--sp-3)">' +
+            esc(s.lastMessage) +
+            "</div>" +
+            html
+        }
+
+        listEl.innerHTML = html
+      }
+
+      function endpointCopy(url) {
+        vscode.postMessage({ type: "copyToClipboard", text: url })
+      }
+      function endpointTest(url) {
+        vscode.postMessage({ type: "testEndpoint", url: url })
+      }
+
+      function claudeIntegrationConnect() {
+        if (claudeIntegrationState.operation) return
+        claudeIntegrationState.operation = "connect"
+        claudeIntegrationState.statusLoading = false
+        claudeIntegrationState.lastMessageKind = "loading"
+        claudeIntegrationState.lastMessage = "Connecting CC CLI to bridge..."
+        renderEndpointsTabIfActive()
+        if (selectedChannel === "claude-api" && allData) {
+          renderChannelDetail()
+        }
+        vscode.postMessage({ type: "claudeIntegrationConnect" })
+      }
+
+      function claudeIntegrationDisconnect() {
+        if (claudeIntegrationState.operation) return
+        claudeIntegrationState.operation = "disconnect"
+        claudeIntegrationState.statusLoading = false
+        claudeIntegrationState.lastMessageKind = "loading"
+        claudeIntegrationState.lastMessage = "Disconnecting CC CLI..."
+        renderEndpointsTabIfActive()
+        if (selectedChannel === "claude-api" && allData) {
+          renderChannelDetail()
+        }
+        vscode.postMessage({ type: "claudeIntegrationDisconnect" })
+      }
+
+      function handleClaudeIntegrationUpdate(data) {
+        if (!data) return
+        if (data.kind === "status" && data.payload) {
+          var p = data.payload
+          claudeIntegrationState.loaded = true
+          claudeIntegrationState.connected = !!p.connected
+          claudeIntegrationState.settingsPath = p.settingsPath || ""
+          claudeIntegrationState.managedBridgeUrl = p.managedBridgeUrl || ""
+          claudeIntegrationState.managedAt = p.managedAt || ""
+          claudeIntegrationState.backupExists = !!p.backupExists
+          claudeIntegrationState.settingsExists = !!p.settingsExists
+          claudeIntegrationState.operation = ""
+          claudeIntegrationState.statusLoading = false
+        } else if (data.kind === "loading") {
+          claudeIntegrationState.lastMessageKind = "loading"
+          claudeIntegrationState.lastMessage = data.message || ""
+        } else if (data.kind === "success") {
+          claudeIntegrationState.lastMessageKind = "success"
+          claudeIntegrationState.lastMessage = data.message || ""
+        } else if (data.kind === "error") {
+          claudeIntegrationState.operation = ""
+          claudeIntegrationState.statusLoading = false
+          claudeIntegrationState.lastMessageKind = "error"
+          claudeIntegrationState.lastMessage =
+            data.message || "Operation failed"
+        }
+        renderEndpointsTabIfActive()
+        if (selectedChannel === "claude-api" && allData) {
+          renderChannelDetail()
+        }
+      }
+
       // ── Kiro Quota Rendering ──
       var kiroQuotaData = null
 
@@ -4645,10 +5301,55 @@
               : ""
           if (accountId) payload.accountId = accountId
         }
+        if (ch === "kiro" && allData) {
+          // Kiro rows have no single id and the bridge rewrites
+          // kiro-accounts.json out of band, so identify the account by the
+          // same stable fields the bridge matches on instead of by position.
+          var kState = getChannelState(allData, ch)
+          var kAcct = kState.accounts[i]
+          if (kAcct) {
+            payload.identity = {
+              authMethod: kAcct.authMethod,
+              region: kAcct.region,
+              refreshToken: kAcct.refreshToken,
+              accessToken: kAcct.accessToken,
+              clientId: kAcct.clientId,
+              kiroApiKey: kAcct.kiroApiKey,
+            }
+          }
+        }
         vscode.postMessage(payload)
       }
       function activateCodexCli(i) {
         vscode.postMessage({ type: "activateCodexCli", index: i })
+      }
+      // Push an existing Kiro pool account into the local Kiro IDE login store.
+      // Identify by stable fields used for removal (not array position) so a
+      // stale snapshot cannot force-login the wrong account.
+      function getKiroForceLoginIdentity(i) {
+        if (!allData) return
+        var kState = getChannelState(allData, "kiro")
+        var acct = kState.accounts[i]
+        if (!acct) return
+        return {
+          authMethod: acct.authMethod,
+          region: acct.region,
+          refreshToken: acct.refreshToken,
+          accessToken: acct.accessToken,
+          clientId: acct.clientId,
+          kiroApiKey: acct.kiroApiKey,
+          label: acct.label,
+        }
+      }
+      function forceKiroIdeLogin(i) {
+        var identity = getKiroForceLoginIdentity(i)
+        if (!identity) return
+        vscode.postMessage({ type: "forceKiroIdeLogin", identity: identity })
+      }
+      function forceKiroCliLogin(i) {
+        var identity = getKiroForceLoginIdentity(i)
+        if (!identity) return
+        vscode.postMessage({ type: "forceKiroCliLogin", identity: identity })
       }
       function runCmd(cmd) {
         vscode.postMessage({ type: "runCommand", command: cmd })
@@ -4665,7 +5366,18 @@
         }, 8000)
       }
       function runCmdWithLoading(btn, cmd) {
-        if (getPendingCommand()) return
+        var pending = getPendingCommand()
+        if (pending) {
+          // Defensive: if a previous command's pending lock somehow
+          // outlived its hard timeout (clock skew, backgrounded tab,
+          // etc.), don't trap the user. Drop it and let this click win.
+          var hardLimit =
+            getPendingTimeout(pending.command) + PENDING_HARD_TIMEOUT_GRACE_MS
+          if (Date.now() - pending.startedAt < hardLimit) {
+            return
+          }
+          clearPendingCommand(false)
+        }
         beginPendingCommand(cmd)
         vscode.postMessage({ type: "runCommand", command: cmd })
       }
@@ -4695,6 +5407,15 @@
       function renderLogFilePath(filePath, exists) {
         var pathEl = document.getElementById("log-file-path")
         if (!pathEl) return
+
+        // Remove data-i18n bindings so applyStaticI18n (called on every
+        // statusUpdate) does not stomp the real path back to "Loading...".
+        // The element starts life with data-i18n="log.loading" as the
+        // initial placeholder; once we render an actual value we own the
+        // text/title/aria-label and i18n must not touch it again.
+        pathEl.removeAttribute("data-i18n")
+        pathEl.removeAttribute("data-i18n-title")
+        pathEl.removeAttribute("data-i18n-aria")
 
         if (!filePath) {
           pathEl.textContent = L("log.unknownPath")

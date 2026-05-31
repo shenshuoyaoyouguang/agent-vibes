@@ -1,18 +1,6 @@
 import { Injectable, Logger, OnModuleInit } from "@nestjs/common"
-import {
-  type ContextAttachmentSnapshot,
-  ContextManagerService,
-  ContextNativeManagementService,
-  ContextRequestPlannerService,
-  type ContextRequestBudget,
-  detectPromptTooLong,
-  TokenCounterService,
-  UnifiedMessage,
-} from "../../context"
-import {
-  AnthropicApiService,
-  DEFAULT_CLAUDE_API_CONTEXT_LIMIT_TOKENS,
-} from "../../llm/anthropic/anthropic-api.service"
+import { type ContextAttachmentSnapshot } from "../../context"
+import { AnthropicApiService } from "../../llm/anthropic/anthropic-api.service"
 import { KiroService } from "../../llm/aws/kiro.service"
 import { GoogleModelCacheService } from "../../llm/google/google-model-cache.service"
 import { GoogleService } from "../../llm/google/google.service"
@@ -23,6 +11,7 @@ import {
 import type { CodexForwardHeaders } from "../../llm/openai/codex-header-utils"
 import { CodexService } from "../../llm/openai/codex.service"
 import { OpenaiCompatService } from "../../llm/openai/openai-compat.service"
+import { getBackendCapability } from "../../llm/shared/backend-capability"
 import { BackendApiError } from "../../llm/shared/backend-errors"
 import {
   canPublicClaudeModelUseGoogle,
@@ -32,6 +21,7 @@ import {
   resolveCloudCodeModel,
 } from "../../llm/shared/model-registry"
 import {
+  type BackendType,
   ModelRouteResult,
   ModelRouterService,
 } from "../../llm/shared/model-router.service"
@@ -46,10 +36,6 @@ import { TokenizerService } from "./tokenizer.service"
 @Injectable()
 export class MessagesService implements OnModuleInit {
   private readonly logger = new Logger(MessagesService.name)
-  private readonly DEFAULT_HISTORY_MAX_TOKENS = 166_000
-  private readonly CLOUD_CODE_CONTEXT_LIMIT_TOKENS = 200_000
-  private readonly CLOUD_CODE_EXTRA_OVERHEAD_TOKENS = 1_536
-  private readonly GENERIC_EXTRA_OVERHEAD_TOKENS = 768
   private readonly GOOGLE_CONTEXT_TAGS = [
     "user_information",
     "mcp_servers",
@@ -70,10 +56,6 @@ export class MessagesService implements OnModuleInit {
     private readonly googleModelCache: GoogleModelCacheService,
     private readonly modelRouter: ModelRouterService,
     private readonly tokenizer: TokenizerService,
-    private readonly tokenCounter: TokenCounterService,
-    private readonly contextManager: ContextManagerService,
-    private readonly contextRequestPlanner: ContextRequestPlannerService,
-    private readonly contextNativeManagement: ContextNativeManagementService,
     private readonly codexService: CodexService,
     private readonly openaiCompatService: OpenaiCompatService,
     private readonly anthropicApiService: AnthropicApiService,
@@ -280,124 +262,245 @@ export class MessagesService implements OnModuleInit {
     return Math.floor(value)
   }
 
-  private countSystemPromptTokens(dto: CreateMessageDto): number {
-    if (!dto.system) return 0
-
-    return this.tokenCounter.countMessages([
-      { role: "user", content: dto.system } as UnifiedMessage,
-    ])
-  }
-
-  private getBackendContextLimit(route: ModelRouteResult): number | undefined {
-    if (this.isGoogleBackend(route)) {
-      return this.CLOUD_CODE_CONTEXT_LIMIT_TOKENS
-    }
-    if (route.backend === "claude-api") {
-      return (
-        this.anthropicApiService.getConfiguredMaxContextTokens(route.model) ??
-        DEFAULT_CLAUDE_API_CONTEXT_LIMIT_TOKENS
-      )
-    }
-    if (route.backend === "kiro") {
-      return (
-        this.kiroService.getConfiguredMaxContextTokens(route.model) ??
-        // Kiro defaults to a 1M window for Sonnet/Opus 4.6 family.
-        1_000_000
-      )
-    }
-    if (route.backend === "openai-compat") {
-      return this.openaiCompatService.getConfiguredMaxContextTokens(route.model)
-    }
-    return undefined
-  }
-
-  private resolveContextBudget(
-    dto: CreateMessageDto,
-    route: ModelRouteResult
-  ): ContextRequestBudget {
-    const backendLimit = this.getBackendContextLimit(route)
-    const budget = this.contextRequestPlanner.resolveBudget({
-      backend: route.backend,
-      protocolMaxTokens: dto._contextTokenBudget,
-      backendMaxTokens: backendLimit,
-      defaultMaxTokens: this.DEFAULT_HISTORY_MAX_TOKENS,
-      systemPromptTokens: this.countSystemPromptTokens(dto),
-      toolDefinitions: dto.tools,
-      backendSystemPromptTokens: this.isGoogleBackend(route)
-        ? this.googleService.getSystemPromptTokenEstimate()
-        : 0,
-      fixedOverheadTokens: this.isGoogleBackend(route)
-        ? this.CLOUD_CODE_EXTRA_OVERHEAD_TOKENS
-        : this.GENERIC_EXTRA_OVERHEAD_TOKENS,
-      maxOutputTokens: dto.max_tokens,
-      requestedServiceTier:
-        route.backend === "codex" && typeof dto.service_tier === "string"
-          ? dto.service_tier
-          : undefined,
-    })
-
-    if (budget.backendClampedFrom && budget.backendClampedTo) {
-      this.logger.warn(
-        `Request context budget ${budget.backendClampedFrom} exceeds backend cap ${budget.backendClampedTo}, clamping`
-      )
-    }
-
-    return budget
-  }
-
+  /**
+   * Transparent passthrough — no context compaction.
+   *
+   * Earlier this method ran a stateless `createEphemeralState(messages) →
+   * snip → microcompact → buildAnthropicContextManagement` pipeline on
+   * every Anthropic-protocol request. The intent was anti-OOM, but the
+   * pipeline silently dropped 70%+ of the message array (1450→390
+   * records) and replaced the dropped span with a single "Context
+   * snipped" placeholder containing no summary. The CLI client never
+   * learned its history had been mutated, so its own auto-compact /
+   * `/compact` heuristics — which are the authoritative context
+   * managers for Claude Code — operated on a different message array
+   * than the backend ever saw.
+   *
+   * The CLIProxyAPI reference implementation does the right thing here:
+   * accept the client's raw body, forward it to the backend, and let
+   * the backend's `context_too_large` errors flow back to the client.
+   * Claude Code, Codex, and Gemini CLI all ship their own /compact
+   * pipelines; the proxy is not the right layer to second-guess them.
+   *
+   * This method is preserved as the single chokepoint where any future
+   * **non-destructive** pre-processing could land (model rename, prompt
+   * injection, etc.). It now returns the dto unchanged.
+   */
   private applyContextCompaction(
     dto: CreateMessageDto,
     route: ModelRouteResult
   ): CreateMessageDto {
-    const originalTokens = this.contextManager.countMessages(
-      dto.messages as UnifiedMessage[]
-    )
-    const budget = this.resolveContextBudget(dto, route)
-    const result = this.contextRequestPlanner.projectMessages(
-      dto.messages as UnifiedMessage[],
-      this.EMPTY_ATTACHMENT_SNAPSHOT,
-      budget,
-      {
-        integrityMode: this.getToolIntegrityModeForRoute(route),
-        pendingToolUseIds: dto._pendingToolUseIds,
-        strategy: "auto",
+    void route
+    return dto
+  }
+
+  /**
+   * CC CLI's compaction summary preamble. Both code paths
+   * (runForkedAgent fork — claude-code/src/services/compact/compact.ts:1222
+   * and streamCompactSummary streaming fallback — same file:1326) build
+   * the user-facing `summaryRequest` via getCompactPrompt /
+   * getPartialCompactPrompt (claude-code/src/services/compact/prompt.ts:282,294),
+   * which unconditionally prefix this exact string. The slash-command
+   * `/compact` and the autoCompact trigger share the same prompt
+   * builder, so this fingerprint covers both manual and automatic
+   * compaction.
+   *
+   * Stability rationale: the literal lives in a single CLI source file,
+   * is shared by every compaction code path, and has the strongest
+   * semantic anchor in the prompt body ("Tool calls will be REJECTED")
+   * — it would not be edited casually. If a future CLI release renames
+   * the preamble, the worst-case regression is the original death-loop
+   * (compact requests rejected by preflight); detection misses fail
+   * safe — a non-compact request that happens to start with this text
+   * being waved through to upstream still gets the upstream's own
+   * context-length error, no worse than today.
+   */
+  private static readonly CC_CLI_COMPACTION_USER_PREAMBLE =
+    "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools."
+
+  /**
+   * Detect a CC CLI context-compaction request.
+   *
+   * The CLI sends the compaction "summarize this conversation" request
+   * through the same POST /v1/messages endpoint as a normal turn.
+   * Distinguishing it matters because preflight (below) would otherwise
+   * reject it for being too large — but compaction is precisely what
+   * the CLI runs to *escape* a too-large context, and a synchronous
+   * rejection here strands the CLI in an unrecoverable state where
+   * neither autoCompact nor `/compact` can succeed (their wire body is
+   * by definition the entire current history).
+   *
+   * Detection: the last user message starts with the fixed
+   * NO_TOOLS_PREAMBLE that prefixes every compaction summary request.
+   * We check the last user message specifically because the CLI
+   * appends `summaryRequest` to the existing transcript — earlier
+   * messages may include unrelated content.
+   */
+  private isCcCliCompactionRequest(dto: CreateMessageDto): boolean {
+    const messages = dto.messages
+    if (!Array.isArray(messages) || messages.length === 0) return false
+    let lastUser: (typeof messages)[number] | undefined
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i]?.role === "user") {
+        lastUser = messages[i]
+        break
       }
-    )
-
-    if (result.wasCompacted) {
-      this.logger.log(
-        `Applied context compaction for ${route.backend}: ${originalTokens} -> ` +
-          `${result.estimatedTokens} tokens (${dto.messages.length} -> ${result.messages.length} messages)`
-      )
     }
-    if (result.snipCompaction?.changed) {
-      this.logger.log(
-        `Applied snip compaction for ${route.backend}: ` +
-          `${result.snipCompaction.removedRecords} live records summarized, ` +
-          `${result.snipCompaction.retainedRecords} retained`
-      )
-    }
-    if (result.microcompactCompaction?.changed) {
-      this.logger.log(
-        `Applied ${result.microcompactCompaction.trigger} microcompact for ${route.backend}: ` +
-          `${result.microcompactCompaction.clearedToolResults} results across ` +
-          `${result.microcompactCompaction.compactedRounds} API rounds`
-      )
+    if (!lastUser) return false
+    const text = this.extractTextContent(lastUser.content).trimStart()
+    return text.startsWith(MessagesService.CC_CLI_COMPACTION_USER_PREAMBLE)
+  }
+
+  /**
+   * Preflight capacity check.
+   *
+   * The bridge knows two things the CLI doesn't:
+   *   1. Which backend a request is actually being routed to.
+   *   2. That backend's effective input cap (from BackendCapability).
+   *
+   * When the routed request exceeds the backend's cap, calling the
+   * upstream is wasted work — every account on that backend will
+   * reject identically. Throw a class-tagged BackendApiError here so
+   * the catch path in executeRoutedMessage / executeRoutedMessageStream
+   * routes the request to a fallback backend (with a larger cap) or,
+   * if no fallback is available, surfaces a spec-compliant Anthropic
+   * `prompt is too long: N tokens > M maximum` envelope to the CLI.
+   * That envelope matches the prose CC CLI's autoCompact / `/compact`
+   * recovery checks (claude-code/src/services/api/errors.ts:564), so
+   * the CLI's own context-management pipeline kicks in.
+   *
+   * Two gates run in series, and either one tripping is enough to
+   * reject:
+   *   - Token gate: cheap, runs first. Uses `countTokensLocal` (the
+   *     same estimator as the `/count_tokens` endpoint) and compares
+   *     against `contextWindow.maxInputTokens`. Slightly conservative
+   *     (overestimates), which is the safe direction here.
+   *   - Wire-byte gate: runs second when a backend declares
+   *     `contextWindow.maxWireBytes`. Some backends (Kiro / CodeWhisperer)
+   *     reject on raw JSON body size rather than token count — the
+   *     probe in `scripts/probe/probe-kiro-cap.mjs` confirmed Kiro
+   *     rejects identically at ~2.15 MB regardless of whether the
+   *     payload is mostly text padding (PURE) or a mix of tool
+   *     definitions and history (TOOLED). The byte gate uses the same
+   *     `JSON.stringify` shape the kiro service writes on the wire,
+   *     so it matches the upstream judgement byte-for-byte.
+   *
+   * Compaction-request exemption: a CC CLI compaction summary request
+   * (manual `/compact` or autoCompact) carries the entire current
+   * transcript by construction, so once the conversation is large
+   * enough to *need* compaction, the compaction request itself is
+   * guaranteed to exceed any cap below the backend's true wire limit.
+   * Rejecting it here creates a hard deadlock: autoCompact never fires
+   * because preflight bounces it, manual `/compact` cannot succeed for
+   * the same reason, and the user has no in-CLI way out. Wave the
+   * compaction call through to upstream — if Kiro's wire layer really
+   * rejects it (the cap isn't a fiction), the CLI's own PTL recovery
+   * (claude-code/src/services/compact/compact.ts:474-515,
+   * MAX_PTL_RETRIES=3 with truncateHeadForPTLRetry) takes over and
+   * shrinks the input until the summary lands. That recovery path is
+   * the *only* way out of the deadlock and it requires the wire-level
+   * error to surface, not a synthetic preflight rejection.
+   */
+  private assertWithinBackendCapacity(
+    dto: CreateMessageDto,
+    route: ModelRouteResult
+  ): void {
+    const cap = getBackendCapability(route.backend)
+    const maxTokens = cap.contextWindow.maxInputTokens
+    const maxBytes = cap.contextWindow.maxWireBytes
+    const isCompaction = this.isCcCliCompactionRequest(dto)
+
+    // ── Token gate ──
+    if (Number.isFinite(maxTokens) && maxTokens > 0) {
+      const estimate = this.countTokensLocal(dto)
+      if (estimate > maxTokens) {
+        if (isCompaction) {
+          this.logger.warn(
+            `[Preflight] ${route.backend}/${route.model}: estimated ${estimate} tokens > ${maxTokens} cap, but request is a CC CLI compaction summary; bypassing preflight so the CLI's own PTL-retry recovery can run`
+          )
+          return
+        }
+        this.logger.warn(
+          `[Preflight] ${route.backend}/${route.model}: estimated ${estimate} tokens > ${maxTokens} cap; throwing context_length_exceeded so router can fall back`
+        )
+        throw new BackendApiError(
+          `prompt is too long: ${estimate} tokens > ${maxTokens} maximum`,
+          {
+            backend: route.backend,
+            statusCode: 400,
+            errorClass: "context_length_exceeded",
+            actualTokens: estimate,
+            maxTokens: maxTokens,
+          }
+        )
+      }
     }
 
-    const contextManagement =
-      this.contextNativeManagement.buildAnthropicContextManagement({
-        backend: route.backend,
-        messages: result.messages,
-        maxTokens: budget.maxTokens,
-        systemPromptTokens: budget.systemPromptTokens,
-        autoCompactTokenLimit: budget.autoCompactTokenLimit,
-      })
+    // ── Wire-byte gate ──
+    // Only stringify when the backend declares a byte cap. Stringify is
+    // O(payload size); the token gate already filtered the obvious
+    // over-cap cases, so the work amortizes to "near-the-limit" requests.
+    if (Number.isFinite(maxBytes) && (maxBytes ?? 0) > 0) {
+      // Measure the TRANSLATED Kiro payload size, not the raw Anthropic
+      // DTO. The DTO carries the full tool-definition array, structured
+      // content blocks, and a system array that claudeToKiro collapses
+      // or drops — gating on the raw DTO false-rejects requests the
+      // gateway would accept (observed: 4.14 MB DTO → 1.54 MB Kiro
+      // payload, well under the 2.125 MB cap).
+      const wireBytes =
+        route.backend === "kiro"
+          ? this.kiroService.estimateWireBytes(dto)
+          : this.estimateRawDtoBytes(dto)
+      if (wireBytes > (maxBytes as number)) {
+        if (isCompaction) {
+          this.logger.warn(
+            `[Preflight] ${route.backend}/${route.model}: estimated ${wireBytes} wire bytes > ${maxBytes} cap, but request is a CC CLI compaction summary; bypassing preflight so the CLI's own PTL-retry recovery can run`
+          )
+          return
+        }
+        this.logger.warn(
+          `[Preflight] ${route.backend}/${route.model}: estimated ${wireBytes} wire bytes > ${maxBytes} cap; throwing context_length_exceeded so router can fall back`
+        )
+        // Render as a token-shaped Anthropic envelope so CC CLI's
+        // autoCompact regex (claude-code/src/services/api/errors.ts:90,
+        // /prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)/i)
+        // still parses both sides. The numbers here are bytes presented
+        // as tokens — slightly misleading in the literal sense, but the
+        // CLI uses the gap between actual and max only to decide how
+        // aggressively to truncate, so a byte-vs-byte comparison is
+        // semantically correct for the recovery path.
+        throw new BackendApiError(
+          `prompt is too long: ${wireBytes} tokens > ${maxBytes} maximum`,
+          {
+            backend: route.backend,
+            statusCode: 400,
+            errorClass: "context_length_exceeded",
+            actualTokens: wireBytes,
+            maxTokens: maxBytes as number,
+          }
+        )
+      }
+    }
+  }
 
-    return {
-      ...dto,
-      messages: result.messages as typeof dto.messages,
-      context_management: contextManagement,
+  /**
+   * Raw Anthropic-DTO JSON byte size. Used as the wire-byte estimate
+   * for backends that don't translate the payload into a smaller shape.
+   * For Kiro, use `kiroService.estimateWireBytes` instead — the Kiro
+   * translation collapses tools / content blocks and produces a much
+   * smaller payload, so the raw DTO size would over-count by ~2-3x.
+   */
+  private estimateRawDtoBytes(dto: CreateMessageDto): number {
+    try {
+      return Buffer.byteLength(JSON.stringify(dto), "utf-8")
+    } catch {
+      // Circular structures / unstringifiable values fall back to a
+      // length-based approximation that still gives the gate a non-zero
+      // signal rather than silently waving the request through.
+      return JSON.stringify({
+        model: dto.model,
+        messageCount: dto.messages?.length ?? 0,
+      }).length
     }
   }
 
@@ -473,15 +576,17 @@ export class MessagesService implements OnModuleInit {
   ): Promise<AnthropicResponse> {
     if (route.backend === "claude-api") {
       this.logger.log(`[ROUTE] Claude API backend | model: ${route.model}`)
-      return await this.anthropicApiService.sendClaudeMessage(
-        dto,
-        forwardHeaders
-      )
+      return await this.anthropicApiService.sendClaudeMessage(dto, {
+        clientMode: "claude-code-cli",
+        forwardHeaders,
+      })
     }
 
     if (route.backend === "kiro") {
       this.logger.log(`[ROUTE] Kiro backend | model: ${route.model}`)
-      return await this.kiroService.sendClaudeMessage(dto)
+      return await this.kiroService.sendClaudeMessage(
+        this.prepareKiroDtoForClaudeCli(dto)
+      )
     }
 
     if (route.backend === "openai-compat") {
@@ -498,24 +603,11 @@ export class MessagesService implements OnModuleInit {
     return await this.googleService.sendClaudeMessage(dto)
   }
 
-  /**
-   * Build a stable key for the reactive-compaction circuit breaker.
-   *
-   * `_conversationId` is preferred when the client provides one (it gives
-   * us a per-session counter), otherwise we fall back to a coarse hash of
-   * the message-array length plus the model so unrelated stateless
-   * requests do not share the same breaker.  The key never carries user
-   * content — only structural metadata — so it is safe to log.
-   */
-  private buildReactiveRecoveryKey(
-    dto: CreateMessageDto,
-    route: ModelRouteResult
-  ): string {
-    if (typeof dto._conversationId === "string" && dto._conversationId) {
-      return `anthropic:${dto._conversationId}`
-    }
-    return `anthropic:stateless:${route.backend}:${route.model}:${dto.messages.length}`
-  }
+  // `buildReactiveRecoveryKey` was removed alongside the reactive
+  // prompt-too-long recovery path. It used to key the
+  // `ContextManagerService` circuit breaker that decided whether to
+  // retry a context-too-large request after silently snipping the
+  // history. We no longer snip-and-retry, so the key has no callers.
 
   private async executeRoutedMessage(
     dto: CreateMessageDto,
@@ -542,33 +634,21 @@ export class MessagesService implements OnModuleInit {
       }
 
       const routedDto = this.prepareDtoForRoute(dto, route)
-      const recoveryKey = this.buildReactiveRecoveryKey(dto, route)
-      try {
-        const response = await this.dispatchToRoutedBackend(
-          routedDto,
-          route,
-          forwardHeaders,
-          codexForwardHeaders
-        )
-        // Successful turn — drop any stale failure counter so the next
-        // attempt starts from a clean slate.
-        this.contextManager.resetReactiveFailures(recoveryKey)
-        return response
-      } catch (innerError) {
-        const recovered = await this.tryReactivePromptTooLongRecovery(
-          dto,
-          route,
-          innerError,
-          recoveryKey,
-          forwardHeaders,
-          codexForwardHeaders
-        )
-        if (recovered) {
-          this.contextManager.resetReactiveFailures(recoveryKey)
-          return recovered
-        }
-        throw innerError
-      }
+      this.assertWithinBackendCapacity(routedDto, route)
+      // Backend errors (including class=context_length_exceeded that
+      // the preflight or the upstream may surface) flow through the
+      // catch below into either a cross-backend fallback or a
+      // spec-compliant Anthropic envelope rendering. CLI clients ship
+      // their own /compact pipelines and react to the envelope's
+      // `prompt is too long: N tokens > M maximum` message — see
+      // backend-error-class.ts for the rendering contract.
+      const response = await this.dispatchToRoutedBackend(
+        routedDto,
+        route,
+        forwardHeaders,
+        codexForwardHeaders
+      )
+      return response
     } catch (error) {
       const fallback = this.modelRouter.getFallbackRoute(
         dto.model,
@@ -602,70 +682,30 @@ export class MessagesService implements OnModuleInit {
     }
   }
 
-  /**
-   * Identify upstream prompt-too-long errors and, when found, reactively
-   * compact the conversation and retry the same backend once.  Returns
-   * the successful response when recovery worked, otherwise `undefined`
-   * so the caller can re-throw the original error.
-   *
-   * Recovery is gated by a circuit breaker living on
-   * `ContextManagerService` so we cannot loop forever on conversations
-   * whose minimum payload still exceeds the upstream cap.
-   */
-  private async tryReactivePromptTooLongRecovery(
-    dto: CreateMessageDto,
-    route: ModelRouteResult,
-    error: unknown,
-    recoveryKey: string,
-    forwardHeaders?: Record<string, string>,
-    codexForwardHeaders?: CodexForwardHeaders
-  ): Promise<AnthropicResponse | undefined> {
-    const detection = detectPromptTooLong(error)
-    if (!detection.matched) return undefined
+  private prepareKiroDtoForClaudeCli(dto: CreateMessageDto): CreateMessageDto {
+    if (!dto.system) return dto
 
-    const previousBudget = this.resolveContextBudget(dto, route)
-    const outcome =
-      this.contextManager.applyReactivePromptTooLongRecoveryFromMessages(
-        dto.messages as UnifiedMessage[],
-        this.EMPTY_ATTACHMENT_SNAPSHOT,
-        {
-          maxTokens: previousBudget.maxTokens,
-          systemPromptTokens: previousBudget.systemPromptTokens,
-          autoCompactTokenLimit: previousBudget.autoCompactTokenLimit,
-          pendingToolUseIds: dto._pendingToolUseIds,
-        },
-        {
-          actualTokens: detection.actualTokens,
-          maxTokens: detection.maxTokens,
-        },
-        recoveryKey
-      )
-    if (!outcome.shouldRetry || !outcome.result) {
-      this.logger.warn(
-        `[REACTIVE-COMPACT] giving up for ${recoveryKey}: ${
-          outcome.reason ?? "unknown"
-        } (failures=${outcome.consecutiveFailures})`
-      )
-      return undefined
-    }
-
-    this.logger.warn(
-      `[REACTIVE-COMPACT] retrying ${route.backend}/${route.model} after prompt-too-long: ` +
-        `${dto.messages.length} → ${outcome.result.messages.length} messages`
-    )
-
-    const recoveredDto: CreateMessageDto = {
+    // POST /v1/messages is the Claude Code CLI/Anthropic-compatible entry.
+    // Claude Code already sends its own harness prompt in `system`. Kiro has
+    // no native system field, so the Kiro translator would otherwise wrap that
+    // prompt into userInputMessage.content as `--- SYSTEM PROMPT --- ...`,
+    // which the model correctly treats as external prompt-injection-like text.
+    // Cursor's Kiro path does not go through this service and keeps its own
+    // protocol/system projection unchanged.
+    return {
       ...dto,
-      messages: outcome.result.messages as typeof dto.messages,
+      system: undefined,
     }
-    const routedDto = this.prepareDtoForRoute(recoveredDto, route)
-    return await this.dispatchToRoutedBackend(
-      routedDto,
-      route,
-      forwardHeaders,
-      codexForwardHeaders
-    )
   }
+
+  /**
+   * Reactive prompt-too-long recovery used to live here. The bridge now
+   * forwards `prompt_too_long` / `context_too_large` errors straight to
+   * the CLI client (matching CLIProxyAPI's transparent-proxy contract),
+   * so this method has been removed. If a future change needs to act on
+   * upstream context errors, do it as an explicit, opt-in protocol
+   * extension rather than a silent payload mutation.
+   */
 
   private async *streamFromRoutedBackend(
     dto: CreateMessageDto,
@@ -677,17 +717,19 @@ export class MessagesService implements OnModuleInit {
       this.logger.log(
         `[ROUTE] Claude API backend | model: ${route.model} | stream: true`
       )
-      yield* this.anthropicApiService.sendClaudeMessageStream(
-        dto,
-        forwardHeaders
-      )
+      yield* this.anthropicApiService.sendClaudeMessageStream(dto, {
+        clientMode: "claude-code-cli",
+        forwardHeaders,
+      })
       return
     }
     if (route.backend === "kiro") {
       this.logger.log(
         `[ROUTE] Kiro backend | model: ${route.model} | stream: true`
       )
-      yield* this.kiroService.sendClaudeMessageStream(dto)
+      yield* this.kiroService.sendClaudeMessageStream(
+        this.prepareKiroDtoForClaudeCli(dto)
+      )
       return
     }
     if (route.backend === "openai-compat") {
@@ -741,8 +783,6 @@ export class MessagesService implements OnModuleInit {
       }
     }
 
-    const recoveryKey = this.buildReactiveRecoveryKey(dto, route)
-
     try {
       if (
         route.backend === "codex" &&
@@ -759,82 +799,25 @@ export class MessagesService implements OnModuleInit {
       }
 
       const routedDto = this.prepareDtoForRoute(dto, route)
-      try {
-        for await (const event of this.streamFromRoutedBackend(
-          routedDto,
-          route,
-          forwardHeaders,
-          codexForwardHeaders
-        )) {
-          yield* handleEvent(event)
-        }
-        if (!emittedAny) {
-          for (const b of buffer) yield b
-        }
-        this.contextManager.resetReactiveFailures(recoveryKey)
-        return
-      } catch (innerError) {
-        // Reactive recovery is only safe before any byte has reached the
-        // client.  Once we have emitted real data, the SSE stream is
-        // committed and another retry would deliver duplicate events.
-        if (emittedAny) {
-          throw innerError
-        }
-        const detection = detectPromptTooLong(innerError)
-        if (!detection.matched) {
-          throw innerError
-        }
-        const previousBudget = this.resolveContextBudget(dto, route)
-        const outcome =
-          this.contextManager.applyReactivePromptTooLongRecoveryFromMessages(
-            dto.messages as UnifiedMessage[],
-            this.EMPTY_ATTACHMENT_SNAPSHOT,
-            {
-              maxTokens: previousBudget.maxTokens,
-              systemPromptTokens: previousBudget.systemPromptTokens,
-              autoCompactTokenLimit: previousBudget.autoCompactTokenLimit,
-              pendingToolUseIds: dto._pendingToolUseIds,
-            },
-            {
-              actualTokens: detection.actualTokens,
-              maxTokens: detection.maxTokens,
-            },
-            recoveryKey
-          )
-        if (!outcome.shouldRetry || !outcome.result) {
-          this.logger.warn(
-            `[REACTIVE-COMPACT] stream giving up for ${recoveryKey}: ${
-              outcome.reason ?? "unknown"
-            } (failures=${outcome.consecutiveFailures})`
-          )
-          throw innerError
-        }
-        this.logger.warn(
-          `[REACTIVE-COMPACT] stream retrying ${route.backend}/${route.model} after prompt-too-long: ` +
-            `${dto.messages.length} → ${outcome.result.messages.length} messages`
-        )
-        const recoveredDto: CreateMessageDto = {
-          ...dto,
-          messages: outcome.result.messages as typeof dto.messages,
-        }
-        const retryRoutedDto = this.prepareDtoForRoute(recoveredDto, route)
-        // Reset the leading-event buffer so we can replay it cleanly on
-        // the retry.  emittedAny is still false here by construction.
-        buffer = []
-        for await (const event of this.streamFromRoutedBackend(
-          retryRoutedDto,
-          route,
-          forwardHeaders,
-          codexForwardHeaders
-        )) {
-          yield* handleEvent(event)
-        }
-        if (!emittedAny) {
-          for (const b of buffer) yield b
-        }
-        this.contextManager.resetReactiveFailures(recoveryKey)
-        return
+      this.assertWithinBackendCapacity(routedDto, route)
+      // Backend errors flow through the catch below into either a
+      // cross-backend fallback or a spec-compliant Anthropic envelope
+      // (services/api/errors.ts:564 in claude-code: CC CLI's
+      // autoCompact / `/compact` recovery key off the canonical
+      // "prompt is too long: N tokens > M maximum" message that
+      // backend-error-class.ts produces).
+      for await (const event of this.streamFromRoutedBackend(
+        routedDto,
+        route,
+        forwardHeaders,
+        codexForwardHeaders
+      )) {
+        yield* handleEvent(event)
       }
+      if (!emittedAny) {
+        for (const b of buffer) yield b
+      }
+      return
     } catch (error) {
       const fallback = this.modelRouter.getFallbackRoute(
         dto.model,
@@ -932,7 +915,8 @@ export class MessagesService implements OnModuleInit {
     // ── Upstream first ──
     try {
       const upstreamResult = await this.anthropicApiService.countTokensUpstream(
-        dto as unknown as Record<string, unknown>
+        dto as unknown as Record<string, unknown>,
+        { clientMode: "claude-code-cli" }
       )
       if (upstreamResult) {
         this.logger.debug(
@@ -997,11 +981,66 @@ export class MessagesService implements OnModuleInit {
               )
               totalTokens += 10 // overhead for tool_use structure
             } else if (block.type === "tool_result") {
-              // Tool result blocks
-              if (block.text) {
-                totalTokens += this.tokenizer.countTokens(block.text)
+              // Tool result blocks. The content surface varies:
+              //   - shorthand: `{type:'tool_result', text:'...'}` (legacy)
+              //   - structured: `{type:'tool_result', content: '...'}`
+              //                 or `{type:'tool_result', content: [{type:'text', text:'...'}, ...]}`
+              //                 (the CC CLI / Anthropic-spec common case)
+              //
+              // The previous version only counted `block.text` so a result
+              // shipped as `content` (string or array) was estimated as
+              // ~5 tokens. With many tool_result blocks this drove the
+              // capacity preflight several orders of magnitude under the
+              // real token cost — see preflight bypass at 8:09:25 in
+              // bridge logs (2 MB body, no [Preflight] warning, Kiro
+              // accepted then a downstream call hit the wire cap).
+              const tr = block as {
+                text?: string
+                content?: unknown
+              }
+              if (typeof tr.text === "string" && tr.text.length > 0) {
+                totalTokens += this.tokenizer.countTokens(tr.text)
+              }
+              if (typeof tr.content === "string") {
+                totalTokens += this.tokenizer.countTokens(tr.content)
+              } else if (Array.isArray(tr.content)) {
+                for (const part of tr.content) {
+                  if (!part || typeof part !== "object") continue
+                  const p = part as { type?: string; text?: string }
+                  if (p.type === "text" && typeof p.text === "string") {
+                    totalTokens += this.tokenizer.countTokens(p.text)
+                  } else if (p.type === "image") {
+                    // Same image baseline as the top-level image block
+                    // case below — base64 length is wire-byte size, not
+                    // model-side token cost.
+                    totalTokens += 1500
+                  } else {
+                    // Other non-text parts (rare): conservative serialization
+                    // estimate so they're never counted as zero.
+                    totalTokens += Math.ceil(JSON.stringify(part).length / 4)
+                  }
+                }
               }
               totalTokens += 5 // overhead for tool_result structure
+            } else if (block.type === "image") {
+              // Image blocks: use Anthropic's baseline token cost per
+              // inlined image. Earlier this estimated by base64 length
+              // (Math.ceil(data.length / 4)) — that conflates wire-byte
+              // size with model-side token cost. A high-DPI screenshot
+              // is ~200 KB base64, which the wrong estimate priced at
+              // ~50K tokens; 14 such images on a single turn (a normal
+              // CC CLI screenshot batch) inflated the estimate by
+              // ~700K tokens and tripped preflight even when the real
+              // token budget was nowhere near full.
+              //
+              // Anthropic's documented per-image cost is roughly
+              // `(width * height) / 750` for vision, with a typical
+              // claim of ~1500-2500 tokens per screenshot. Without
+              // dimensions in the wire payload we can't compute that
+              // precisely, so use the documented baseline. The wire-
+              // byte gate still catches cases where the JSON body
+              // genuinely exceeds Kiro's ~2.15 MB cap.
+              totalTokens += 1500
             }
           }
         }
@@ -1091,8 +1130,48 @@ export class MessagesService implements OnModuleInit {
         owned_by: string
         type: string
         display_name?: string
+        max_input_tokens?: number
       }
     >()
+
+    /**
+     * Pick the most generous context window across the backends that
+     * could route this model. Surfaced to clients so their local
+     * auto-compact thresholds (e.g. claude-code's
+     * `getContextWindowForModel` reading `cap.max_input_tokens`) match
+     * what the bridge can actually deliver. When the model is served
+     * only by a small-window backend (Kiro), this returns the smaller
+     * number so the client compacts before wire overflow rather than
+     * after — see backend-capability.ts:contextWindow.advertisedToCC.
+     */
+    const resolveAdvertisedWindow = (modelId: string): number | undefined => {
+      const candidates: BackendType[] = []
+      const resolved = resolveCloudCodeModel(modelId)
+      if (
+        resolved &&
+        resolved.family === "claude" &&
+        this.anthropicApiService.supportsModel(modelId)
+      ) {
+        candidates.push("claude-api")
+      }
+      if (canRouteViaGoogle(modelId)) {
+        candidates.push(
+          resolved?.family === "claude" ? "google-claude" : "google"
+        )
+      }
+      if (canRouteViaKiro(modelId)) candidates.push("kiro")
+      // GPT family handled separately — it doesn't use the BackendCapability
+      // window since codex / openai-compat have their own per-model caps.
+      if (candidates.length === 0) return undefined
+      let best = 0
+      for (const backend of candidates) {
+        const cap = getBackendCapability(backend)
+        if (cap.contextWindow.advertisedToCC > best) {
+          best = cap.contextWindow.advertisedToCC
+        }
+      }
+      return best > 0 ? best : undefined
+    }
 
     const addModel = (id: string, owner?: string) => {
       if (modelMap.has(id)) return
@@ -1113,6 +1192,7 @@ export class MessagesService implements OnModuleInit {
         owned_by: derivedOwner,
         type: "model",
         display_name: metadata?.displayName || resolved?.displayName,
+        max_input_tokens: resolveAdvertisedWindow(id),
       })
     }
 

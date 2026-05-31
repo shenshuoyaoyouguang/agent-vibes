@@ -1,0 +1,11 @@
+-- Migration 008: Reset cursor sessions for SessionMessage shape upgrade
+--
+-- Originally a `DELETE FROM cursor_sessions` to drop persisted v1 blobs
+-- after the SessionMessage shape change. Migration 002 (which created
+-- cursor_sessions) has since been removed as part of the agent-vibes
+-- turn-system architecture refactor (step 1, see
+-- /Users/recronin/.claude/plans/fancy-kindling-alpaca.md), so this
+-- migration must remain runnable on fresh databases where the table no
+-- longer exists. A guarded DROP keeps the historical reset behaviour
+-- without requiring the table to be present.
+DROP TABLE IF EXISTS cursor_sessions;

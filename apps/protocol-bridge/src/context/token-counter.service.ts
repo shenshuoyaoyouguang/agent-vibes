@@ -39,6 +39,28 @@ import {
  *   `@anthropic-ai/tokenizer.getTokenizer()` allocates fresh native state
  *   on every call.
  */
+/**
+ * Per-message token cache entry.
+ *
+ * Stored on a WeakMap<UnifiedMessage, MessageTokenCacheEntry>.  Validity is
+ * checked by reference equality on the four fields that contribute to the
+ * raw token count: `content`, `tool_calls`, `tool_call_id`, and `role`.  If
+ * any of those references differ from what was cached, the cache misses and
+ * we recompute (this is what makes the cache safe under in-place mutation:
+ * mutators that replace `content` invalidate; mutators that mutate the
+ * existing array/string in place would silently desync, but the bridge
+ * codebase consistently replaces these fields rather than mutating them in
+ * place — `applySendTimeSanitize` builds fresh `project()` output,
+ * `addMessage`/`appendToolResultWithIntegrity` create new objects).
+ */
+interface MessageTokenCacheEntry {
+  contentRef: unknown
+  toolCallsRef: UnifiedMessage["tool_calls"]
+  toolCallIdRef: UnifiedMessage["tool_call_id"] | undefined
+  roleRef: UnifiedMessage["role"]
+  rawTokens: number
+}
+
 @Injectable()
 export class TokenCounterService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(TokenCounterService.name)
@@ -56,6 +78,50 @@ export class TokenCounterService implements OnModuleInit, OnModuleDestroy {
   // Tool overhead tokens
   private readonly TOKENS_PER_TOOL_CALL = 20
   private readonly TOKENS_PER_TOOL_RESULT = 10
+
+  /**
+   * Per-message raw-token cache.  Keyed by message object identity; entries
+   * carry a snapshot of the references that contribute to the count so we
+   * can detect content replacement and recompute.  Entries naturally drop
+   * out as messages are GC'd from session histories.
+   *
+   * Cache hits short-circuit the full `countMessage` walk (which calls into
+   * tiktoken for every text/JSON segment).  On a 100-message history this
+   * is the difference between O(n) tokenizer invocations per turn and
+   * O(1) lookups for unchanged history plus O(1 new message) for the tail.
+   */
+  private readonly messageTokenCache: WeakMap<
+    UnifiedMessage,
+    MessageTokenCacheEntry
+  > = new WeakMap()
+
+  /**
+   * Bounded LRU for `countText` on long strings.  System prompts (typically
+   * 8–15 KB) and tool input_schema serializations are recomputed on every
+   * tool-continuation by `resolveMessageBudget` → `countSystemPromptTokens`
+   * / `countJsonValue`; tokenizing 10 KB through tiktoken is a non-trivial
+   * fraction of `prepare_context_ms`.
+   *
+   * Threshold of 128 chars keeps role/name/tool_use_id strings out of the
+   * cache (they're cheap to tokenize and would dominate insert churn).
+   * Bound of 64 entries comfortably covers per-turn unique long strings
+   * across concurrent sessions while keeping retained heap small (≤~1 MB
+   * worst case).
+   */
+  private readonly LONG_TEXT_CACHE_THRESHOLD_CHARS = 128
+  private readonly LONG_TEXT_CACHE_MAX_ENTRIES = 64
+  private readonly longTextRawTokenCache: Map<string, number> = new Map()
+
+  /**
+   * Per-object JSON-token cache for `countJsonValue`.  Tool definition
+   * arrays and tool input schemas pass through here and recur identically
+   * across every tool-continuation in a turn (the array reference is
+   * captured in a closure and reused).  Keyed by object identity, so the
+   * cache is automatically invalidated when callers rebuild the tools
+   * array.
+   */
+  private readonly jsonValueRawTokenCache: WeakMap<object, number> =
+    new WeakMap()
 
   private safeJsonStringify(value: unknown): string {
     const seen = new WeakSet<object>()
@@ -124,6 +190,19 @@ export class TokenCounterService implements OnModuleInit, OnModuleDestroy {
   countText(text: string, applyCorrection = true): number {
     if (!text) return 0
 
+    const useCache = text.length >= this.LONG_TEXT_CACHE_THRESHOLD_CHARS
+    if (useCache) {
+      const cached = this.longTextRawTokenCache.get(text)
+      if (cached !== undefined) {
+        // LRU: re-insert moves to most-recently-used position.
+        this.longTextRawTokenCache.delete(text)
+        this.longTextRawTokenCache.set(text, cached)
+        return applyCorrection
+          ? Math.ceil(cached * this.CLAUDE_CORRECTION_FACTOR)
+          : cached
+      }
+    }
+
     let count: number
 
     if (this.encoder) {
@@ -138,6 +217,18 @@ export class TokenCounterService implements OnModuleInit, OnModuleDestroy {
     } else {
       // Fallback: estimate ~4 characters per token
       count = Math.ceil(text.length / 4)
+    }
+
+    if (useCache) {
+      // Evict oldest if over bound. Map preserves insertion order, so the
+      // first key returned by .keys() is the least-recently-used entry.
+      if (this.longTextRawTokenCache.size >= this.LONG_TEXT_CACHE_MAX_ENTRIES) {
+        const oldest = this.longTextRawTokenCache.keys().next().value
+        if (oldest !== undefined) {
+          this.longTextRawTokenCache.delete(oldest)
+        }
+      }
+      this.longTextRawTokenCache.set(text, count)
     }
 
     return applyCorrection
@@ -208,9 +299,36 @@ export class TokenCounterService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Count tokens in a single unified message
+   * Count tokens in a single unified message.
+   *
+   * Caches the raw (pre-correction) result on a WeakMap keyed by the
+   * message object.  Cache validity is determined by reference equality on
+   * the fields that contribute to the count.  This makes the cache
+   * transparent to in-place mutators that *replace* fields (the dominant
+   * pattern in this codebase) and conservative for any mutator that
+   * unexpectedly mutates a content array in place — such a mutator would
+   * be a latent bug regardless, since it bypasses the persistence/projection
+   * pipelines that produce fresh arrays.
    */
   countMessage(message: UnifiedMessage, applyCorrection = true): number {
+    const rawTokens = this.computeMessageRawTokensCached(message)
+    return applyCorrection
+      ? Math.ceil(rawTokens * this.CLAUDE_CORRECTION_FACTOR)
+      : rawTokens
+  }
+
+  private computeMessageRawTokensCached(message: UnifiedMessage): number {
+    const cached = this.messageTokenCache.get(message)
+    if (
+      cached &&
+      cached.contentRef === message.content &&
+      cached.toolCallsRef === message.tool_calls &&
+      cached.toolCallIdRef === message.tool_call_id &&
+      cached.roleRef === message.role
+    ) {
+      return cached.rawTokens
+    }
+
     let tokens = this.TOKENS_PER_MESSAGE
 
     // Role token
@@ -234,9 +352,15 @@ export class TokenCounterService implements OnModuleInit, OnModuleDestroy {
       tokens += this.countText(message.tool_call_id, false)
     }
 
-    return applyCorrection
-      ? Math.ceil(tokens * this.CLAUDE_CORRECTION_FACTOR)
-      : tokens
+    this.messageTokenCache.set(message, {
+      contentRef: message.content,
+      toolCallsRef: message.tool_calls,
+      toolCallIdRef: message.tool_call_id,
+      roleRef: message.role,
+      rawTokens: tokens,
+    })
+
+    return tokens
   }
 
   /**
@@ -345,8 +469,30 @@ export class TokenCounterService implements OnModuleInit, OnModuleDestroy {
   /**
    * Count tokens for a serialized JSON value.
    * Useful for tool definitions, function call args, etc.
+   *
+   * For object/array inputs, the raw token count is cached on a WeakMap
+   * keyed by the input reference.  Tool definition arrays are the dominant
+   * caller: `resolveMessageBudget` forwards the same `apiTools` array on
+   * every continuation in a turn (the reference is captured in a closure
+   * and reused), so a single tokenize-the-whole-tool-catalog cost is paid
+   * once per array build instead of once per tool round.
    */
   countJsonValue(value: unknown, applyCorrection = true): number {
+    if (value !== null && typeof value === "object") {
+      const cached = this.jsonValueRawTokenCache.get(value)
+      if (cached !== undefined) {
+        return applyCorrection
+          ? Math.ceil(cached * this.CLAUDE_CORRECTION_FACTOR)
+          : cached
+      }
+      const json = this.safeJsonStringify(value)
+      if (!json) return 0
+      const raw = this.countText(json, false)
+      this.jsonValueRawTokenCache.set(value, raw)
+      return applyCorrection
+        ? Math.ceil(raw * this.CLAUDE_CORRECTION_FACTOR)
+        : raw
+    }
     const json = this.safeJsonStringify(value)
     return json ? this.countText(json, applyCorrection) : 0
   }

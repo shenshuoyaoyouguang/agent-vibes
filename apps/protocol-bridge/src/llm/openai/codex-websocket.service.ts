@@ -20,6 +20,7 @@
  */
 
 import { Injectable, Logger, OnModuleDestroy } from "@nestjs/common"
+import type { IncomingHttpHeaders } from "http"
 import { HttpProxyAgent } from "http-proxy-agent"
 import { HttpsProxyAgent } from "https-proxy-agent"
 import { SocksProxyAgent } from "socks-proxy-agent"
@@ -28,11 +29,16 @@ import {
   buildCodexWebSocketHeaders,
   type CodexForwardHeaders,
 } from "./codex-header-utils"
+import { CodexClientIdentityService } from "./codex-client-identity.service"
 
 // ── Constants ──────────────────────────────────────────────────────────
 
 const WS_IDLE_TIMEOUT_MS = 5 * 60 * 1000 // 5 minutes
-const WS_HANDSHAKE_TIMEOUT_MS = 30 * 1000 // 30 seconds
+/**
+ * 握手超时阈值。chatgpt.com codex 后端正常握手 < 1.5s；保留 5s 容忍轻度抖动，
+ * 之前的 30s 会让网络异常时整个 turn 卡 30s 才回落到 HTTP。
+ */
+const WS_HANDSHAKE_TIMEOUT_MS = 5 * 1000
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -51,9 +57,20 @@ export interface WebSocketMessage {
   [key: string]: unknown
 }
 
+export interface CodexWebSocketConnectionMetadata {
+  turnState?: string
+  modelsEtag?: string
+  serverModel?: string
+  reasoningIncluded: boolean
+}
+
 export interface CodexWebSocketError {
   status: number
   error: Record<string, unknown>
+}
+
+type WebSocketWithCodexMetadata = WebSocket & {
+  __codexMetadata?: CodexWebSocketConnectionMetadata
 }
 
 interface SessionStreamQueueItem {
@@ -78,7 +95,7 @@ export class CodexWebSocketService implements OnModuleDestroy {
   private readonly sessions = new Map<string, WebSocketSession>()
   private readonly connToSession = new WeakMap<WebSocket, WebSocketSession>()
 
-  constructor() {}
+  constructor(private readonly identity: CodexClientIdentityService) {}
 
   onModuleDestroy(): void {
     // Close all active sessions
@@ -129,6 +146,11 @@ export class CodexWebSocketService implements OnModuleDestroy {
     return buildCodexWebSocketHeaders({
       token,
       isApiKey,
+      identity: {
+        version: this.identity.version(),
+        userAgent: this.identity.userAgent(),
+        originator: this.identity.originator(),
+      },
       conversationId,
       accountId,
       workspaceId,
@@ -222,6 +244,48 @@ export class CodexWebSocketService implements OnModuleDestroy {
       )
       return undefined
     }
+  }
+
+  private readUpgradeHeader(
+    headers: IncomingHttpHeaders,
+    name: string
+  ): string | undefined {
+    const value = headers[name.toLowerCase()]
+    if (Array.isArray(value)) {
+      return value.find((item) => item.trim().length > 0)?.trim()
+    }
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value.trim()
+    }
+    return undefined
+  }
+
+  private captureConnectionMetadata(
+    ws: WebSocket,
+    headers: IncomingHttpHeaders
+  ): void {
+    const metadata: CodexWebSocketConnectionMetadata = {
+      turnState: this.readUpgradeHeader(headers, "x-codex-turn-state"),
+      modelsEtag: this.readUpgradeHeader(headers, "x-models-etag"),
+      serverModel: this.readUpgradeHeader(headers, "openai-model"),
+      reasoningIncluded: !!this.readUpgradeHeader(
+        headers,
+        "x-reasoning-included"
+      ),
+    }
+    ;(ws as WebSocketWithCodexMetadata).__codexMetadata = metadata
+    this.logger.debug(
+      `[Codex][WS Upgrade] turn_state=${metadata.turnState ? "present" : "none"} ` +
+        `models_etag=${metadata.modelsEtag ? "present" : "none"} ` +
+        `server_model=${metadata.serverModel || "none"} ` +
+        `reasoning_included=${metadata.reasoningIncluded}`
+    )
+  }
+
+  getConnectionMetadata(
+    ws: WebSocket
+  ): CodexWebSocketConnectionMetadata | undefined {
+    return (ws as WebSocketWithCodexMetadata).__codexMetadata
   }
 
   // ── Request Body Building ──────────────────────────────────────────
@@ -407,6 +471,10 @@ export class CodexWebSocketService implements OnModuleDestroy {
         resolve(ws)
       })
 
+      ws.once("upgrade", (res) => {
+        this.captureConnectionMetadata(ws, res.headers)
+      })
+
       ws.on("error", (err) => {
         clearTimeout(timeout)
         reject(err)
@@ -513,6 +581,96 @@ export class CodexWebSocketService implements OnModuleDestroy {
           session.requestTail = Promise.resolve()
         }
       },
+    }
+  }
+
+  /**
+   * 在上一轮 turn 的 response.completed 之后立即触发，异步预热下一轮 WebSocket
+   * 连接。chatgpt.com codex 后端会在 response.completed 后用 code=1005 主动关
+   * 闭连接，下一轮 turn 必须重新握手（约 1s）。prewarm 在 turn 间隙建立新连接
+   * 并挂到 session.conn，使下一轮 turn 进入 ensureSessionConnection 时直接命
+   * 中存活连接。
+   *
+   * 安全保证：
+   * - 如果握手期间已有新 turn 占用 session（activeStream 非空），prewarm 结果
+   *   直接关闭丢弃，不影响进行中的请求。
+   * - 如果 session.conn 已被其它路径替换为 OPEN 状态（说明已经成功复用），同样
+   *   丢弃 prewarm，避免无谓抢占。
+   * - 网络失败时静默丢弃，下一轮 turn 走原有的现场握手路径，无功能降级。
+   */
+  async schedulePrewarmConnection(
+    sessionId: string,
+    wsUrl: string,
+    headers: Record<string, string>,
+    proxyUrl?: string,
+    replacingWs?: WebSocket
+  ): Promise<void> {
+    const initialSession = this.sessions.get(sessionId)
+    if (!initialSession) {
+      return
+    }
+
+    let ws: WebSocket
+    try {
+      ws = await this.connect(wsUrl, headers, proxyUrl)
+    } catch (error) {
+      this.logger.debug(
+        `[Codex][Prewarm] connect failed for session ${sessionId}: ${(error as Error).message}`
+      )
+      return
+    }
+
+    const current = this.sessions.get(sessionId)
+    if (!current) {
+      this.safeCloseWebSocket(ws)
+      return
+    }
+
+    if (current.activeStream) {
+      // 另一个 turn 已经占用此 session，prewarm 不能抢占
+      this.safeCloseWebSocket(ws)
+      this.logger.debug(
+        `[Codex][Prewarm] discarded for session ${sessionId}: active stream in progress`
+      )
+      return
+    }
+
+    const existing = current.conn
+    const existingIsDead =
+      !existing ||
+      existing.readyState === WebSocket.CLOSED ||
+      existing.readyState === WebSocket.CLOSING
+    const existingIsStaleReplacing = !!replacingWs && existing === replacingWs
+
+    if (!existingIsDead && !existingIsStaleReplacing) {
+      // session 已持有另一条活连接，保留现状
+      this.safeCloseWebSocket(ws)
+      return
+    }
+
+    if (
+      existingIsStaleReplacing &&
+      existing &&
+      existing.readyState === WebSocket.OPEN
+    ) {
+      this.safeCloseWebSocket(existing)
+    }
+
+    current.conn = ws
+    current.wsUrl = wsUrl
+    this.attachSessionLifecycle(current, ws)
+    this.logger.debug(
+      `[Codex][Prewarm] adopted prewarmed connection for session ${sessionId}`
+    )
+  }
+
+  private safeCloseWebSocket(ws: WebSocket): void {
+    try {
+      ws.close()
+    } catch (error) {
+      this.logger.debug(
+        `[Codex][WS] close ignored: ${(error as Error).message}`
+      )
     }
   }
 
@@ -634,7 +792,12 @@ export class CodexWebSocketService implements OnModuleDestroy {
       activeStream.waiter = null
     })
 
-    conn.on("close", () => {
+    conn.on("close", (code: number, reason: Buffer) => {
+      const reasonText = reason.toString("utf8")
+      const activeStream = session.activeStream
+      this.logger.debug(
+        `WebSocket session ${session.sessionId} closed: code=${code} reason=${JSON.stringify(reasonText)} active=${activeStream?.conn === conn}`
+      )
       this.failActiveStream(
         session,
         conn,
@@ -646,6 +809,9 @@ export class CodexWebSocketService implements OnModuleDestroy {
     conn.on("error", (error) => {
       const normalizedError =
         error instanceof Error ? error : new Error(String(error))
+      this.logger.debug(
+        `WebSocket session ${session.sessionId} error: ${normalizedError.message}`
+      )
       this.failActiveStream(session, conn, normalizedError)
       clearIfCurrent()
     })
@@ -702,10 +868,14 @@ export class CodexWebSocketService implements OnModuleDestroy {
     if (parsed.type === "error") {
       const status =
         (parsed.status as number) || (parsed.status_code as number) || 500
-      throw new CodexWebSocketUpgradeError(
-        status,
-        JSON.stringify(parsed.error || parsed)
-      )
+      const errorBody = JSON.stringify(parsed.error || parsed)
+      // 协议级逻辑错误：previous_response_id 失效。TCP/WS 帧通道仍健康，
+      // 标记 preserveConnection=true 让上层在保留 ws 的前提下重发完整 input。
+      const preserveConnection =
+        status === 400 && /previous.response.*not found/i.test(errorBody)
+      throw new CodexWebSocketUpgradeError(status, errorBody, {
+        preserveConnection,
+      })
     }
 
     if (parsed.type === "response.done") {
@@ -771,6 +941,7 @@ export class CodexWebSocketService implements OnModuleDestroy {
     }
     session.activeStream = activeStream
     let responseCompleted = false
+    let preserveOnError = false
 
     try {
       await this.sendRequestPayload(ws, requestBody)
@@ -796,6 +967,13 @@ export class CodexWebSocketService implements OnModuleDestroy {
         try {
           parsed = this.parseWebSocketMessage(item.data)
         } catch (error) {
+          if (
+            error instanceof CodexWebSocketUpgradeError &&
+            error.preserveConnection &&
+            ws.readyState === WebSocket.OPEN
+          ) {
+            preserveOnError = true
+          }
           if (session.activeStream === activeStream) {
             session.activeStream = null
           }
@@ -816,8 +994,12 @@ export class CodexWebSocketService implements OnModuleDestroy {
       if (session.activeStream === activeStream) {
         session.activeStream = null
       }
-      if (!responseCompleted) {
+      if (!responseCompleted && !preserveOnError) {
         this.invalidateSessionConnection(session.sessionId, ws)
+      } else if (preserveOnError) {
+        this.logger.debug(
+          `[Codex][WS] session ${session.sessionId} preserved after protocol-level error (ws.readyState=${ws.readyState})`
+        )
       }
     }
   }
@@ -950,14 +1132,24 @@ export class CodexWebSocketService implements OnModuleDestroy {
 // ── Error Types ────────────────────────────────────────────────────────
 
 export class CodexWebSocketUpgradeError extends Error {
+  /**
+   * 当为 true 时，错误属于"协议级逻辑错误"——TCP/WS 帧通道仍然健康，
+   * 上层 catch 后可以直接复用同一 WebSocket 重发请求，避免一次完整握手。
+   * 当前唯一会标记的场景：服务器拒绝 previous_response_id（HTTP 400 +
+   * "Previous response with id ... not found"）。
+   */
+  public readonly preserveConnection: boolean
+
   constructor(
     public readonly statusCode: number,
-    public readonly body: string
+    public readonly body: string,
+    options: { preserveConnection?: boolean } = {}
   ) {
     super(
       `WebSocket upgrade failed: status=${statusCode}, body=${body.slice(0, 200)}`
     )
     this.name = "CodexWebSocketUpgradeError"
+    this.preserveConnection = options.preserveConnection === true
   }
 
   /**

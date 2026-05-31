@@ -1,15 +1,52 @@
 /**
  * esbuild configuration for Protocol Bridge SEA bundling.
  *
- * Uses @anatine/esbuild-decorators to properly handle NestJS's
- * emitDecoratorMetadata — falls back to tsc for files with decorators.
+ * Uses @swc/core to transpile decorator-bearing TypeScript with proper
+ * `emitDecoratorMetadata` output (legacy decorators + design:paramtypes).
+ * NestJS DI relies on this metadata to resolve constructor params.
  *
- * Pipeline: esbuild + decorator plugin → single CJS file → SEA blob
+ * Pipeline: SWC (src/**\/*.ts) → esbuild bundle (CJS) → SEA blob
  */
 const esbuild = require("esbuild")
 const path = require("path")
 const fs = require("fs")
-const { esbuildDecorators } = require("@anatine/esbuild-decorators")
+const swc = require("@swc/core")
+
+// Only files under apps/protocol-bridge/src are routed through SWC.
+// sea-entry.ts and any node_modules .ts are handled by esbuild's
+// built-in TS loader (no decorator metadata needed there).
+const SRC_ROOT = path.resolve(__dirname, "..", "src") + path.sep
+
+const swcDecoratorPlugin = {
+  name: "swc-decorators",
+  setup(build) {
+    build.onLoad({ filter: /\.ts$/ }, async (args) => {
+      if (!args.path.startsWith(SRC_ROOT)) return null
+
+      const source = await fs.promises.readFile(args.path, "utf-8")
+      const { code } = await swc.transform(source, {
+        filename: args.path,
+        sourceMaps: false,
+        jsc: {
+          parser: {
+            syntax: "typescript",
+            decorators: true,
+            dynamicImport: true,
+          },
+          transform: {
+            legacyDecorator: true,
+            decoratorMetadata: true,
+          },
+          target: "es2022",
+          keepClassNames: true,
+        },
+        // Emit ES module syntax; let esbuild handle the final CJS conversion.
+        module: { type: "es6" },
+      })
+      return { contents: code, loader: "js" }
+    })
+  },
+}
 
 // Plugin to redirect @nestjs/swagger to our no-op stub
 const swaggerStubPlugin = {
@@ -70,13 +107,7 @@ async function build() {
     target: "node24",
     format: "cjs",
     outfile: path.join(__dirname, "..", "dist", "sea-entry.js"),
-    plugins: [
-      esbuildDecorators({
-        tsconfig: path.join(__dirname, "..", "tsconfig.build.json"),
-      }),
-      swaggerStubPlugin,
-      tiktokenWasmPlugin,
-    ],
+    plugins: [swcDecoratorPlugin, swaggerStubPlugin, tiktokenWasmPlugin],
     // Keep node built-ins and NestJS optional peer deps external
     external: [
       "node:*",

@@ -64,6 +64,7 @@
     "kiro:capture:stop": "node scripts/capture/capture-kiro.js stop",
     "kiro:capture:status": "node scripts/capture/capture-kiro.js status",
     "kiro:capture:repair": "node scripts/capture/capture-kiro.js repair",
+    "kiro:probe:cap": "node scripts/probe/probe-kiro-cap.mjs",
     "deploy:sync": "node bin/agent-vibes sync --deploy"
   },
   "devDependencies": {

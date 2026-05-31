@@ -106,13 +106,58 @@ export interface DiscoverToolCatalogEntry {
 }
 
 /**
+ * Names of tools that already live in the **core** tool surface (i.e.
+ * were not trimmed out by the defer policy and so are callable
+ * directly without a `discover_tool` round-trip). When the model
+ * mistakenly calls `discover_tool` on one of these, we return a
+ * dedicated success-style error explaining that the tool is already
+ * loaded — instead of the generic
+ * `Unknown deferred tool "..."` reject which would be misleading.
+ *
+ * Caller is responsible for passing the actual list (it is computed
+ * from the session's `coreToolDefinitions` + `discoveredTools` set
+ * in cursor-connect-stream.service.ts).
+ */
+export type CoreToolNameSet = ReadonlySet<string>
+
+/**
+ * Tool names that are NOT in Cursor's `agent.v1` protocol but that
+ * frequently leak into model outputs because they exist in another
+ * surface the model has been trained on (Antigravity / Google Cloud
+ * Code). When the model `discover_tool`s one of these names, returning
+ * the generic "Unknown deferred tool" reject burns a turn while the
+ * model retries variants. Surface a one-line redirect to the actual
+ * Cursor protocol equivalent so the model can recover on this turn.
+ *
+ * Keep this list small and only add entries when we have a confident
+ * 1:1 redirect; broad guesses would mask real catalog mismatches.
+ */
+const NON_CURSOR_TOOL_REDIRECTS: ReadonlyMap<string, string> = new Map([
+  [
+    "view_content_chunk",
+    "`view_content_chunk` belongs to Antigravity / Google Cloud Code, not Cursor `agent.v1`. Cursor's `web_fetch` returns the entire document in one call; if you need to fetch a URL, call `web_fetch` instead. Bridge-internal `[tool_result stored]` archives are also not addressable by chunk — re-invoke the original tool to read again.",
+  ],
+  [
+    "read_url_content",
+    "`read_url_content` belongs to Antigravity / Google Cloud Code, not Cursor `agent.v1`. Use `web_fetch` to read a URL on this surface.",
+  ],
+])
+
+function buildUnknownDeferredToolMessage(requested: string): string {
+  const redirect = NON_CURSOR_TOOL_REDIRECTS.get(requested)
+  const base = `Unknown deferred tool "${requested}". Names are case-sensitive; check the <deferred_tools> catalog in the system prompt.`
+  return redirect ? `${base} ${redirect}` : base
+}
+
+/**
  * Resolve a `discover_tool` call.  Pure: no I/O, no session mutation;
  * the caller is responsible for adding `result.tool_name` to the
  * session's `discoveredTools` on success.
  */
 export function handleDiscoverToolCall(
   toolInput: Record<string, unknown>,
-  catalog: ReadonlyMap<string, DiscoverToolCatalogEntry>
+  catalog: ReadonlyMap<string, DiscoverToolCatalogEntry>,
+  coreToolNames?: CoreToolNameSet
 ): DiscoverToolResult {
   const requested =
     typeof toolInput.tool_name === "string" ? toolInput.tool_name.trim() : ""
@@ -127,9 +172,29 @@ export function handleDiscoverToolCall(
       available: Array.from(catalog.keys()).slice(0, 32),
     }
   }
-
   const entry = catalog.get(requested)
   if (!entry) {
+    // P1-3 / smoke-regression #5: when the requested tool is already
+    // in the core surface (e.g. `kill_agent`, `task`, `await_task`),
+    // returning the generic `Unknown deferred tool` error misleads
+    // the model into thinking the tool is unavailable. Hand back a
+    // success-shaped result with `promoted_to_core=true` and a
+    // `description` that explicitly says no discovery was needed,
+    // so the model retries by calling the tool directly.
+    if (coreToolNames && coreToolNames.has(requested)) {
+      return {
+        status: "success",
+        tool_name: requested,
+        description:
+          `"${requested}" is already part of the core tool surface ` +
+          `for this session; no discover_tool round-trip is needed. ` +
+          `Call it directly with its documented arguments. ` +
+          `(This response is synthetic — there is no separate ` +
+          `description payload to fetch.)`,
+        input_schema: { type: "object", properties: {}, required: [] },
+        promoted_to_core: true,
+      }
+    }
     // Try a case-insensitive lookup as a courtesy; common-failure mode is
     // models lower-casing names that have non-trivial casing (notably
     // some MCP tool prefixes).
@@ -145,7 +210,7 @@ export function handleDiscoverToolCall(
       return {
         status: "error",
         tool_name: requested,
-        error: `Unknown deferred tool "${requested}". Names are case-sensitive; check the <deferred_tools> catalog in the system prompt.`,
+        error: buildUnknownDeferredToolMessage(requested),
         available: Array.from(catalog.keys()).slice(0, 32),
       }
     }

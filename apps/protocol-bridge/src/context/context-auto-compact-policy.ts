@@ -7,7 +7,16 @@ export interface ContextAutoCompactInput {
 
 const COMPACT_SUMMARY_OUTPUT_RESERVE_TOKENS = 20_000
 const DEFAULT_TURN_OUTPUT_RESERVE_TOKENS = 8_192
-const BASE_AUTOCOMPACT_BUFFER_TOKENS = 13_000
+// Lowered from 13_000. The original 13K headroom was sized so a fully
+// synchronous compact (Opus 4.7 thinking, 30–110s) had room to land before
+// the next request would otherwise overflow. With predictive pre-warm doing
+// compaction in the background while the previous tool result settles, the
+// reactive trigger is rarely on the request critical path; we can
+// confidently shave a few thousand tokens off the buffer to give Opus turns
+// 1–2 extra read-only batches before the next compaction kicks. The ratio
+// for the medium / large tiers is unchanged because those models have
+// proportionally larger working sets and don't benefit as much.
+const BASE_AUTOCOMPACT_BUFFER_TOKENS = 8_000
 const MEDIUM_CONTEXT_AUTOCOMPACT_BUFFER_TOKENS = 30_000
 const LARGE_CONTEXT_AUTOCOMPACT_BUFFER_TOKENS = 50_000
 const TOOL_RESULT_TURN_GROWTH_ESTIMATE_TOKENS = 15_000

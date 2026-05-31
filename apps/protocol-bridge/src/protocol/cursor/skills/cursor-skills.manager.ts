@@ -7,7 +7,7 @@
  *      isCursorSkillActive / activateCursorSkillForSession / activateCursorSkillsForPath /
  *      buildInactiveCursorSkillToolError / pickCursorSkillTargetPath）集中到本类。
  *   - 提供「只读策略求解」「会话级激活/卸载」「工具访问拦截」「Skill 搜索」四组 API。
- *   - Service 自身保持无状态（state 全部寄存在 ChatSession 上），便于水平扩展。
+ *   - Service 自身保持无状态（state 全部寄存在 SessionRecord 上），便于水平扩展。
  *
  * 模型对照：
  *   - Anthropic Claude Code SkillsManager（getSkillToolCommands + permission）
@@ -17,8 +17,8 @@
 
 import { Injectable, Logger } from "@nestjs/common"
 import type { CursorRule } from "../../../gen/agent/v1_pb"
-import type { ChatSession } from "../session/chat-session.service"
-import { ChatSessionManager } from "../session/chat-session.service"
+import type { SessionRecord } from "../session/session-lifecycle.service"
+import { SessionLifecycleService } from "../session/session-lifecycle.service"
 import { renderCursorSkillsCatalog } from "./catalog"
 import { normalizePathForMatch, normalizeSkillName } from "./frontmatter"
 import {
@@ -49,7 +49,27 @@ export interface CursorSkillsPromptContext {
 export class CursorSkillsManager {
   private readonly logger = new Logger(CursorSkillsManager.name)
 
-  constructor(private readonly sessionManager: ChatSessionManager) {}
+  /**
+   * Per-session dedupe ledger for the "Suppressed N inactive Cursor skill
+   * rule(s)" WARN. Without this guard the same line is emitted on every
+   * prompt rebuild (227 occurrences observed in the smoke regression's
+   * 20-minute bridge log for a single session). The ledger keys on
+   * conversationId + sorted suppressed-skill-name fingerprint so a real
+   * change in suppressed set still surfaces a fresh WARN; pure
+   * repetition is silenced.
+   *
+   * Memory bound: keyed by conversationId, cleared via
+   * `forgetSession`. The Set per session is at most O(K) where K is the
+   * number of distinct suppressed-skill fingerprints observed in that
+   * session — in practice K ≤ 3 since the catalog rarely changes mid-
+   * session.
+   */
+  private readonly suppressedSkillsWarnedFingerprints = new Map<
+    string,
+    Set<string>
+  >()
+
+  constructor(private readonly sessionManager: SessionLifecycleService) {}
 
   /* ---------------- 策略求解 ---------------- */
 
@@ -59,18 +79,57 @@ export class CursorSkillsManager {
   ): CursorSkillPolicyResult {
     const policy = resolveCursorSkillPolicy(this.toPolicyInput(context))
     if (policy.suppressedSkills.length > 0) {
-      this.logger.warn(
-        `Suppressed ${policy.suppressedSkills.length} inactive Cursor skill rule(s) for prompt: ` +
-          policy.suppressedSkills.map((skill) => skill.name).join(", ") +
-          "; use fetch_rules({ skill_name }) to load a skill before applying its workflow"
-      )
+      const conversationId = this.deriveDedupeSessionKey(context)
+      const fingerprint = policy.suppressedSkills
+        .map((skill) => skill.name)
+        .sort()
+        .join("|")
+      const seenForSession =
+        this.suppressedSkillsWarnedFingerprints.get(conversationId) ??
+        new Set<string>()
+      if (!seenForSession.has(fingerprint)) {
+        seenForSession.add(fingerprint)
+        this.suppressedSkillsWarnedFingerprints.set(
+          conversationId,
+          seenForSession
+        )
+        this.logger.warn(
+          `Suppressed ${policy.suppressedSkills.length} inactive Cursor skill rule(s) for prompt: ` +
+            policy.suppressedSkills.map((skill) => skill.name).join(", ") +
+            "; use fetch_rules({ skill_name }) to load a skill before applying its workflow"
+        )
+      }
     }
     return policy
   }
 
-  /** 直接以 ChatSession 求解策略；用于 fetch_rules 等运行时调用。 */
+  /**
+   * Derive the dedupe key for the suppressed-skills WARN. Falls back to
+   * `__no_session__` when the prompt context has no project root or
+   * tracked rule path; that bucket is intentionally global so non-
+   * session prompt rebuilds also dedupe instead of spamming.
+   */
+  private deriveDedupeSessionKey(context: CursorSkillsPromptContext): string {
+    const root = context.projectContext?.rootPath
+    if (typeof root === "string" && root.trim().length > 0) {
+      return `root:${root.trim()}`
+    }
+    return "__no_session__"
+  }
+
+  /**
+   * Drop dedupe ledger entries for a session. Called by SessionLifecycleService
+   * when a session is closed so long-running bridges do not slowly leak
+   * fingerprints. Safe no-op when the session was never seen.
+   */
+  forgetSession(conversationId: string): void {
+    if (!conversationId) return
+    this.suppressedSkillsWarnedFingerprints.delete(conversationId)
+  }
+
+  /** 直接以 SessionRecord 求解策略；用于 fetch_rules 等运行时调用。 */
   resolvePolicyForSession(
-    session: ChatSession,
+    session: SessionRecord,
     extraContextPaths: string[] = []
   ): CursorSkillPolicyResult {
     return resolveCursorSkillPolicy(
@@ -96,7 +155,7 @@ export class CursorSkillsManager {
   /* ---------------- 会话级激活/卸载 ---------------- */
 
   /** 判定 Skill 是否在当前会话中处于激活态。 */
-  isActive(session: ChatSession, skillName: string): boolean {
+  isActive(session: SessionRecord, skillName: string): boolean {
     const normalized = normalizeSkillName(skillName)
     if (!normalized) return false
     if (
@@ -112,7 +171,7 @@ export class CursorSkillsManager {
   }
 
   /** 在会话上激活某个 Skill（幂等）。 */
-  activate(session: ChatSession, skillName: string, reason: string): void {
+  activate(session: SessionRecord, skillName: string, reason: string): void {
     const normalized = normalizeSkillName(skillName)
     if (!normalized) return
     const activeNames = new Set(
@@ -132,7 +191,7 @@ export class CursorSkillsManager {
   }
 
   /** 显式卸载某个 Skill；无匹配则忽略。 */
-  deactivate(session: ChatSession, skillName: string): boolean {
+  deactivate(session: SessionRecord, skillName: string): boolean {
     const normalized = normalizeSkillName(skillName)
     if (!normalized) return false
     const before = session.activeCursorSkillNames || []
@@ -149,7 +208,11 @@ export class CursorSkillsManager {
   }
 
   /** 根据当前工具访问的路径，自动激活满足 path_match 条件的 Skill。 */
-  activateForPath(session: ChatSession, rawPath: string, reason: string): void {
+  activateForPath(
+    session: SessionRecord,
+    rawPath: string,
+    reason: string
+  ): void {
     if (!rawPath) return
     const policy = this.resolvePolicyForSession(session, [rawPath])
     for (const skill of policy.activeSkills) {
@@ -167,7 +230,7 @@ export class CursorSkillsManager {
    * 否则返回 null。
    */
   guardToolAccess(
-    session: ChatSession,
+    session: SessionRecord,
     toolName: string,
     input: Record<string, unknown>
   ): string | null {
@@ -251,7 +314,7 @@ export class CursorSkillsManager {
   }
 
   private toPolicyInputFromSession(
-    session: ChatSession,
+    session: SessionRecord,
     extraContextPaths: string[]
   ): CursorSkillPolicyInput {
     const baseContextPaths = (session.codeChunks || []).map(

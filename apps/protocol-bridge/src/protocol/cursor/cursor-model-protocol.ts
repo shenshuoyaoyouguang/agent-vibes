@@ -1220,9 +1220,15 @@ export function buildCursorAvailableModel(
   const defaultDisplayVariant = selectDefaultDisplayVariant(projectedVariants)
   const shouldSuppressProjectedTagline =
     model.isThinking && model.family !== "gpt"
+  // `model.tagline` lets registry/cache providers force a curated badge such
+  // as Antigravity's `Fast` chip on `gemini-3.5-flash-*`. It still defers to
+  // the thinking-model suppress rule (Claude/Gemini reasoning models keep
+  // their displayName as tagline) so we don't accidentally double-decorate
+  // a thinking entry.
   const projectedTagline = shouldSuppressProjectedTagline
     ? model.displayName
-    : defaultDisplayVariant?.tagline ||
+    : model.tagline ||
+      defaultDisplayVariant?.tagline ||
       extractVariantSuffix(
         defaultDisplayVariant?.displayName,
         model.displayName

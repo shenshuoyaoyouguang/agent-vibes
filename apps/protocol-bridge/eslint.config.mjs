@@ -57,6 +57,25 @@ export default tseslint.config(
     },
   },
   {
+    // Phase B–G new architecture: turn-runner interfaces and tests
+    // declare async methods that satisfy a contract and may not
+    // themselves use `await`. Likewise async generators are used
+    // for backend-event streams that are scripted in tests. These
+    // are inherent to the interface shapes, not bugs.
+    files: [
+      "src/protocol/cursor/turn/**/*.ts",
+      "src/protocol/cursor/bidi/**/*.ts",
+      "src/protocol/cursor/backend/backend-stream.ts",
+      "src/protocol/cursor/backend/backend-stream.spec.ts",
+      "src/protocol/cursor/context-bridge/**/*.ts",
+      "src/protocol/cursor/subagents-bridge/**/*.ts",
+    ],
+    rules: {
+      "@typescript-eslint/require-await": "off",
+      "require-yield": "off",
+    },
+  },
+  {
     files: ["src/protocol/cursor/cursor-connect-stream.service.ts"],
     rules: {
       "@typescript-eslint/restrict-template-expressions": "off",
@@ -78,6 +97,19 @@ export default tseslint.config(
       "@typescript-eslint/no-unsafe-assignment": "off",
       "@typescript-eslint/no-unsafe-member-access": "off",
       "@typescript-eslint/no-unsafe-return": "off",
+    },
+  },
+  {
+    // Jest spec files commonly assert on mock methods read off class
+    // instances (`expect(service.method).toHaveBeenCalled()`); the
+    // strict `unbound-method` rule is a constant false positive in
+    // that idiom — the test does not actually invoke the unbound
+    // reference. Tests are also free to script async generators that
+    // do not yield in every branch and to fabricate handles whose
+    // `this` is never read.
+    files: ["**/*.spec.ts", "**/*.test.ts"],
+    rules: {
+      "@typescript-eslint/unbound-method": "off",
     },
   }
 )

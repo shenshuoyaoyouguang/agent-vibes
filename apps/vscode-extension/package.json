@@ -161,6 +161,11 @@
         "category": "Agent Vibes"
       },
       {
+        "command": "agentVibes.applyCursorIdleKillerPatch",
+        "title": "Apply Cursor Idle Extension Host Patch",
+        "category": "Agent Vibes"
+      },
+      {
         "command": "agentVibes.resetCursorPatches",
         "title": "Reset Cursor Patches",
         "category": "Agent Vibes"

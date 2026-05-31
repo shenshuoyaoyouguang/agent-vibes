@@ -1,12 +1,14 @@
 import { Injectable, Logger } from "@nestjs/common"
 import { createHash } from "crypto"
 import { ContextAttachmentSnapshot } from "./context-attachment-builder.service"
+import { ContextCollapseService } from "./context-collapse.service"
 import {
   ContextCompactionCandidate,
   ContextCompactionPlan,
   ContextCompactionService,
 } from "./context-compaction.service"
 import {
+  isContextCollapseSummaryRecord,
   isMessageRecord,
   stripInternalContextEvents,
 } from "./context-transcript-events"
@@ -17,6 +19,7 @@ import {
   CodexContextState,
   CodexRawResponseItemBlock,
   CodexReferenceContextItem,
+  ContextCollapseCommit,
   CodexReplacementHistoryItem,
   CodexTruncationPolicy,
   ContextConversationState,
@@ -62,6 +65,12 @@ export interface CodexRemoteCompactRequest {
   maxTokens: number
   candidate: ContextCompactionCandidate
   referenceContextItem: CodexReferenceContextItem
+  /**
+   * Aborted when the surrounding turn is superseded or cancelled. The
+   * provider must thread this through to the underlying Codex Responses
+   * compact request so a stale compaction does not race the next turn.
+   */
+  signal: AbortSignal
 }
 
 export interface CodexRemoteCompactResult {
@@ -78,6 +87,7 @@ export class CodexContextAdapterService {
 
   constructor(
     private readonly compaction: ContextCompactionService,
+    private readonly contextCollapse: ContextCollapseService,
     private readonly tokenCounter: TokenCounterService,
     private readonly toolIntegrity: ToolIntegrityService
   ) {}
@@ -136,8 +146,17 @@ export class CodexContextAdapterService {
         candidate: ContextCompactionCandidate
       ) => Promise<string | undefined>
       remoteCompactProvider: CodexRemoteCompactProvider
+      signal: AbortSignal
+      meta?: {
+        sessionId?: string
+        conversationId?: string
+        agentId?: string
+        querySource?: string
+        notifyPromptCacheCompaction?: () => void
+      }
     }
   ): Promise<ContextCompactionPlan | undefined> {
+    options.signal.throwIfAborted()
     const candidate = this.compaction.prepareCompactionCandidate(
       state,
       snapshot,
@@ -154,6 +173,7 @@ export class CodexContextAdapterService {
 
     const hookUserMessage =
       options.hookUserMessage || (await options.hookProvider?.(candidate))
+    options.signal.throwIfAborted()
     const sourceMessages = this.recordsToMessages([
       ...candidate.archivedRecords,
       ...candidate.retainedRecords,
@@ -167,7 +187,9 @@ export class CodexContextAdapterService {
       maxTokens: candidate.summaryBudget,
       candidate,
       referenceContextItem: options.referenceContextItem,
+      signal: options.signal,
     })
+    options.signal.throwIfAborted()
     const replacementHistory = this.processRemoteReplacementHistory(
       compactResult.replacementHistory,
       options.injectionMode,
@@ -185,6 +207,7 @@ export class CodexContextAdapterService {
       {
         summary,
         hookUserMessage,
+        meta: options.meta,
       }
     )
     const anchorRecordId =
@@ -220,6 +243,75 @@ export class CodexContextAdapterService {
       `Codex compact applied commit=${plan.commit.id} mode=${options.injectionMode} replacementItems=${replacementHistory.length}`
     )
     return plan
+  }
+
+  async applyCollapsesIfNeeded(
+    state: ContextConversationState,
+    snapshot: ContextAttachmentSnapshot,
+    options: {
+      maxTokens: number
+      systemPromptTokens: number
+      autoCompactTokenLimit?: number
+      predictiveCompactTokenLimit?: number
+      strategy?: "auto" | "manual" | "reactive"
+      integrityMode?: "strict-adjacent" | "global"
+      referenceContextItem: CodexReferenceContextItem
+      remoteCompactProvider: CodexRemoteCompactProvider
+      signal: AbortSignal
+    }
+  ): Promise<ContextCollapseCommit | undefined> {
+    options.signal.throwIfAborted()
+    const candidate = this.compaction.prepareCompactionCandidate(
+      state,
+      snapshot,
+      {
+        maxTokens: options.maxTokens,
+        systemPromptTokens: options.systemPromptTokens,
+        autoCompactTokenLimit: options.autoCompactTokenLimit,
+        predictiveCompactTokenLimit: options.predictiveCompactTokenLimit,
+        strategy: options.strategy || "auto",
+        integrityMode: options.integrityMode,
+      }
+    )
+    if (!candidate) return undefined
+
+    const sourceMessages = this.recordsToMessages([
+      ...candidate.archivedRecords,
+      ...candidate.retainedRecords,
+    ])
+    const compactMessages = this.projectCodexMessages(state, sourceMessages, {
+      maxTokens: options.maxTokens,
+      systemPromptTokens: options.systemPromptTokens,
+    })
+    const compactResult = await options.remoteCompactProvider({
+      messages: compactMessages,
+      maxTokens: candidate.summaryBudget,
+      candidate,
+      referenceContextItem: options.referenceContextItem,
+      signal: options.signal,
+    })
+    options.signal.throwIfAborted()
+    const replacementHistory = this.processRemoteReplacementHistory(
+      compactResult.replacementHistory,
+      "pre_turn",
+      options.referenceContextItem
+    )
+    if (replacementHistory.length === 0) {
+      throw new Error(
+        "Codex remote collapse returned empty replacement history"
+      )
+    }
+
+    const summary = this.buildReplacementSummary(replacementHistory)
+    const commit = this.contextCollapse.applyGeneratedCollapse(
+      state,
+      candidate,
+      { summary }
+    )
+    this.logger.log(
+      `Codex context collapse applied commit=${commit.id} replacementItems=${replacementHistory.length}`
+    )
+    return commit
   }
 
   projectCodexMessages(
@@ -418,10 +510,15 @@ export class CodexContextAdapterService {
   private recordsToMessages(
     records: readonly ContextTranscriptRecord[]
   ): UnifiedMessage[] {
-    return records.filter(isMessageRecord).map((record) => ({
-      role: record.role,
-      content: record.content,
-    })) as UnifiedMessage[]
+    return records
+      .filter(
+        (record) =>
+          isMessageRecord(record) || isContextCollapseSummaryRecord(record)
+      )
+      .map((record) => ({
+        role: record.role,
+        content: record.content,
+      })) as UnifiedMessage[]
   }
 
   private cloneReplacementItem(

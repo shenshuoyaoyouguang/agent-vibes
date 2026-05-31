@@ -12,6 +12,9 @@ export {
   resolveAutoCompactTokenLimit,
   type ContextAutoCompactInput,
 } from "./context-auto-compact-policy"
+export { CompactWarningStateService } from "./compact-warning-state.service"
+export { CompactWarningHookService } from "./compact-warning-hook.service"
+export { PostCompactCleanupService } from "./post-compact-cleanup.service"
 export {
   CodexContextAdapterService,
   CODEX_SUMMARIZATION_PROMPT,
@@ -28,6 +31,11 @@ export type {
   ContextAttachmentSnapshot,
   SessionTodoAttachmentLike,
 } from "./context-attachment-builder.service"
+export { ContextCollapseService } from "./context-collapse.service"
+export type {
+  ContextCollapseApplyInput,
+  ContextCollapseProjectionResult,
+} from "./context-collapse.service"
 export { ContextCompactRunnerService } from "./context-compact-runner.service"
 export type {
   ContextCompactRunnerHookProvider,
@@ -41,6 +49,7 @@ export {
 } from "./context-compaction.service"
 export type {
   ContextCompactionCandidate,
+  ContextCompactionPlan,
   ContextCompactionResult,
 } from "./context-compaction.service"
 export {
@@ -52,22 +61,32 @@ export type {
   ReactiveRecoveryOutcome,
   ReactiveRecoveryRequest,
 } from "./context-manager.service"
-export { ContextNativeCacheEditService } from "./context-native-cache-edit.service"
-export type { ContextNativeCacheEditApplyResult } from "./context-native-cache-edit.service"
 export { ContextNativeManagementService } from "./context-native-management.service"
 export type {
   AnthropicNativeContextManagementInput,
   ContextNativeEditStrategy,
   ContextNativeManagementConfig,
 } from "./context-native-management.service"
-export { ContextPipelineService } from "./context-pipeline.service"
+export {
+  ContextPipeline,
+  ContextPipelineService,
+} from "./context-pipeline.service"
 export { ContextProjectionService } from "./context-projection.service"
 export { ContextRequestPlannerService } from "./context-request-planner.service"
+export { ReasoningMemoryService } from "./reasoning-memory.service"
+export type {
+  ReasoningRecord,
+  ReasoningCapture,
+  ReasoningPreamble,
+  ReasoningPreambleBudget,
+} from "./reasoning-memory.service"
 export type {
   ContextProjectionOptions,
   ContextProjectionBudget,
   ContextRequestBudget,
+  ContextRequestBudgetDecision,
   ContextRequestBudgetInput,
+  ContextRequestBudgetSelectionSource,
 } from "./context-request-planner.service"
 export { ContextTelemetryService } from "./context-telemetry.service"
 export type {
@@ -79,6 +98,7 @@ export {
   createCompactSummaryRecord,
   createAttachmentRecord,
   createHookResultRecord,
+  createContextCollapseSummaryRecord,
   createMicrocompactBoundaryRecord,
   createSnipBoundaryRecord,
   deriveCompactionHistoryFromTranscript,
@@ -88,11 +108,13 @@ export {
   isAttachmentRecord,
   isCompactBoundaryRecord,
   isCompactSummaryRecord,
+  isContextCollapseSummaryRecord,
   isHookResultRecord,
   isMessageRecord,
   isMicrocompactBoundaryRecord,
   isSnipBoundaryRecord,
   projectSnippedView,
+  renderContextCollapseSummary,
   stripInternalContextEvents,
 } from "./context-transcript-events"
 export { ContextUsageLedgerService } from "./context-usage-ledger.service"
@@ -100,14 +122,7 @@ export { SessionMemoryCompactionService } from "./session-memory-compaction.serv
 export type { SessionMemoryBuildOptions } from "./session-memory-compaction.service"
 export { TokenCounterService } from "./token-counter.service"
 export { ToolIntegrityService } from "./tool-integrity.service"
-export { assertIntegrity, enforceToolProtocol } from "./tool-protocol-integrity"
-export type {
-  IntegrityViolation,
-  RepairResult,
-} from "./tool-protocol-integrity"
-export { normalizeToolProtocolMessages } from "./tool-protocol-normalizer"
-export type { ToolProtocolNormalizationResult } from "./tool-protocol-normalizer"
-export { ToolResultCompactionService } from "./tool-result-compaction.service"
+export type { EnforceToolProtocolOptions } from "./tool-integrity.service"
 export { ToolResultStorageService } from "./tool-result-storage.service"
 export type {
   ToolResultStorageProcessInput,

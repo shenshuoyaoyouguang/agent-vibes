@@ -104,6 +104,18 @@ class OutputConfigDto {
   @IsString()
   @IsOptional()
   effort?: string
+
+  @ApiPropertyOptional({
+    type: Object,
+    description:
+      "API-side token task budget: { type: 'tokens', total, remaining? }.",
+  })
+  @IsOptional()
+  task_budget?: {
+    type: "tokens"
+    total: number
+    remaining?: number
+  }
 }
 
 export class CreateMessageDto {
@@ -262,6 +274,25 @@ export class CreateMessageDto {
   @IsOptional()
   @IsBoolean()
   _includeThinkingSummary?: boolean
+
+  /**
+   * Internal carrier for a wire-ready cross-turn reasoning preamble.
+   * Producer (cursor-connect-stream.service.ts:buildStreamingDtoForRoute)
+   * sources records from ReasoningMemoryService.buildPreamble, applies
+   * budget arithmetic, frames the text as
+   * `<previous_thinking>...</previous_thinking>`, and hands the
+   * ready-to-splice payload over via this field. Consumer (provider
+   * adapter, e.g. KiroService.buildKiroPayload) splices it raw — no
+   * additional framing — onto the next user content block.
+   *
+   * Only populated for backends whose
+   * BackendCapability.continuityStrategy === "text_preamble" (kiro,
+   * codex). Native-signature backends rely on the structured assistant
+   * history instead.
+   */
+  @IsOptional()
+  @IsString()
+  _lastThinkingSummary?: string
 
   /**
    * Internal original model identifier before backend routing canonicalizes it.

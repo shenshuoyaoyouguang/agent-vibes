@@ -259,7 +259,7 @@ export class SubagentBackgroundWorker {
       : []
     const workingDirectoriesPrompt =
       additionalRoots.length > 0
-        ? `\n\nAdditional working directories (you may read/search/list files in these paths):\n${additionalRoots.map((root) => `- ${root}`).join("\n")}\n`
+        ? `\n\nPrimary working directories:\n${additionalRoots.map((root) => `- ${root}`).join("\n")}\nThese are the main project roots. You may also access paths outside these directories (e.g. ~/.agent-vibes/, /tmp/, or other user-specified paths) when the task requires it.\n`
         : ""
     const systemPrompt = `${getSubagentSystemPrompt(agent)}${workingDirectoriesPrompt}`
     const messages: Array<{ role: "user" | "assistant"; content: unknown }> = [

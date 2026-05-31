@@ -131,6 +131,32 @@ export interface UnifiedMessage {
   // Metadata
   token_count?: number
   created_at?: number
+
+  /**
+   * Anthropic message id when known (assistant messages only). Multiple
+   * UnifiedMessage entries may share the same id — that's the split-sibling
+   * pattern from claude-code/src/services/api/claude.ts:2281-2300, where
+   * each `content_block_stop` emits its own AssistantMessage carrying the
+   * turn-wide `message.id`. Send-time normalization
+   * (apps/protocol-bridge/src/llm/shared/normalize-for-api.ts:
+   * `mergeAssistantMessagesById`) folds siblings by this key. Optional
+   * because attachment / boundary / summary / hook projections have no
+   * Anthropic id to attach.
+   */
+  messageId?: string
+
+  /**
+   * cc-style isMeta — when true, this message exists for context
+   * plumbing only (compaction summaries, attachment hoists, hook
+   * injections) and the IDE-facing transcript should hide it. Mirrors
+   * cc utils/messages.ts:484 + bridge/bridgeMessaging.ts:117. The
+   * normalize-for-api pipeline already understands the field on its
+   * FlatUser shape (`mergeUserMessages` favours non-meta uuid /
+   * preserves meta only when both sides are meta — line 325-326).
+   * User-side only; the type allows the field on assistants for
+   * structural simplicity but writers should leave it absent there.
+   */
+  isMeta?: boolean
 }
 
 /**
@@ -157,16 +183,30 @@ export interface ContextTranscriptRecord {
   role: "user" | "assistant"
   content: LooseMessageContent
   createdAt: number
+  /**
+   * Anthropic message id (when known). Multiple records may share the same
+   * `messageId` — that's the split-sibling pattern from
+   * claude-code/src/services/api/claude.ts:2281-2300, where each
+   * content_block_stop emits its own AssistantMessage with a fresh `uuid`
+   * but the turn-wide `message.id`. Send-time normalization merges siblings
+   * by this key.
+   */
+  messageId?: string
   kind?:
     | "message"
     | "compact_boundary"
     | "compact_summary"
+    | "context_collapse_summary"
     | "snip_boundary"
     | "microcompact_boundary"
     | "attachment"
     | "hook_result"
   compactMetadata?: {
     commit?: ContextCompactionCommit
+    summary?: string
+  }
+  contextCollapseMetadata?: {
+    commit?: ContextCollapseCommit
     summary?: string
   }
   attachmentMetadata?: ContextProjectionAttachment
@@ -176,6 +216,15 @@ export interface ContextTranscriptRecord {
   }
   snipMetadata?: {
     removedRecordIds: string[]
+    /**
+     * Human-readable digest of the records that this boundary represents,
+     * built from a deterministic textual heuristic at snip time. The
+     * projection layer uses it to render a non-empty boundary message so
+     * the model gets a hint of what it explored before, instead of a bare
+     * "Context snipped" placeholder. Optional for back-compat with
+     * persisted records that were snipped before summaries existed.
+     */
+    summary?: string
   }
   microcompactMetadata?: {
     trigger: "auto" | "idle"
@@ -220,6 +269,30 @@ export interface ContextCompactionCommit {
   summaryTokenCount: number
   projectedTokenCount: number
   codexReplacementHistory?: CodexReplacementHistory
+}
+
+export interface ContextCollapseCommit {
+  id: string
+  createdAt: number
+  strategy: "auto" | "manual" | "reactive"
+  parentCollapseId?: string
+  archivedRecordIds: string[]
+  archivedThroughRecordId: string
+  summaryRecordId: string
+  sourceRecordCount: number
+  sourceMessageCount: number
+  sourceTokenCount: number
+  retainedStartRecordId?: string
+  retainedRecordCount: number
+  retainedTokenCount?: number
+  summary: string
+  summaryTokenCount: number
+  projectedTokenCount: number
+}
+
+export interface ContextCollapseState {
+  commits: ContextCollapseCommit[]
+  updatedAt?: number
 }
 
 export interface ContextUsageLedgerState {
@@ -267,20 +340,6 @@ export interface ContextToolResultReplacementState {
   replacementByToolUseId: Record<string, string>
   storedByToolUseId?: Record<string, ContextStoredToolResultReference>
   records?: ContextToolResultReplacementRecord[]
-}
-
-export interface ContextNativeCacheEditPin {
-  targetRecordId?: string
-  targetMessageIndex: number
-  block: CacheEditsBlock
-  createdAt: number
-}
-
-export interface ContextNativeCacheEditState {
-  toolOrder: string[]
-  deletedToolUseIds: string[]
-  pinnedEdits: ContextNativeCacheEditPin[]
-  toolsSentToApi?: boolean
 }
 
 export interface CodexTruncationPolicy {
@@ -395,7 +454,7 @@ export interface SessionMemorySummaryLike {
  * Two callers in the bridge currently obey this:
  *
  * 1. `cursor-connect-stream.service.ts` serialises requests per session
- *    via `ChatSessionManager` so the writer is the request handler.
+ *    via `SessionLifecycleService` so the writer is the request handler.
  * 2. `anthropic/messages.service.ts` is stateless — every request
  *    creates an ephemeral state via `ContextManagerService`.
  *
@@ -411,6 +470,18 @@ export interface SessionMemorySummaryLike {
  * correct but allocates O(records × rounds) on every request and
  * defeats the ledger's projected-token cache.
  */
+export interface ContextCompactWarningState {
+  /**
+   * True after a successful microcompact / cache_edit emission /
+   * boundary compaction. Suppresses the next round of "compaction
+   * imminent" telemetry emissions until cleared on the next
+   * ensureWithinBudget entry.
+   */
+  suppressed: boolean
+  /** Wall-clock time of the last `compaction.warning_imminent` emission. */
+  lastEmittedEpoch?: number
+}
+
 export interface ContextConversationState {
   records: ContextTranscriptRecord[]
   compactionHistory: ContextCompactionCommit[]
@@ -420,9 +491,10 @@ export interface ContextConversationState {
   usageLedger: ContextUsageLedgerState
   codexContext?: CodexContextState
   toolResultReplacementState?: ContextToolResultReplacementState
-  nativeCacheEditState?: ContextNativeCacheEditState
   investigationMemory: ContextInvestigationMemoryEntry[]
   sessionMemory: ContextSessionMemoryEntry[]
+  compactWarningState?: ContextCompactWarningState
+  contextCollapseState?: ContextCollapseState
 }
 
 export interface ProjectedContextMessage {
@@ -432,11 +504,28 @@ export interface ProjectedContextMessage {
     | "record"
     | "boundary"
     | "summary"
+    | "context_collapse"
     | "attachment"
     | "snip"
     | "microcompact"
     | "hook"
   recordId?: string
+  /**
+   * Anthropic message id (when source === "record" and the underlying
+   * `ContextTranscriptRecord.messageId` was set). Carries the same
+   * split-sibling key as `UnifiedMessage.messageId`; preserved through
+   * compaction so send-time merge can fold siblings.
+   */
+  messageId?: string
+  /**
+   * cc-style isMeta — set when this projected message is infrastructure
+   * (compaction summary / boundary / attachment / hook). Forwarded onto
+   * UnifiedMessage so the IDE-facing transcript layer can choose to
+   * hide it. `record` source rows reflect actual user/assistant turns
+   * and stay non-meta unless the underlying SessionMessage already
+   * carries isMeta=true.
+   */
+  isMeta?: boolean
   commitId?: string
   attachmentKind?: ContextProjectionAttachment["kind"]
   compactionEvent?: {

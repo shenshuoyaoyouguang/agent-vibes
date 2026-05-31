@@ -4,36 +4,11 @@ import * as crypto from "crypto"
 import type { KvServerMessage as KvStorageMessage } from "./kv-storage.service"
 
 import {
+  // InteractionUpdate 补齐
+  ActiveBranchChangeSchema,
   AgentMode,
   type AgentServerMessage,
   AgentServerMessageSchema,
-  // New: ForceBackground / McpState / SubagentAwait exec schemas
-  // CommunicateUpdate 完整工具链
-  CommunicateUpdateArgsSchema,
-  CommunicateUpdateErrorSchema,
-  type CommunicateUpdateResult,
-  CommunicateUpdateResultSchema,
-  CommunicateUpdateSuccessSchema,
-  CommunicateUpdateToolCallSchema,
-  ForceBackgroundShellArgsSchema,
-  ForceBackgroundSubagentArgsSchema,
-  McpStateExecArgsSchema,
-  // SendFinalSummary 完整工具链
-  SendFinalSummaryArgsSchema,
-  SendFinalSummaryErrorSchema,
-  type SendFinalSummaryResult,
-  SendFinalSummaryResultSchema,
-  SendFinalSummarySuccessSchema,
-  SendFinalSummaryToolCallSchema,
-  SubagentAwaitArgsSchema,
-  // InteractionUpdate 补齐
-  ActiveBranchChangeSchema,
-  FeedbackRequestCategorySchema,
-  FeedbackRequestUpdateSchema,
-  PostRequestPromptUpdateSchema,
-  PromptSuggestionUpdateSchema,
-  // ExecServerMessage 补齐
-  RequestContextArgsSchema,
   // New v2.6.13 ToolCall schemas
   AiAttributionArgsSchema,
   AiAttributionErrorSchema,
@@ -55,6 +30,10 @@ import {
   AskQuestionResultSchema,
   AskQuestionSuccessSchema,
   AskQuestionToolCallSchema,
+  // ConversationStep — sub-agent transcript renderer expects an
+  // assembled list of these for the parent task bubble's expandable
+  // detail panel.
+  AssistantMessageSchema,
   AwaitArgsSchema,
   AwaitErrorSchema,
   type AwaitResult,
@@ -70,6 +49,14 @@ import {
   BlameByFilePathToolCallSchema,
   type CommandClassifierResult,
   CommandClassifierResultSchema,
+  // New: ForceBackground / McpState / SubagentAwait exec schemas
+  // CommunicateUpdate 完整工具链
+  CommunicateUpdateArgsSchema,
+  CommunicateUpdateErrorSchema,
+  type CommunicateUpdateResult,
+  CommunicateUpdateResultSchema,
+  CommunicateUpdateSuccessSchema,
+  CommunicateUpdateToolCallSchema,
   ComputerUseArgsSchema,
   ComputerUseErrorSchema,
   ComputerUseResultSchema,
@@ -77,6 +64,7 @@ import {
   ComputerUseToolCallSchema,
   // ConversationStateStructure
   ConversationStateStructureSchema,
+  ConversationStepSchema,
   ConversationSummaryArchiveSchema,
   ConversationSummarySchema,
   ConversationTokenDetailsSchema,
@@ -116,6 +104,8 @@ import {
   type ExecServerMessage,
   ExecServerMessageSchema,
   ExecuteHookArgsSchema,
+  FeedbackRequestCategorySchema,
+  FeedbackRequestUpdateSchema,
   FetchArgsSchema,
   FetchErrorSchema,
   FetchResultSchema,
@@ -123,6 +113,8 @@ import {
   FetchToolCallSchema,
   FileDiagnosticsSchema,
   FileStateStructureSchema,
+  ForceBackgroundShellArgsSchema,
+  ForceBackgroundSubagentArgsSchema,
   GenerateImageArgsSchema,
   GenerateImageErrorSchema,
   GenerateImageResultSchema,
@@ -178,6 +170,7 @@ import {
   McpAuthToolCallSchema,
   McpPermissionDeniedSchema,
   McpRejectedSchema,
+  McpStateExecArgsSchema,
   McpSuccessSchema,
   McpTextContentSchema,
   McpToolCallSchema,
@@ -189,6 +182,7 @@ import {
   PartialToolCallUpdateSchema,
   PhaseSchema,
   PositionSchema,
+  PostRequestPromptUpdateSchema,
   type PrManagementArgs,
   PrManagementArgsSchema,
   PrManagementErrorSchema,
@@ -197,6 +191,7 @@ import {
   PrManagementResultSchema,
   PrManagementSuccessSchema,
   PrManagementToolCallSchema,
+  PromptSuggestionUpdateSchema,
   ReadArgsSchema,
   ReadLintsToolArgsSchema,
   ReadLintsToolCallSchema,
@@ -245,6 +240,8 @@ import {
   ReportBugResultSchema,
   ReportBugSuccessSchema,
   ReportBugToolCallSchema,
+  // ExecServerMessage 补齐
+  RequestContextArgsSchema,
   SandboxPolicy_Type,
   SandboxPolicySchema,
   SemSearchToolArgsSchema,
@@ -252,6 +249,13 @@ import {
   SemSearchToolErrorSchema,
   SemSearchToolResultSchema,
   SemSearchToolSuccessSchema,
+  // SendFinalSummary 完整工具链
+  SendFinalSummaryArgsSchema,
+  SendFinalSummaryErrorSchema,
+  type SendFinalSummaryResult,
+  SendFinalSummaryResultSchema,
+  SendFinalSummarySuccessSchema,
+  SendFinalSummaryToolCallSchema,
   SetActiveBranchArgsSchema,
   SetActiveBranchErrorSchema,
   SetActiveBranchResultSchema,
@@ -286,6 +290,7 @@ import {
   ShellToolCallSchema,
   ShellToolCallStderrDeltaSchema,
   ShellToolCallStdoutDeltaSchema,
+  SimulatedMsgReason,
   // SpanContext
   SpanContextSchema,
   StartGrindExecutionArgsSchema,
@@ -302,6 +307,7 @@ import {
   StepStartedUpdateSchema,
   StepTimingSchema,
   SubagentArgsSchema,
+  SubagentAwaitArgsSchema,
   SubagentTypeBashSchema,
   SubagentTypeBrowserUseSchema,
   SubagentTypeComputerUseSchema,
@@ -335,14 +341,9 @@ import {
   TextDeltaUpdateSchema,
   ThinkingCompletedUpdateSchema,
   ThinkingDeltaUpdateSchema,
+  ThinkingMessageSchema,
   ThinkingStyle,
   TimeoutBehavior,
-  // ConversationStep — sub-agent transcript renderer expects an
-  // assembled list of these for the parent task bubble's expandable
-  // detail panel.
-  AssistantMessageSchema,
-  ConversationStepSchema,
-  ThinkingMessageSchema,
   // Todo & Phase
   TodoItemSchema,
   TokenDeltaUpdateSchema,
@@ -366,6 +367,7 @@ import {
   UpdateTodosResultSchema,
   UpdateTodosSuccessSchema,
   UpdateTodosToolCallSchema,
+  UserMessage_SimulatedMessageMetadataSchema,
   UserMessageAppendedUpdateSchema,
   UserMessageSchema,
   WebFetchArgsSchema,
@@ -396,8 +398,8 @@ import {
   type Value,
   ValueSchema,
 } from "../../gen/google/protobuf/value_pb"
-import { normalizeBugfixResultItems as normalizeBugfixResultItemsFromContract } from "./tools/bugfix-result-normalizer"
 import { CursorProtocolTraceService } from "./cursor-protocol-trace.service"
+import { normalizeBugfixResultItems as normalizeBugfixResultItemsFromContract } from "./tools/bugfix-result-normalizer"
 import { resolveCursorToolDefinitionKey } from "./tools/cursor-tool-mapper"
 import { resolveMcpCallFields as resolveMcpCallFieldsFromContract } from "./tools/mcp-call-contract"
 
@@ -1367,12 +1369,32 @@ export class CursorGrpcService {
   }
 
   /**
-   * Create UserMessageAppended response
+   * Create UserMessageAppended response.
+   *
+   * When the appended message is NOT actually typed by a human — e.g.,
+   * the bridge is injecting a synthetic continuation event such as a
+   * background_task_completion notification, an async ask_question
+   * answer, or a plan-execution kickoff — pass `simulated: { reason,
+   * metadata }`. This populates the protocol-defined fields:
+   *
+   *   UserMessage.is_simulated_msg = true
+   *   UserMessage.simulated_msg_reason = <reason>
+   *   UserMessage.simulated_message_metadata = <metadata>
+   *
+   * Without these, the IDE renders the injection as a regular user
+   * chat bubble, which is misleading (the user did not type it) and
+   * also means downstream UI features keyed on `simulated_msg_reason`
+   * (history rendering, "queued"/"continuation" badges, retry
+   * filtering) cannot recognise the event.
    */
   createUserMessageAppendedResponse(
     text: string,
     messageId: string,
-    mode: AgentMode = AgentMode.AGENT
+    mode: AgentMode = AgentMode.AGENT,
+    simulated?: {
+      reason: SimulatedMsgReason
+      metadata?: { taskId?: string; title?: string }
+    }
   ): Buffer {
     return this.wrapInteractionUpdate(
       "userMessageAppended",
@@ -1382,6 +1404,23 @@ export class CursorGrpcService {
           messageId,
           mode,
           conversationStateBlobId: new Uint8Array(),
+          ...(simulated
+            ? {
+                isSimulatedMsg: true,
+                simulatedMsgReason: simulated.reason,
+                ...(simulated.metadata
+                  ? {
+                      simulatedMessageMetadata: create(
+                        UserMessage_SimulatedMessageMetadataSchema,
+                        {
+                          taskId: simulated.metadata.taskId,
+                          title: simulated.metadata.title,
+                        }
+                      ),
+                    }
+                  : {}),
+              }
+            : {}),
         }),
       })
     )
@@ -3097,10 +3136,18 @@ export class CursorGrpcService {
           : !this.parseBooleanFlag(caseSensitiveRaw, true)
         : this.parseBooleanFlag(caseInsensitiveRaw)
     const type = safeString(args.type).trim()
+    // head_limit=0 is the explicit "remove the bridge default" escape hatch:
+    // omit the field so no client-side cap is sent (the protocol treats an
+    // absent head_limit as "no client limit"; any residual ripgrep cap is
+    // surfaced to the model via ripgrep_truncated). An unspecified head_limit
+    // falls back to the official default of 50 for official-shape requests.
+    const rawHeadLimit = this.parseOptionalNonNegativeInt(
+      args.head_limit ?? args.headLimit ?? args.HeadLimit
+    )
     const headLimit =
-      this.parseOptionalNonNegativeInt(
-        args.head_limit ?? args.headLimit ?? args.HeadLimit
-      ) ?? (hasOfficialShape ? 50 : undefined)
+      rawHeadLimit === 0
+        ? undefined
+        : (rawHeadLimit ?? (hasOfficialShape ? 50 : undefined))
     const offset = this.parseOptionalNonNegativeInt(args.offset ?? args.Offset)
 
     return {
@@ -4723,16 +4770,88 @@ export class CursorGrpcService {
     return toolFamilyHint || this.detectToolFamily(toolName)
   }
 
+  /**
+   * Cursor's `ToolCall.tool` oneof intentionally has no dedicated case for a
+   * sizeable set of bridge-internal / IDE-internal tools (discover_tool,
+   * kill_agent, fix_lints, force_background_*, canvas_*, mcp_state_exec,
+   * subagent_await, request_context, execute_hook, etc.). Projecting them
+   * onto `truncatedToolCall` is the **designed** behaviour, not an anomaly.
+   *
+   * Previous versions logged every projection at `warn` level, which
+   * produced ~30 noise lines per session and drowned out the real
+   * SessionContextIntegrity / Bedrock 400 warnings. We now classify each
+   * projection as either:
+   *
+   *   - `expected: true`  — the tool family is in the explicit "no proto
+   *                         oneof, by design" set; log at `debug` level
+   *                         (still observable when DEBUG is enabled, but
+   *                         not on the hot operational path).
+   *
+   *   - `expected: false` — the resolver fell through to `truncated` /
+   *                         `unknown` because the tool name was not
+   *                         recognised. This is a real signal that the
+   *                         family resolver needs a new entry; keep `warn`.
+   *
+   * The set below mirrors the `truncatedToolCall` entries in
+   * `buildEmptyToolCallV2.familyToCase` plus the explicit fall-throughs
+   * inside `detectToolFamily` (discover_tool, killagent, kill_agent,
+   * backgroundcomposerfollowup, updateproject) that intentionally return
+   * the `truncated` family.
+   */
+  private static readonly EXPECTED_TRUNCATED_TOOL_FAMILIES: ReadonlySet<ToolFamily> =
+    new Set<ToolFamily>([
+      "fix_lints",
+      "execute_hook",
+      "force_background_shell",
+      "force_background_subagent",
+      "canvas_get_url",
+      "canvas_destroy",
+      "canvas_register",
+      "mcp_state_exec",
+      "subagent_await",
+      "request_context",
+      "truncated",
+    ])
+
+  private isExpectedTruncatedProjection(
+    family: ToolFamily,
+    toolName: string
+  ): boolean {
+    if (CursorGrpcService.EXPECTED_TRUNCATED_TOOL_FAMILIES.has(family)) {
+      return true
+    }
+    // detectToolFamily routes a few bridge-internal tool names directly to
+    // the `truncated` family. Treat them as expected even though the
+    // family name itself is generic.
+    const normalized = this.normalizeToolName(toolName)
+    return (
+      normalized === "discovertool" ||
+      normalized === "discover_tool" ||
+      normalized.includes("killagent") ||
+      normalized === "kill_agent" ||
+      normalized.includes("backgroundcomposerfollowup") ||
+      normalized.includes("updateproject")
+    )
+  }
+
   private warnTruncatedToolProjection(
     context: string,
     toolName: string,
     family: ToolFamily,
     reason: string
   ): void {
-    this.logger.warn(
+    const message =
       `[ToolProjection] ${context}: toolName="${toolName}", family="${family}" ` +
-        `projected to truncatedToolCall. reason=${reason}`
-    )
+      `projected to truncatedToolCall. reason=${reason}`
+    if (this.isExpectedTruncatedProjection(family, toolName)) {
+      // Designed projection — the proto has no dedicated oneof for this
+      // family. Keep the trace at debug so operators can still surface it
+      // when investigating, without polluting steady-state warn output.
+      this.logger.debug(message)
+      return
+    }
+    // Truly unknown fall-through; this is the signal we want to keep.
+    this.logger.warn(message)
   }
 
   /**

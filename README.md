@@ -37,7 +37,7 @@ while routing requests across Antigravity, Claude-compatible, Codex, OpenAI-comp
 
 **Clients** (front-end):
 
-- **Claude Code CLI** — Anthropic Messages API
+- **Claude Code CLI** — Anthropic API
 - **Cursor IDE** — Protocol-compatible ConnectRPC/gRPC implementation
 
 **Backends** (back-end):
@@ -78,7 +78,7 @@ while routing requests across Antigravity, Claude-compatible, Codex, OpenAI-comp
 
 | Area                             | Capabilities                                                                                                                                                                                                                                               |
 | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Protocols and clients            | Native support for Claude Code CLI and Cursor IDE; Claude Code CLI uses Anthropic Messages API (SSE), while Cursor IDE uses a native ConnectRPC/gRPC agent channel implementation.                                                                         |
+| Protocols and clients            | Native support for Claude Code CLI and Cursor IDE; Claude Code CLI uses Anthropic API (SSE), while Cursor IDE uses a native ConnectRPC/gRPC agent channel implementation.                                                                                  |
 | Cursor protocol implementation   | Direct implementation of the Cursor protocol, including the full streaming tool loop and the related tool protocol mapping, not just compatibility endpoints or simple forwarding.                                                                         |
 | Routing and backends             | Routes requests across Antigravity IDE, Claude-compatible API, Codex CLI, OpenAI-compatible API, and Kiro (AWS CodeWhisperer); covers Gemini, Claude, and GPT / O-series models with routing decisions based on backend availability and model capability. |
 | Account pools and quotas         | Native worker / process pools, backend account state, cooldowns, model-level cooldowns, Google / Codex / Kiro quota views, rate-limit views, and multi-account rotation for availability.                                                                  |
@@ -752,15 +752,15 @@ agent-vibes/
 
 ## API Endpoints
 
-| Path                         | Method | Protocol                     | Description             |
-| ---------------------------- | ------ | ---------------------------- | ----------------------- |
-| `/v1/messages`               | POST   | Anthropic Messages API (SSE) | Claude Code CLI         |
-| `/v1/messages/count_tokens`  | POST   | Anthropic Messages API       | Count request tokens    |
-| `/agent.v1.AgentService/Run` | POST   | ConnectRPC (HTTP/2 BiDi)     | Cursor IDE (Agent mode) |
-| `/v1/models`                 | GET    | REST JSON                    | Anthropic model list    |
-| `/v1/anthropic/models`       | GET    | REST JSON                    | List available models   |
-| `/health`                    | GET    | REST JSON                    | Health check            |
-| `/docs`                      | GET    | Swagger UI                   | API documentation       |
+| Path                         | Method | Protocol                 | Description             |
+| ---------------------------- | ------ | ------------------------ | ----------------------- |
+| `/v1/messages`               | POST   | Anthropic API (SSE)      | Claude Code CLI         |
+| `/v1/messages/count_tokens`  | POST   | Anthropic API            | Count request tokens    |
+| `/agent.v1.AgentService/Run` | POST   | ConnectRPC (HTTP/2 BiDi) | Cursor IDE (Agent mode) |
+| `/v1/models`                 | GET    | REST JSON                | Anthropic model list    |
+| `/v1/anthropic/models`       | GET    | REST JSON                | List available models   |
+| `/health`                    | GET    | REST JSON                | Health check            |
+| `/docs`                      | GET    | Swagger UI               | API documentation       |
 
 ## Tech Stack
 

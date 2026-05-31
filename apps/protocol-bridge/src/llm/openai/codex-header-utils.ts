@@ -1,14 +1,28 @@
 export type CodexForwardHeaders = Record<string, string>
 
-export const CODEX_USER_AGENT =
-  "codex-tui/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.118.0)"
-export const CODEX_ORIGINATOR = "codex-tui"
+/**
+ * Identity values mirroring what the upstream openai/codex CLI sends. Use
+ * `CodexClientIdentityService` to resolve a fresh instance at boot and pass
+ * it to the header builders below — there is no module-level fallback here
+ * by design, so missing wiring fails loudly at the type checker rather than
+ * silently spoofing a stale version.
+ */
+export interface CodexClientIdentity {
+  /** Sent in the `version` header (and `Version` alias). */
+  version: string
+  /** Full User-Agent string. */
+  userAgent: string
+  /** Sent in the `Originator` header for OAuth (non-API-key) requests. */
+  originator: string
+}
+
 export const CODEX_WS_BETA_HEADER = "responses_websockets=2026-02-06"
 
 interface BuildCodexHttpHeadersParams {
   token: string
   isApiKey: boolean
   stream: boolean
+  identity: CodexClientIdentity
   conversationId?: string
   accountId?: string
   workspaceId?: string
@@ -20,6 +34,7 @@ interface BuildCodexHttpHeadersParams {
 interface BuildCodexWebSocketHeadersParams {
   token: string
   isApiKey: boolean
+  identity: CodexClientIdentity
   conversationId?: string
   accountId?: string
   workspaceId?: string
@@ -129,7 +144,13 @@ export function buildCodexHttpHeaders(
     headers["X-Codex-Beta-Features"] = betaFeatures
   }
 
-  ensureHeader(headers, params.forwardHeaders, "Version", "")
+  ensureHeader(
+    headers,
+    params.forwardHeaders,
+    "version",
+    params.identity.version,
+    ["Version"]
+  )
   ensureHeader(headers, params.forwardHeaders, "X-Codex-Turn-Metadata", "", [
     "x-codex-turn-metadata",
   ])
@@ -140,17 +161,18 @@ export function buildCodexHttpHeaders(
     normalizedConversationId,
     ["x-client-request-id"]
   )
-  ensureHeader(headers, params.forwardHeaders, "User-Agent", CODEX_USER_AGENT, [
-    "user-agent",
-  ])
+  ensureHeader(
+    headers,
+    params.forwardHeaders,
+    "User-Agent",
+    params.identity.userAgent,
+    ["user-agent"]
+  )
   ensureHeader(
     headers,
     params.forwardHeaders,
     "session_id",
-    normalizedConversationId ||
-      (getExistingHeader(headers, "User-Agent").includes("Mac OS")
-        ? crypto.randomUUID()
-        : ""),
+    normalizedConversationId || crypto.randomUUID(),
     ["session_id", "session-id"]
   )
 
@@ -159,7 +181,7 @@ export function buildCodexHttpHeaders(
       headers,
       params.forwardHeaders,
       "Originator",
-      CODEX_ORIGINATOR,
+      params.identity.originator,
       ["originator"]
     )
     const accountId = params.omitAccountId ? "" : params.accountId?.trim() || ""
@@ -212,10 +234,24 @@ export function buildCodexWebSocketHeaders(
     "",
     ["x-responsesapi-include-timing-metrics"]
   )
-  ensureHeader(headers, params.forwardHeaders, "Version", "")
-  ensureHeader(headers, params.forwardHeaders, "User-Agent", CODEX_USER_AGENT, [
-    "user-agent",
-  ])
+  ensureHeader(
+    headers,
+    params.forwardHeaders,
+    "version",
+    params.identity.version,
+    ["Version"]
+  )
+  // The WebSocket upgrade request strips User-Agent before send (see the
+  // explicit `delete headers["User-Agent"]` below), but we still register it
+  // here so any forwardHeaders override would be honored if WebSocket
+  // semantics change. Keep User-Agent identity in sync with HTTP.
+  ensureHeader(
+    headers,
+    params.forwardHeaders,
+    "User-Agent",
+    params.identity.userAgent,
+    ["user-agent"]
+  )
 
   const openAiBeta = getForwardHeader(params.forwardHeaders, "openai-beta")
   headers["OpenAI-Beta"] =
@@ -227,10 +263,7 @@ export function buildCodexWebSocketHeaders(
     headers,
     params.forwardHeaders,
     "session_id",
-    normalizedConversationId ||
-      (getExistingHeader(headers, "User-Agent").includes("Mac OS")
-        ? crypto.randomUUID()
-        : ""),
+    normalizedConversationId || crypto.randomUUID(),
     ["session_id", "session-id"]
   )
   delete headers["User-Agent"]
@@ -240,7 +273,7 @@ export function buildCodexWebSocketHeaders(
       headers,
       params.forwardHeaders,
       "Originator",
-      CODEX_ORIGINATOR,
+      params.identity.originator,
       ["originator"]
     )
     const accountId = params.omitAccountId ? "" : params.accountId?.trim() || ""

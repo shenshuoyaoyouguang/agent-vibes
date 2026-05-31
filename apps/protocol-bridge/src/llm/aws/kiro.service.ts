@@ -31,7 +31,6 @@ import {
 import { UsageStatsService } from "../../usage"
 import {
   clearAccountDisablement,
-  getEarliestRecovery,
   isAccountAvailableForModel,
   isAccountDisabled,
   markAccountCooldown,
@@ -43,6 +42,10 @@ import {
   type PersistedBackendAccountState,
 } from "../shared/backend-account-state-store"
 import {
+  RETRY_POLICY,
+  type BackendErrorClass,
+} from "../shared/backend-error-class"
+import {
   BackendAccountPoolUnavailableError,
   BackendApiError,
 } from "../shared/backend-errors"
@@ -51,6 +54,11 @@ import {
   BackendPoolStatus,
 } from "../shared/backend-pool-status"
 import { canPublicClaudeModelUseKiro } from "../shared/model-registry"
+import { resolveThinkingIntentFromDto } from "../shared/thinking-intent"
+import type {
+  ThinkingIntent,
+  ThinkingIntentEffort,
+} from "../shared/thinking-types"
 import {
   pollKiroBuilderIdDeviceFlow,
   startKiroBuilderIdDeviceFlow,
@@ -69,10 +77,16 @@ import {
   type KiroClientConfig,
 } from "./headers"
 import {
+  writeKiroCliLogin,
+  writeKiroIdeLogin,
+  type KiroIdeExportInput,
+} from "./local-export"
+import {
   discoverLocalKiroTokens,
   type DiscoveredKiroToken,
 } from "./local-import"
 import { refreshKiroToken, type KiroAuthMethod } from "./oidc"
+import type { KiroAdditionalModelRequestFields } from "./protocol-types"
 import {
   KIRO_ENDPOINTS,
   type KiroEndpoint,
@@ -93,12 +107,14 @@ interface KiroAccount extends CooldownableAccount {
   source: "env" | "file"
   stateKey: string
   authMethod: KiroAuthMethod
+  provider?: string
   region: string
   accessToken: string
   refreshToken: string
   expiresAt: number
   clientId?: string
   clientSecret?: string
+  registrationExpiresAt?: number
   machineId: string
   profileArn?: string
   proxyUrl?: string
@@ -140,6 +156,7 @@ interface KiroAccountFileEntry {
   expiresAt?: number
   clientId?: string
   clientSecret?: string
+  registrationExpiresAt?: number
   machineId?: string
   profileArn?: string
   provider?: string
@@ -157,6 +174,22 @@ interface KiroAccountFileEntry {
 
 interface KiroAccountConfigFile {
   accounts?: KiroAccountFileEntry[]
+}
+
+type KiroLocalLoginKind = "ide" | "cli"
+
+interface KiroLocalLoginTarget {
+  authMethod: KiroAuthMethod
+  region: string
+  stateKey?: string
+  clientId?: string
+  label?: string
+  updatedAt?: string
+}
+
+interface KiroLocalLoginTargetsFile {
+  ide?: KiroLocalLoginTarget
+  cli?: KiroLocalLoginTarget
 }
 
 type PersistedKiroAccountState = PersistedBackendAccountState
@@ -189,6 +222,7 @@ const FALLBACK_KIRO_MODEL_IDS: string[] = [
   "claude-opus-4-5",
   "claude-opus-4-6",
   "claude-opus-4-7",
+  "claude-opus-4-8",
   "claude-haiku-4-5",
 ]
 
@@ -263,6 +297,7 @@ export class KiroService implements OnModuleInit {
       try {
         await this.ensureFreshToken(account)
         await this.ensureProfileArn(account)
+        this.mirrorLocalLoginsIfSelected(account)
         this.logger.log(
           `  [Kiro] Startup probe OK: ${account.label || account.stateKey.slice(0, 12)} ` +
             `(token expires=${account.expiresAt ? new Date(account.expiresAt * 1000).toISOString() : "unknown"}, ` +
@@ -281,6 +316,93 @@ export class KiroService implements OnModuleInit {
 
     // Start background token refresh loop (every 15 minutes).
     this.startBackgroundRefresh()
+
+    // Startup warmup: prime the upstream Bedrock model instance with a tiny
+    // generateAssistantResponse so the first user request does not pay the
+    // cold-start tax (observed ~20s first_semantic_event_ms vs ~5s warm).
+    // On by default — set KIRO_WARMUP_ON_START=0 to opt out (e.g. for tight
+    // quota environments where the startup probe is already enough).
+    void this.maybeRunStartupWarmup()
+  }
+
+  /**
+   * Best-effort startup warmup. Sends a minimal `generateAssistantResponse`
+   * request per ready account so Bedrock can warm the model instance + KV
+   * cache before the first real user turn arrives.
+   *
+   * On by default; set `KIRO_WARMUP_ON_START` to a falsy value
+   * (0/false/no/off) to opt out. Failures are swallowed — warmup is purely
+   * an optimization and must never block module init.
+   */
+  private async maybeRunStartupWarmup(): Promise<void> {
+    const flag = (process.env.KIRO_WARMUP_ON_START || "").trim().toLowerCase()
+    if (flag === "0" || flag === "false" || flag === "no" || flag === "off") {
+      return
+    }
+    if (this.accounts.length === 0) return
+
+    // Pick the warmup model: prefer the first discovered model, otherwise the
+    // first fallback. Using a single dominant model keeps quota impact bounded
+    // while still priming the most common path.
+    const warmupModel =
+      this.discoveredModels[0]?.modelId ||
+      FALLBACK_KIRO_MODEL_IDS[0] ||
+      "claude-opus-4.7"
+
+    // Limit warmup parallelism to one account at a time so a configuration
+    // mistake (e.g. all 5 accounts down) cannot stampede.
+    for (const account of this.accounts) {
+      if (isAccountDisabled(account)) continue
+      try {
+        await this.warmupAccount(account, warmupModel)
+      } catch (error) {
+        this.logger.debug?.(
+          `[Kiro][Warmup] account=${this.accountTag(account)} model=${warmupModel} skipped: ${(error as Error).message}`
+        )
+      }
+    }
+  }
+
+  private async warmupAccount(
+    account: KiroAccount,
+    model: string
+  ): Promise<void> {
+    if (!this.supportsModel(model)) return
+    if (!this.hasAvailableEndpointForModel(account, model, Date.now())) return
+
+    const startedAt = Date.now()
+    // Minimal DTO: no system, no tools, no thinking. The goal is purely to
+    // make the upstream allocate / warm the model instance. We cap output to
+    // a tiny number of tokens; Bedrock will still complete quickly.
+    const dto: CreateMessageDto = {
+      model,
+      messages: [{ role: "user", content: "ping" }],
+      max_tokens: 8,
+      stream: true,
+    } as unknown as CreateMessageDto
+
+    let firstEventAt = 0
+    const callback: KiroStreamCallback = {
+      onText: () => {
+        if (firstEventAt === 0) firstEventAt = Date.now()
+      },
+      onComplete: () => {
+        if (firstEventAt === 0) firstEventAt = Date.now()
+      },
+      onError: () => {
+        if (firstEventAt === 0) firstEventAt = Date.now()
+      },
+    }
+
+    // Hard cap warmup to 20s so a slow upstream cannot stall the queue.
+    const abort = AbortSignal.timeout(20_000)
+    await this.callKiro(dto, account, callback, abort)
+    const totalMs = Date.now() - startedAt
+    const ttfbMs = firstEventAt > 0 ? firstEventAt - startedAt : -1
+    this.logger.log(
+      `[Kiro][Warmup] account=${this.accountTag(account)} model=${model} ` +
+        `total=${totalMs}ms ttfb=${ttfbMs >= 0 ? `${ttfbMs}ms` : "n/a"}`
+    )
   }
 
   isAvailable(): boolean {
@@ -303,6 +425,45 @@ export class KiroService implements OnModuleInit {
     }
     // Fallback to static Claude model check.
     return canPublicClaudeModelUseKiro(model)
+  }
+
+  /**
+   * Estimate the JSON request-body size (in UTF-8 bytes) that this DTO
+   * will occupy on the wire AFTER translation into Kiro's
+   * `conversationState` shape.
+   *
+   * This must be measured on the *translated* payload, not the raw
+   * Anthropic DTO: the Anthropic shape carries the full tool-definition
+   * array (71 CC CLI tools × full JSON schema), structured content
+   * blocks, and a system-prompt array — all of which `claudeToKiro`
+   * either collapses (content blocks → plain strings), drops, or moves.
+   * Measured in production: a request whose Anthropic DTO serializes to
+   * ~4.14 MB translates to a ~1.54 MB Kiro payload. Gating on the raw
+   * DTO size (the previous behaviour) false-rejected requests that the
+   * Kiro gateway would have accepted.
+   *
+   * profileArn is irrelevant to size (a short ARN string), so we pass a
+   * representative account or omit it — the byte count is dominated by
+   * message/tool content either way.
+   */
+  estimateWireBytes(dto: CreateMessageDto): number {
+    const account = this.accounts.find((a) => !isAccountDisabled(a))
+    try {
+      const payload = this.buildKiroPayload(
+        dto,
+        account ?? ({ profileArn: undefined } as unknown as KiroAccount)
+      )
+      return Buffer.byteLength(JSON.stringify(payload), "utf-8")
+    } catch {
+      // Translation failed (malformed DTO). Fall back to the raw DTO
+      // size so the gate still has a non-zero signal rather than
+      // silently waving an unbounded request through.
+      try {
+        return Buffer.byteLength(JSON.stringify(dto), "utf-8")
+      } catch {
+        return 0
+      }
+    }
   }
 
   getConfiguredMaxContextTokens(model: string): number | undefined {
@@ -603,6 +764,224 @@ export class KiroService implements OnModuleInit {
     return this.deviceAuthSessions.delete(sessionId)
   }
 
+  // ── Force-login an existing pool account into local Kiro IDE ─────────
+
+  private async prepareKiroLocalLogin(
+    identity: {
+      authMethod?: string
+      region?: string
+      refreshToken?: string
+      accessToken?: string
+      clientId?: string
+      kiroApiKey?: string
+      label?: string
+    },
+    targetName = "Kiro IDE"
+  ): Promise<
+    | {
+        success: true
+        label: string
+        exportInput: KiroIdeExportInput
+        account: KiroAccount
+      }
+    | {
+        success: false
+        label: string
+        error: string
+      }
+  > {
+    const account = this.findInMemoryAccount(identity)
+    const label =
+      account?.label || identity.label || identity.region || "Kiro account"
+
+    if (!account) {
+      return {
+        success: false,
+        label,
+        error: "Matching Kiro account not found in the pool",
+      }
+    }
+
+    if (account.authMethod === "api_key") {
+      return {
+        success: false,
+        label,
+        error: `API-key accounts cannot be pushed to the ${targetName} login (no OAuth token pair)`,
+      }
+    }
+
+    await this.ensureFreshToken(account, { force: true })
+    await this.ensureProfileArn(account)
+
+    return {
+      success: true,
+      label,
+      exportInput: {
+        authMethod: account.authMethod === "social" ? "social" : "idc",
+        region: account.region,
+        accessToken: account.accessToken,
+        refreshToken: account.refreshToken,
+        expiresAt: account.expiresAt,
+        profileArn: account.profileArn,
+        provider: account.provider,
+        clientId: account.clientId,
+        clientSecret: account.clientSecret,
+        registrationExpiresAt: account.registrationExpiresAt,
+      },
+      account,
+    }
+  }
+
+  /**
+   * Push an existing pool account's credentials into the local Kiro IDE login
+   * cache (`~/.aws/sso/cache/kiro-auth-token.json`, plus the client
+   * registration file for IdC accounts) so the desktop Kiro IDE signs in as
+   * that account. This is the Kiro analogue of activating a Codex CLI account.
+   *
+   * The token is refreshed first (and profileArn resolved) so the IDE receives
+   * a live access token rather than a possibly-expired one. API-key accounts
+   * cannot be force-logged-in because the IDE login cache requires an
+   * OAuth-style access/refresh token pair.
+   */
+  async forceLoginToKiroIde(identity: {
+    authMethod?: string
+    region?: string
+    refreshToken?: string
+    accessToken?: string
+    clientId?: string
+    kiroApiKey?: string
+    label?: string
+  }): Promise<{
+    success: boolean
+    label: string
+    tokenPath?: string
+    registrationPath?: string
+    profilePath?: string
+    error?: string
+  }> {
+    try {
+      const prepared = await this.prepareKiroLocalLogin(identity)
+      if (!prepared.success) return prepared
+
+      const result = writeKiroIdeLogin(prepared.exportInput)
+      this.rememberLocalLoginTarget("ide", prepared.account)
+
+      this.logger.log(
+        `[Kiro] Force-logged ${prepared.label} into local Kiro IDE (${result.tokenPath})`
+      )
+      return {
+        success: true,
+        label: prepared.label,
+        tokenPath: result.tokenPath,
+        registrationPath: result.registrationPath,
+        profilePath: result.profilePath,
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      const label = identity.label || identity.region || "Kiro account"
+      this.logger.warn(`[Kiro] IDE force-login failed for ${label}: ${message}`)
+      return { success: false, label, error: message }
+    }
+  }
+
+  /**
+   * Push an existing pool account's credentials into the local Kiro CLI login
+   * database. Kiro CLI currently accepts these pool credentials via its
+   * `kirocli:social:token` entry; writing the IdC-shaped CLI token makes
+   * `whoami` pass but chat fails with an invalid bearer token.
+   */
+  async forceLoginToKiroCli(identity: {
+    authMethod?: string
+    region?: string
+    refreshToken?: string
+    accessToken?: string
+    clientId?: string
+    kiroApiKey?: string
+    label?: string
+  }): Promise<{
+    success: boolean
+    label: string
+    dbPath?: string
+    tokenPath?: string
+    error?: string
+  }> {
+    try {
+      const prepared = await this.prepareKiroLocalLogin(identity, "Kiro CLI")
+      if (!prepared.success) return prepared
+
+      const result = writeKiroCliLogin(prepared.exportInput)
+      this.rememberLocalLoginTarget("cli", prepared.account)
+
+      this.logger.log(
+        `[Kiro] Force-logged ${prepared.label} into local Kiro CLI (${result.dbPath}, ${result.tokenPath})`
+      )
+      return {
+        success: true,
+        label: prepared.label,
+        dbPath: result.dbPath,
+        tokenPath: result.tokenPath,
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      const label = identity.label || identity.region || "Kiro account"
+      this.logger.warn(`[Kiro] CLI force-login failed for ${label}: ${message}`)
+      return { success: false, label, error: message }
+    }
+  }
+
+  /**
+   * Locate an in-memory account by the same stable identity the dashboard and
+   * `findMatchingEntryIndex` use (authMethod + region, then refresh/access
+   * token, or clientId for IdC; api_key matches on the key itself).
+   */
+  private findInMemoryAccount(identity: {
+    authMethod?: string
+    region?: string
+    refreshToken?: string
+    accessToken?: string
+    clientId?: string
+    kiroApiKey?: string
+  }): KiroAccount | undefined {
+    const norm = (value: unknown): string =>
+      typeof value === "string" ? value.trim() : ""
+    const normRegion = (value: unknown): string => norm(value) || "us-east-1"
+    const wantAuth: KiroAuthMethod =
+      identity.authMethod === "api_key" || identity.authMethod === "apikey"
+        ? "api_key"
+        : identity.authMethod === "social"
+          ? "social"
+          : "idc"
+    const wantRegion = normRegion(identity.region)
+    const wantRefresh = norm(identity.refreshToken)
+    const wantAccess = norm(identity.accessToken)
+    const wantClient = norm(identity.clientId)
+    const wantApiKey = norm(identity.kiroApiKey)
+
+    return this.accounts.find((account) => {
+      if (account.authMethod !== wantAuth) return false
+      if (normRegion(account.region) !== wantRegion) return false
+      if (wantAuth === "api_key") {
+        return wantApiKey !== "" && wantApiKey === norm(account.kiroApiKey)
+      }
+      if (
+        wantRefresh &&
+        norm(account.refreshToken) &&
+        wantRefresh === norm(account.refreshToken)
+      ) {
+        return true
+      }
+      if (
+        wantAccess &&
+        norm(account.accessToken) &&
+        wantAccess === norm(account.accessToken)
+      ) {
+        return true
+      }
+      if (wantAuth !== "idc") return false
+      return wantClient !== "" && wantClient === norm(account.clientId)
+    })
+  }
+
   // ── Quota / usage info ──────────────────────────────────────────────────
 
   /**
@@ -854,6 +1233,7 @@ export class KiroService implements OnModuleInit {
       source,
       stateKey,
       authMethod,
+      provider: entry.provider?.trim() || undefined,
       region: (entry.region || "us-east-1").trim() || "us-east-1",
       // For API Key accounts, use the key as the access token directly.
       accessToken: authMethod === "api_key" ? kiroApiKey : accessToken,
@@ -864,6 +1244,10 @@ export class KiroService implements OnModuleInit {
       clientSecret:
         authMethod === "idc"
           ? entry.clientSecret?.trim() || undefined
+          : undefined,
+      registrationExpiresAt:
+        typeof entry.registrationExpiresAt === "number"
+          ? entry.registrationExpiresAt
           : undefined,
       machineId:
         (entry.machineId || "").trim() ||
@@ -899,6 +1283,20 @@ export class KiroService implements OnModuleInit {
   }
 
   /**
+   * Whether to bail out of `callKiro`'s in-loop backoff when no alternate
+   * account is available, so the caller's model router can pick a
+   * different backend (claude-api / google-claude) instead of waiting for
+   * a Kiro cooldown to expire. Default off to preserve existing behavior;
+   * set `KIRO_FAST_FAIL_ON_NO_ALTERNATE=1` to opt in.
+   */
+  private shouldFastFailOnNoAlternate(): boolean {
+    const raw = (process.env.KIRO_FAST_FAIL_ON_NO_ALTERNATE || "")
+      .trim()
+      .toLowerCase()
+    return raw === "1" || raw === "true" || raw === "yes" || raw === "on"
+  }
+
+  /**
    * Render a stable, human-friendly identifier for log lines: prefer the
    * `(label) [stateKeyShort]` form so two accounts that share a label
    * (e.g. two Google social logins) are still distinguishable in the log.
@@ -913,6 +1311,19 @@ export class KiroService implements OnModuleInit {
    * Find the next available account (round-robin, cooldown-aware) WITHOUT
    * advancing the global pointer. The caller is responsible for updating
    * `accountIndex` once it commits to using the picked account.
+   *
+   * Selection order:
+   *   1. Eligible (not in cooldown for `model`, not excluded, has at least
+   *      one warm endpoint).
+   *   2. Among eligible, prefer the **lowest historical backoff level** for
+   *      this model — accounts that have been recently 429'd into L2/L3/L4
+   *      are dropped to the back of the queue even after their cooldown
+   *      expires, so the next request lands on a healthier account first.
+   *      This avoids the pathological pattern where one always-stressed
+   *      account (e.g. k2) keeps absorbing the first request of every turn,
+   *      stealing 1-2s on a guaranteed 429 before we switch.
+   *   3. Among accounts at the same backoff level, fall back to round-robin
+   *      using `accountIndex + startOffset` as the starting point.
    */
   private findAvailableAccount(
     model: string,
@@ -922,6 +1333,10 @@ export class KiroService implements OnModuleInit {
     const now = options?.now ?? Date.now()
     const exclude = options?.exclude
     const startOffset = options?.startOffset ?? 0
+
+    // Collect every eligible account along with its rotation rank so the
+    // scoring stage can break ties deterministically.
+    const eligible: Array<{ account: KiroAccount; rotationRank: number }> = []
     for (let offset = 0; offset < this.accounts.length; offset++) {
       const idx =
         (this.accountIndex + startOffset + offset) % this.accounts.length
@@ -931,10 +1346,21 @@ export class KiroService implements OnModuleInit {
         isAccountAvailableForModel(account, model, now) &&
         this.hasAvailableEndpointForModel(account, model, now)
       ) {
-        return account
+        eligible.push({ account, rotationRank: offset })
       }
     }
-    return null
+    if (eligible.length === 0) return null
+
+    // Score each candidate: lower is better.
+    //   - backoffLevel for this model (0 if never 429'd)
+    //   - then rotation rank, so ties keep round-robin behaviour
+    eligible.sort((a, b) => {
+      const aLevel = a.account.modelStates.get(model)?.backoffLevel ?? 0
+      const bLevel = b.account.modelStates.get(model)?.backoffLevel ?? 0
+      if (aLevel !== bLevel) return aLevel - bLevel
+      return a.rotationRank - b.rotationRank
+    })
+    return eligible[0]!.account
   }
 
   private hasAvailableEndpointForModel(
@@ -992,7 +1418,7 @@ export class KiroService implements OnModuleInit {
       return picked
     }
 
-    const recovery = getEarliestRecovery(this.accounts, model)
+    const recovery = this.getEarliestRecoveryForModel(model)
     const retryAfterSeconds =
       recovery && recovery.retryAfterMs > 0
         ? Math.ceil(recovery.retryAfterMs / 1000)
@@ -1060,6 +1486,7 @@ export class KiroService implements OnModuleInit {
         }
         // Persist to disk so next restart has fresh token.
         this.persistTokenToDisk(account)
+        this.mirrorLocalLoginsIfSelected(account)
         this.logger.log(
           `[Kiro] Refreshed access token for ${account.label || account.stateKey.slice(0, 12)} (expiresAt=${account.expiresAt})`
         )
@@ -1115,24 +1542,79 @@ export class KiroService implements OnModuleInit {
     // API Key accounts do not use profileArn.
     if (account.authMethod === "api_key") return
     if (account.profileArn) return
-    try {
-      const arn = await listAvailableProfileArn({
-        accessToken: account.accessToken,
-        machineId: account.machineId,
-        proxyUrl: account.proxyUrl,
-        client: account.client,
-      })
-      if (arn) {
-        account.profileArn = arn
-        this.persistAccountStates()
-        this.logger.log(
-          `[Kiro] Resolved profileArn for ${account.label || account.stateKey.slice(0, 12)}`
+
+    // Mirror Kiro-Go's ResolveProfileArn: retry ListAvailableProfiles on
+    // transient failures (network / 5xx / 429), then fall back to a token
+    // refresh whose response may carry the profileArn (social accounts).
+    // IdC/Enterprise accounts get their ARN from ListAvailableProfiles; the
+    // upstream rejects generateAssistantResponse with HTTP 400
+    // "profileArn is required" when it is missing, so resolving it here is
+    // mandatory, not best-effort.
+    const MAX_ATTEMPTS = 3
+    let backoffMs = 200
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        const arn = await listAvailableProfileArn({
+          accessToken: account.accessToken,
+          machineId: account.machineId,
+          proxyUrl: account.proxyUrl,
+          client: account.client,
+        })
+        if (arn) {
+          account.profileArn = arn
+          this.persistAccountStates()
+          // Cache to disk too so a restart skips re-resolution.
+          this.persistTokenToDisk(account)
+          this.logger.log(
+            `[Kiro] Resolved profileArn for ${account.label || account.stateKey.slice(0, 12)}`
+          )
+          return
+        }
+        // Empty profile list is authoritative — stop retrying and try the
+        // refresh fallback below.
+        break
+      } catch (error) {
+        const message = (error as Error).message
+        const isTransient =
+          /HTTP 5\d\d|HTTP 429/.test(message) || !/HTTP \d/.test(message)
+        if (!isTransient || attempt === MAX_ATTEMPTS) {
+          this.logger.debug?.(
+            `[Kiro] ListAvailableProfiles failed for ${account.label || ""}: ${message}`
+          )
+          break
+        }
+        await new Promise((resolve) => setTimeout(resolve, backoffMs))
+        backoffMs *= 2
+      }
+    }
+
+    // Fallback: a forced token refresh may return profileArn (social).
+    if (account.refreshToken) {
+      try {
+        const result = await refreshKiroToken({
+          authMethod: account.authMethod,
+          refreshToken: account.refreshToken,
+          clientId: account.clientId,
+          clientSecret: account.clientSecret,
+          region: account.region,
+          proxyUrl: account.proxyUrl,
+        })
+        account.accessToken = result.accessToken
+        account.refreshToken = result.refreshToken
+        account.expiresAt = result.expiresAt
+        if (result.profileArn) {
+          account.profileArn = result.profileArn
+          this.persistAccountStates()
+          this.persistTokenToDisk(account)
+          this.logger.log(
+            `[Kiro] Resolved profileArn via refresh for ${account.label || account.stateKey.slice(0, 12)}`
+          )
+        }
+      } catch (error) {
+        this.logger.debug?.(
+          `[Kiro] profileArn refresh fallback failed for ${account.label || ""}: ${(error as Error).message}`
         )
       }
-    } catch (error) {
-      this.logger.debug?.(
-        `[Kiro] ListAvailableProfiles failed for ${account.label || ""}: ${(error as Error).message}`
-      )
     }
   }
 
@@ -1188,8 +1670,71 @@ export class KiroService implements OnModuleInit {
     const state = account.endpointStates.get(key)
     if (!state) return true
     if (state.cooldownUntil > now) return false
-    account.endpointStates.delete(key)
+    if (state.cooldownUntil > 0) {
+      account.endpointStates.set(key, {
+        ...state,
+        cooldownUntil: 0,
+      })
+    }
     return true
+  }
+
+  private getActiveEndpointCooldownUntil(
+    account: KiroAccount,
+    endpoint: KiroEndpoint,
+    model: string,
+    now: number = Date.now()
+  ): number {
+    const key = this.endpointCooldownKey(endpoint, model)
+    const state = account.endpointStates.get(key)
+    if (!state) return 0
+    if (state.cooldownUntil > now) return state.cooldownUntil
+    if (state.cooldownUntil > 0) {
+      account.endpointStates.set(key, {
+        ...state,
+        cooldownUntil: 0,
+      })
+    }
+    return 0
+  }
+
+  private getEarliestRecoveryForModel(
+    model: string
+  ): { earliestRecovery: number; retryAfterMs: number } | null {
+    const now = Date.now()
+    let earliest = Infinity
+
+    for (const account of this.accounts) {
+      if (isAccountDisabled(account)) continue
+
+      const globalOrModelRecovery = Math.max(
+        account.cooldownUntil > now ? account.cooldownUntil : 0,
+        account.modelStates.get(model)?.cooldownUntil ?? 0
+      )
+      const activeEndpointRecoveries = this.getBaseOrderedEndpoints(account)
+        .map((endpoint) =>
+          this.getActiveEndpointCooldownUntil(account, endpoint, model, now)
+        )
+        .filter((cooldownUntil) => cooldownUntil > now)
+      const allEndpointsCooling =
+        activeEndpointRecoveries.length ===
+        this.getBaseOrderedEndpoints(account).length
+      const endpointRecovery = allEndpointsCooling
+        ? Math.min(...activeEndpointRecoveries)
+        : 0
+      const accountRecovery = Math.max(globalOrModelRecovery, endpointRecovery)
+
+      if (accountRecovery <= now) {
+        return null
+      }
+      earliest = Math.min(earliest, accountRecovery)
+    }
+
+    if (earliest === Infinity) return null
+    return {
+      earliestRecovery: earliest,
+      retryAfterMs: Math.max(0, earliest - now),
+    }
   }
 
   private markEndpointCooldown(
@@ -1229,6 +1774,30 @@ export class KiroService implements OnModuleInit {
     account.endpointStates.delete(this.endpointCooldownKey(endpoint, model))
   }
 
+  private markAccountQuotaCooldownIfEndpointsExhausted(
+    account: KiroAccount,
+    model: string,
+    retryAfterHeader?: string
+  ): boolean {
+    if (this.hasAvailableEndpointForModel(account, model, Date.now())) {
+      return false
+    }
+
+    markAccountCooldown(
+      account,
+      429,
+      model,
+      retryAfterHeader,
+      this.accountTag(account)
+    )
+    this.persistAccountStates()
+    this.logger.warn(
+      `[Kiro] All endpoints are cooling for ${this.accountTag(account)} ` +
+        `model=${model}; skipping this account until quota recovery`
+    )
+    return true
+  }
+
   private buildProxyDispatcher(account: KiroAccount): unknown {
     const proxyUrl = account.proxyUrl
     if (!proxyUrl) return undefined
@@ -1251,29 +1820,210 @@ export class KiroService implements OnModuleInit {
 
   // ── Core call ───────────────────────────────────────────────────────────
 
-  private prepareThinking(dto: CreateMessageDto): boolean {
-    const intent = dto._thinkingIntent
-    if (intent && intent.mode !== "disabled") return true
-    if (
-      dto.thinking &&
-      typeof dto.thinking === "object" &&
-      typeof dto.thinking.type === "string"
-    ) {
-      const type = dto.thinking.type.toLowerCase()
-      if (type === "enabled" || type === "adaptive" || type === "auto")
-        return true
-    }
-    return /thinking/.test((dto.model || "").toLowerCase())
+  /**
+   * Resolve the per-request `additionalModelRequestFields` we want the
+   * Kiro backend to honour for this DTO.
+   *
+   * Background: the Kiro `claude-opus-4.7` family advertises (via
+   * `ListAvailableModels.additionalModelRequestFieldsSchema`) a
+   * `thinking: { type: "adaptive" | "disabled", display: ... }` knob plus
+   * an `output_config.effort` knob. When the wire payload omits the field,
+   * the backend falls back to its model default — which on Opus 4.7 means
+   * adaptive thinking with summarized display. Empirically that adds 5–40
+   * seconds of `reasoningContentEvent` frames before any tool/assistant
+   * output even on trivial tool continuations, dominating turn latency.
+   *
+   * We translate the bridge-internal `ThinkingIntent` (built upstream from
+   * the Cursor request and/or `dto.thinking`) into the wire shape Kiro
+   * accepts, so callers who explicitly disabled thinking get a true
+   * non-thinking call instead of silently falling back to Opus 4.7's
+   * default adaptive mode.
+   *
+   * Returns `undefined` when no override is needed (caller wants the
+   * model default). Callers that want a non-thinking call must pass an
+   * intent of `{ mode: "disabled" }` upstream.
+   */
+  private prepareAdditionalModelRequestFields(
+    dto: CreateMessageDto
+  ): KiroAdditionalModelRequestFields | undefined {
+    const intent = resolveThinkingIntentFromDto(dto)
+    if (!intent) return undefined
+
+    return this.intentToKiroFields(intent)
   }
 
+  private intentToKiroFields(
+    intent: ThinkingIntent
+  ): KiroAdditionalModelRequestFields | undefined {
+    switch (intent.mode) {
+      case "disabled":
+        return { thinking: { type: "disabled", display: "omitted" } }
+      case "adaptive": {
+        const out: KiroAdditionalModelRequestFields = {
+          thinking: { type: "adaptive", display: "summarized" },
+        }
+        const effort = this.normalizeKiroEffort(intent.effort)
+        if (effort) out.output_config = { effort }
+        return out
+      }
+      case "explicit_effort": {
+        const effort = this.normalizeKiroEffort(intent.effort)
+        const out: KiroAdditionalModelRequestFields = {
+          thinking: { type: "adaptive", display: "summarized" },
+        }
+        if (effort) out.output_config = { effort }
+        return out
+      }
+      case "explicit_budget":
+        // Kiro's schema does not accept `budget_tokens` directly; the
+        // closest mapping is enabling adaptive thinking. Effort stays
+        // unset so the backend picks a sensible default.
+        return { thinking: { type: "adaptive", display: "summarized" } }
+      default:
+        return undefined
+    }
+  }
+
+  private normalizeKiroEffort(
+    effort: ThinkingIntentEffort | undefined
+  ): "low" | "medium" | "high" | "xhigh" | "max" | undefined {
+    switch (effort) {
+      case "minimal":
+      case "low":
+        return "low"
+      case "medium":
+        return "medium"
+      case "high":
+        return "high"
+      case "xhigh":
+        return "xhigh"
+      case "max":
+        return "max"
+      default:
+        return undefined
+    }
+  }
+
+  /**
+   * Classify a Kiro / CodeWhisperer non-2xx response into the unified
+   * BackendErrorClass taxonomy. Reads the structured `reason` field
+   * from the JSON body (a stable upstream enum) ahead of any prose
+   * matching, so this classifier survives upstream rephrasing.
+   *
+   * The two endpoints in this backend (Kiro IDE + CodeWhisperer) emit
+   * slightly different message strings for the same underlying
+   * condition; both carry the same `reason` enum value, which is what
+   * we key on. See backend-error-class.ts for the cross-provider
+   * taxonomy and downstream policy.
+   */
+  private classifyKiroResponseError(
+    status: number,
+    responseText: string
+  ): { errorClass: BackendErrorClass; maxTokens?: number } {
+    if (status === 401 || status === 403) {
+      return { errorClass: "auth_failed" }
+    }
+    if (status === 429) {
+      return { errorClass: "rate_limited" }
+    }
+    if (status >= 500 && status < 600) {
+      return { errorClass: "transient_5xx" }
+    }
+    if (status !== 400) {
+      return { errorClass: "unknown" }
+    }
+
+    // 400: dispatch on the structured `reason` enum first.
+    let reason: string | undefined
+    try {
+      const parsed = JSON.parse(responseText) as Record<string, unknown>
+      const candidate = typeof parsed.reason === "string" ? parsed.reason : ""
+      if (candidate) reason = candidate
+    } catch {
+      // body wasn't JSON; fall through to prose match.
+    }
+
+    if (reason === "CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+      return {
+        errorClass: "context_length_exceeded",
+        // Kiro doesn't return the actual / max numbers — its reject is
+        // wire-byte based (~2.15 MB JSON body), not token based, and
+        // the upstream error body carries no counters. The Anthropic
+        // envelope renderer (formatAnthropicMessage) emits the bare
+        // "prompt is too long" string in that case, which CC CLI still
+        // matches via its case-insensitive substring check at
+        // services/api/errors.ts:564 — the precise N/M numbers are
+        // only used by the reactive-compact gap math, which falls back
+        // to a heuristic step when the numbers are missing.
+        maxTokens: undefined,
+      }
+    }
+
+    // No structured enum — last-resort classification on prose. Tools
+    // / schema / validation are bridge-debuggable shape problems; the
+    // rest are generic 4xx that we don't auto-recover.
+    if (
+      /toolconfig|tool_config_missing|tool config|schema|validation/i.test(
+        responseText
+      )
+    ) {
+      return { errorClass: "tool_schema_invalid" }
+    }
+    // Defense in depth: if `reason` was missing but the prose still
+    // describes a length error, classify it correctly.
+    if (
+      /input is too long|input content length exceeds|exceeds threshold|prompt is too long/i.test(
+        responseText
+      )
+    ) {
+      return { errorClass: "context_length_exceeded" }
+    }
+    return { errorClass: "request_shape_invalid" }
+  }
+
+  /**
+   * @deprecated Use `classifyKiroResponseError` + RETRY_POLICY instead.
+   * Kept for one release as a thin shim over the new classifier.
+   */
   private isNonRetryableRequestShapeError(
     status: number,
     responseText: string
   ): boolean {
-    if (status !== 400) return false
-    return /toolconfig|tool_config_missing|tool config|schema|validation/i.test(
-      responseText
-    )
+    const { errorClass } = this.classifyKiroResponseError(status, responseText)
+    return !RETRY_POLICY[errorClass].retryableDifferentAccount
+  }
+
+  /**
+   * Tag a parser-side stream failure with the unified BackendError
+   * taxonomy so the router / fallback layer can act on it.
+   *
+   * The "Kiro stream closed without producing any assistant content"
+   * case (event-stream.ts) is a real, observed failure mode where AWS
+   * closes the connection cleanly mid-flight on long compaction
+   * summary requests. Without an explicit class tag the surrounding
+   * catch site re-throws a bare Error which `classifyBackendError`
+   * maps to `unknown` — that class disables both same-account retry
+   * and cross-backend fallback in RETRY_POLICY, so the request would
+   * dead-end here. Tagging it as `transient_5xx` matches its
+   * semantics (upstream produced no useful response) and unlocks the
+   * retry / fallback ladder.
+   *
+   * Non-empty-stream errors are passed through unchanged — the caller
+   * sees the original error type and message.
+   */
+  private tagKiroStreamParseError(error: unknown): unknown {
+    if (
+      error instanceof Error &&
+      !(error instanceof BackendApiError) &&
+      error.message.startsWith("Kiro stream closed without producing")
+    ) {
+      return new BackendApiError(error.message, {
+        backend: "kiro",
+        statusCode: 502,
+        errorClass: "transient_5xx",
+      })
+    }
+    return error
   }
 
   /**
@@ -1289,6 +2039,50 @@ export class KiroService implements OnModuleInit {
     if (e.code === "ABORT_ERR") return true
     if (e.name === "TimeoutError") return true
     if (/abort/i.test(e.message ?? "")) return true
+    return false
+  }
+
+  private resolveStreamRequestTimeoutMs(): number {
+    const raw = (process.env.KIRO_STREAM_REQUEST_TIMEOUT_MS || "").trim()
+    if (!raw) return STREAM_REQUEST_TIMEOUT_MS
+    const parsed = Number(raw)
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      this.logger.warn(
+        `[Kiro] Ignoring invalid KIRO_STREAM_REQUEST_TIMEOUT_MS=${raw}`
+      )
+      return STREAM_REQUEST_TIMEOUT_MS
+    }
+    return Math.max(1_000, Math.floor(parsed))
+  }
+
+  private createStreamRequestAbortSignal(externalSignal?: AbortSignal): {
+    signal: AbortSignal
+    timeoutMs: number
+  } {
+    const timeoutMs = this.resolveStreamRequestTimeoutMs()
+    const timeoutSignal = AbortSignal.timeout(timeoutMs)
+    return {
+      signal: externalSignal
+        ? AbortSignal.any([externalSignal, timeoutSignal])
+        : timeoutSignal,
+      timeoutMs,
+    }
+  }
+
+  private isTimeoutAbort(error: unknown, signal?: AbortSignal): boolean {
+    const reason: unknown = signal?.reason
+    if (reason && typeof reason === "object") {
+      const name = (reason as { name?: string }).name
+      if (name === "TimeoutError") return true
+    }
+    if (reason instanceof Error && /timeout/i.test(reason.message)) return true
+    if (typeof reason === "string" && /timeout/i.test(reason)) return true
+
+    if (error && typeof error === "object") {
+      const e = error as { name?: string; message?: string }
+      if (e.name === "TimeoutError") return true
+      if (/timeout/i.test(e.message ?? "")) return true
+    }
     return false
   }
 
@@ -1312,12 +2106,37 @@ export class KiroService implements OnModuleInit {
     dto: CreateMessageDto,
     account: KiroAccount
   ): KiroPayload {
-    const thinking = this.prepareThinking(dto)
+    const fields = this.prepareAdditionalModelRequestFields(dto)
     const payload = claudeToKiro(dto, {
-      thinking,
+      thinking: fields?.thinking,
+      effort: fields?.output_config?.effort,
       profileArn: account.profileArn,
       conversationId: (dto._conversationId || "").trim() || undefined,
     })
+
+    // Splice the previous turn(s)' reasoning digest into the user content.
+    // The wire path does not carry structured thinking blocks across turns,
+    // so the bridge-level continuity strategy for kiro is `text_preamble`
+    // (see backend-capability.ts). The send-time pipeline in
+    // cursor-connect-stream.ts owns the projection — it sources records
+    // from ReasoningMemoryService, applies budget arithmetic, frames the
+    // text as `<previous_thinking>...</previous_thinking>`, and hands the
+    // ready-to-splice payload over via `dto._lastThinkingSummary`. We
+    // splice it raw — no additional framing — so the contract is:
+    //
+    //   `dto._lastThinkingSummary` is wire-ready preamble text, including
+    //   its own XML envelope and trailing blank line. Producers (and only
+    //   producers) decide its shape.
+    const summary = dto._lastThinkingSummary
+    if (typeof summary === "string" && summary.length > 0) {
+      const userMsg = payload.conversationState.currentMessage.userInputMessage
+      const existing = userMsg.content || ""
+      userMsg.content = summary + existing
+      this.logger.log?.(
+        `[Kiro] Injected previous-turn reasoning preamble: ${summary.length} chars`
+      )
+    }
+
     return payload
   }
 
@@ -1339,12 +2158,25 @@ export class KiroService implements OnModuleInit {
     let lastError: Error | null = null
     const MAX_RETRIES = 10
     const BASE_DELAY_MS = 3000
-    /** Accounts that have been tried and failed with auth errors this call. */
+    /** Accounts that have been tried and failed or entered cooldown this call. */
     const attemptedAccountKeys = new Set<string>()
     /** Accounts that have already been force-refreshed this call (max once per account). */
     const forceRefreshedKeys = new Set<string>()
 
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      // Class-driven early exit: if the last failure carries a class
+      // that policy says is not retryable on a different account,
+      // there is no point churning the retry loop. PTL is the
+      // motivating case — every account fails identically because
+      // the wire body is identical.
+      if (
+        attempt > 0 &&
+        lastError instanceof BackendApiError &&
+        lastError.errorClass &&
+        !RETRY_POLICY[lastError.errorClass].retryableDifferentAccount
+      ) {
+        throw lastError
+      }
       if (attempt > 0) {
         // Before waiting, try to switch to a different account if available.
         const alternate = this.findAvailableAccount(model, {
@@ -1352,12 +2184,33 @@ export class KiroService implements OnModuleInit {
         })
         if (alternate && alternate.stateKey !== currentAccount.stateKey) {
           this.logger.log(
-            `[Kiro] Switching from ${this.accountTag(currentAccount)} to ${this.accountTag(alternate)} after auth failure`
+            `[Kiro] Switching from ${this.accountTag(currentAccount)} to ${this.accountTag(alternate)} after previous account failure/cooldown`
           )
           currentAccount = alternate
           await this.ensureFreshToken(currentAccount)
           await this.ensureProfileArn(currentAccount)
         } else {
+          // No alternate available. Two paths:
+          //   - Default: wait with exponential backoff (capped at 30s) and
+          //     hope a cooldown expires.
+          //   - KIRO_FAST_FAIL_ON_NO_ALTERNATE=1: throw immediately so the
+          //     model router can fall back to claude-api / google-claude
+          //     instead of stalling the user-visible turn for 3-30s while
+          //     every Kiro account is hot. The backend pool error class is
+          //     non-permanent so the router will re-enter Kiro on a later
+          //     turn once cooldowns clear.
+          if (this.shouldFastFailOnNoAlternate()) {
+            this.logger.warn(
+              `[Kiro] No alternate Kiro account available (attempted=${attemptedAccountKeys.size}/${this.accounts.length}); fast-failing so the upstream router can pick a different backend.`
+            )
+            throw (
+              lastError ??
+              new BackendApiError(
+                `No Kiro account available for model=${model} (all in cooldown)`,
+                { backend: "kiro", statusCode: 429 }
+              )
+            )
+          }
           // No alternate available — wait with backoff (capped at 30s).
           const delay = Math.min(
             30_000,
@@ -1376,6 +2229,7 @@ export class KiroService implements OnModuleInit {
               backend: "kiro",
               statusCode: 499,
               permanent: true,
+              errorClass: "client_aborted",
             })
           }
           // After waiting, cooldowns may have expired — try to pick a fresh account.
@@ -1389,12 +2243,37 @@ export class KiroService implements OnModuleInit {
       }
 
       const payload = this.buildKiroPayload(dto, currentAccount)
+
+      // Last-resort guard: if profileArn is still missing after all
+      // ensureProfileArn calls, force one final parse attempt before
+      // sending the request. This prevents 400 "profileArn is required"
+      // errors from reaching the wire.
+      if (!payload.profileArn) {
+        this.logger.warn(
+          `[Kiro] profileArn missing in payload for ${this.accountTag(currentAccount)} before request — forcing final parse attempt`
+        )
+        await this.ensureProfileArn(currentAccount)
+        // Rebuild payload with (hopefully) fresh profileArn
+        const rebuiltPayload = this.buildKiroPayload(dto, currentAccount)
+        if (rebuiltPayload.profileArn) {
+          Object.assign(payload, rebuiltPayload)
+          this.logger.log(
+            `[Kiro] profileArn recovered: ${rebuiltPayload.profileArn}`
+          )
+        } else {
+          this.logger.error(
+            `[Kiro] profileArn still missing after final parse attempt for ${this.accountTag(currentAccount)} — request will likely fail with 400`
+          )
+        }
+      }
+
       const orderedEndpoints = this.getOrderedEndpoints(currentAccount, model)
       if (orderedEndpoints.length === 0) {
         lastError = new BackendApiError(
           `All Kiro endpoints are cooling down for ${this.accountTag(currentAccount)} model=${model}`,
-          { backend: "kiro", statusCode: 429 }
+          { backend: "kiro", statusCode: 429, errorClass: "rate_limited" }
         )
+        attemptedAccountKeys.add(currentAccount.stateKey)
         continue
       }
 
@@ -1428,10 +2307,12 @@ export class KiroService implements OnModuleInit {
           baseHeaders["tokentype"] = "API_KEY"
         }
 
+        let activeRequestAbort =
+          this.createStreamRequestAbortSignal(abortSignal)
         const fetchOptions: RequestInit & { dispatcher?: unknown } = {
           method: "POST",
           headers: baseHeaders,
-          signal: abortSignal ?? AbortSignal.timeout(STREAM_REQUEST_TIMEOUT_MS),
+          signal: activeRequestAbort.signal,
         }
         const dispatcher = this.buildProxyDispatcher(currentAccount)
         if (dispatcher) fetchOptions.dispatcher = dispatcher
@@ -1455,17 +2336,29 @@ export class KiroService implements OnModuleInit {
           })
 
           if (response.status === 429) {
+            const retryAfterHeader =
+              response.headers.get("retry-after") || undefined
             this.markEndpointCooldown(
               currentAccount,
               endpoint,
               model,
-              response.headers.get("retry-after") || undefined
+              retryAfterHeader
             )
+            const accountEndpointsExhausted =
+              this.markAccountQuotaCooldownIfEndpointsExhausted(
+                currentAccount,
+                model,
+                retryAfterHeader
+              )
+            if (accountEndpointsExhausted) {
+              attemptedAccountKeys.add(currentAccount.stateKey)
+            }
             lastError = new BackendApiError(
               `Kiro endpoint ${endpoint.name} returned 429`,
               { backend: "kiro", statusCode: 429 }
             )
             response.body?.cancel().catch(() => undefined)
+            if (accountEndpointsExhausted) break
             continue
           }
 
@@ -1523,14 +2416,14 @@ export class KiroService implements OnModuleInit {
                   if (currentAccount.authMethod === "api_key") {
                     retryHeaders["tokentype"] = "API_KEY"
                   }
+                  activeRequestAbort =
+                    this.createStreamRequestAbortSignal(abortSignal)
                   const retryFetchOptions: RequestInit & {
                     dispatcher?: unknown
                   } = {
                     method: "POST",
                     headers: retryHeaders,
-                    signal:
-                      abortSignal ??
-                      AbortSignal.timeout(STREAM_REQUEST_TIMEOUT_MS),
+                    signal: activeRequestAbort.signal,
                   }
                   const retryDispatcher =
                     this.buildProxyDispatcher(currentAccount)
@@ -1554,11 +2447,15 @@ export class KiroService implements OnModuleInit {
                   })
 
                   if (retryResponse.ok && retryResponse.body) {
-                    await parseKiroEventStream(
-                      retryResponse.body,
-                      callback,
-                      abortSignal
-                    )
+                    try {
+                      await parseKiroEventStream(
+                        retryResponse.body,
+                        callback,
+                        activeRequestAbort.signal
+                      )
+                    } catch (parseError) {
+                      throw this.tagKiroStreamParseError(parseError)
+                    }
                     this.logger.log(
                       `[Kiro] <- ${endpoint.name} stream completed after refresh (account=${this.accountTag(currentAccount)}, model=${model})`
                     )
@@ -1597,18 +2494,40 @@ export class KiroService implements OnModuleInit {
               attemptedAccountKeys.add(currentAccount.stateKey)
               lastError = new BackendApiError(
                 `Kiro auth error: HTTP ${status} ${text.slice(0, 200)}`,
-                { backend: "kiro", statusCode: status }
+                {
+                  backend: "kiro",
+                  statusCode: status,
+                  errorClass: "auth_failed",
+                }
               )
               // Break out of endpoint loop to trigger account switch at top of retry loop.
               break
             }
 
-            // All other non-200: continue to next endpoint.
+            // All other non-200: classify with structured-field-aware
+            // logic and tag the BackendApiError so downstream retry /
+            // fallback / Anthropic-envelope rendering can read the
+            // class instead of re-parsing the wire body.
+            const { errorClass, maxTokens } = this.classifyKiroResponseError(
+              status,
+              text
+            )
             const requestError = new BackendApiError(
               `Kiro endpoint ${endpoint.name} HTTP ${status}: ${text.slice(0, 200)}`,
-              { backend: "kiro", statusCode: status }
+              {
+                backend: "kiro",
+                statusCode: status,
+                errorClass,
+                maxTokens,
+              }
             )
-            if (this.isNonRetryableRequestShapeError(status, text)) {
+            // Per-class policy decides whether to keep trying on this
+            // backend (different account / different endpoint) or
+            // bubble up so the model router can pick a different
+            // backend entirely. PTL: bubble up immediately — every
+            // account fails identically because the wire body is
+            // identical.
+            if (!RETRY_POLICY[errorClass].retryableDifferentAccount) {
               throw requestError
             }
             lastError = requestError
@@ -1620,10 +2539,19 @@ export class KiroService implements OnModuleInit {
             throw new BackendApiError("Kiro response has no body", {
               backend: "kiro",
               statusCode: 502,
+              errorClass: "transient_5xx",
             })
           }
 
-          await parseKiroEventStream(response.body, callback, abortSignal)
+          try {
+            await parseKiroEventStream(
+              response.body,
+              callback,
+              activeRequestAbort.signal
+            )
+          } catch (parseError) {
+            throw this.tagKiroStreamParseError(parseError)
+          }
           this.logger.log(
             `[Kiro] <- ${endpoint.name} stream completed (account=${this.accountTag(currentAccount)}, model=${model})`
           )
@@ -1654,15 +2582,51 @@ export class KiroService implements OnModuleInit {
           // The AbortController fires with reason containing "Superseded"
           // when a new bidi stream replaces the current one.
           if (this.isAbortError(error)) {
-            const reason = this.extractAbortReason(error, abortSignal)
+            const reason = this.extractAbortReason(
+              error,
+              activeRequestAbort.signal
+            )
+            if (this.isTimeoutAbort(error, activeRequestAbort.signal)) {
+              throw new BackendApiError(
+                `Kiro request timed out after ${activeRequestAbort.timeoutMs}ms`,
+                {
+                  backend: "kiro",
+                  statusCode: 504,
+                  errorClass: "transient_network",
+                }
+              )
+            }
             throw new BackendApiError(`Kiro request aborted: ${reason}`, {
               backend: "kiro",
               statusCode: 499,
               permanent: true,
+              errorClass: "client_aborted",
             })
           }
 
           const message = (error as Error).message || String(error)
+          // Belt-and-suspenders: not every supersede surfaces as a proper
+          // AbortError. When `backendStreamAbortRegistry.abortOtherStreams`
+          // tears down an in-flight fetch the underlying error sometimes
+          // arrives as a generic Error / TypeError whose message still
+          // carries the "Superseded by stream <id> during ..." reason
+          // string we set on the AbortController. Without this guard the
+          // generic `Endpoint X failed for Y` warning fires and pollutes
+          // both the operator log and downstream endpoint-health
+          // statistics, even though no real endpoint failure occurred.
+          // Treat any such error as a non-retryable cancellation, mirror
+          // the proper abort path, and log at debug only.
+          if (message.includes("Superseded by stream")) {
+            this.logger.debug(
+              `[Kiro] Endpoint ${endpoint.name} cancelled for ${this.accountTag(currentAccount)} (stream supersede): ${message}`
+            )
+            throw new BackendApiError(`Kiro request cancelled: ${message}`, {
+              backend: "kiro",
+              statusCode: 499,
+              permanent: true,
+              errorClass: "client_aborted",
+            })
+          }
           this.logger.warn(
             `[Kiro] Endpoint ${endpoint.name} failed for ${this.accountTag(currentAccount)}: ${message}`
           )
@@ -2062,6 +3026,7 @@ export class KiroService implements OnModuleInit {
     }
 
     const runner = (async () => {
+      let completedNormally = false
       try {
         const result = await this.callKiro(dto, account, callback, abortSignal)
         // If callKiro switched accounts mid-flight, update for cache tracking.
@@ -2071,25 +3036,43 @@ export class KiroService implements OnModuleInit {
         // Persist the breakpoints only after a successful response so a
         // failed turn does not poison the cache state of this account.
         this.cacheTracker.update(account.stateKey, cacheProfile)
+        completedNormally = true
       } catch (error) {
         streamError = error as Error
       } finally {
+        // Always close any opened content blocks to keep block_start /
+        // block_stop frames balanced — the consumer's SSE parser treats
+        // an unbalanced frame count as a protocol violation regardless
+        // of whether the turn succeeded or errored.
         if (textBlockOpen) closeTextBlock()
         if (thinkingBlockOpen) closeThinkingBlock()
 
-        if (collectedInput <= 0) {
-          collectedInput = estimatedInputTokens
+        // CRITICAL: only emit message_delta + message_stop when the
+        // upstream stream actually finished. On error, emitting these
+        // looks to CC CLI like a well-formed `stop_reason: end_turn`
+        // turn with empty content — the compact summary path then
+        // accepts the empty assistant text as success, replaces history
+        // with an empty <summary>, and the next turn immediately
+        // recreates the over-cap condition. The error path must let
+        // the BackendApiError surface so the controller can render an
+        // SSE `event: error` instead, which CC CLI maps to either a
+        // PTL retry (truncateHeadForPTLRetry, MAX_PTL_RETRIES=3) or a
+        // visible "Failed to generate conversation summary" failure —
+        // both safe outcomes vs. silent corruption.
+        if (completedNormally) {
+          if (collectedInput <= 0) {
+            collectedInput = estimatedInputTokens
+          }
+          const stopReason = toolUseBlockMeta.size > 0 ? "tool_use" : "end_turn"
+          emit(
+            sseEvent("message_delta", {
+              type: "message_delta",
+              delta: { stop_reason: stopReason, stop_sequence: null },
+              usage: buildUsageObject(collectedInput, collectedOutput),
+            })
+          )
+          emit(sseEvent("message_stop", { type: "message_stop" }))
         }
-
-        const stopReason = toolUseBlockMeta.size > 0 ? "tool_use" : "end_turn"
-        emit(
-          sseEvent("message_delta", {
-            type: "message_delta",
-            delta: { stop_reason: stopReason, stop_sequence: null },
-            usage: buildUsageObject(collectedInput, collectedOutput),
-          })
-        )
-        emit(sseEvent("message_stop", { type: "message_stop" }))
         finished = true
         const waiter = eventQueue.shift()
         if (waiter?.resolve) waiter.resolve()
@@ -2226,6 +3209,118 @@ export class KiroService implements OnModuleInit {
     )
   }
 
+  private getLocalLoginTargetsPath(): string {
+    return path.join(
+      path.dirname(this.getAccountsFilePath()),
+      "kiro-local-login-targets.json"
+    )
+  }
+
+  private readLocalLoginTargets(): KiroLocalLoginTargetsFile {
+    const filePath = this.getLocalLoginTargetsPath()
+    if (!fs.existsSync(filePath)) return {}
+    try {
+      const parsed = JSON.parse(
+        fs.readFileSync(filePath, "utf-8")
+      ) as KiroLocalLoginTargetsFile
+      return parsed && typeof parsed === "object" ? parsed : {}
+    } catch (error) {
+      this.logger.warn(
+        `[Kiro] Failed to read local login targets: ${(error as Error).message}`
+      )
+      return {}
+    }
+  }
+
+  private writeLocalLoginTargets(targets: KiroLocalLoginTargetsFile): void {
+    const filePath = this.getLocalLoginTargetsPath()
+    fs.mkdirSync(path.dirname(filePath), { recursive: true })
+    fs.writeFileSync(filePath, JSON.stringify(targets, null, 2) + "\n", {
+      mode: 0o600,
+    })
+  }
+
+  private rememberLocalLoginTarget(
+    kind: KiroLocalLoginKind,
+    account: KiroAccount
+  ): void {
+    const targets = this.readLocalLoginTargets()
+    targets[kind] = {
+      authMethod: account.authMethod,
+      region: account.region,
+      stateKey: account.stateKey,
+      clientId: account.clientId,
+      label: account.label,
+      updatedAt: new Date().toISOString(),
+    }
+    this.writeLocalLoginTargets(targets)
+  }
+
+  private accountMatchesLocalLoginTarget(
+    account: KiroAccount,
+    target: KiroLocalLoginTarget | undefined
+  ): boolean {
+    if (!target) return false
+    if (account.authMethod !== target.authMethod) return false
+    const normalize = (value: unknown) =>
+      typeof value === "string" ? value.trim() : ""
+    const accountRegion = normalize(account.region || "us-east-1")
+    const targetRegion = normalize(target.region || "us-east-1")
+    if (accountRegion !== targetRegion) return false
+    if (target.stateKey && target.stateKey === account.stateKey) return true
+    if (target.clientId && target.clientId === account.clientId) return true
+    return !!target.label && target.label === account.label
+  }
+
+  private buildLocalLoginExportInput(account: KiroAccount): KiroIdeExportInput {
+    return {
+      authMethod: account.authMethod === "social" ? "social" : "idc",
+      region: account.region,
+      accessToken: account.accessToken,
+      refreshToken: account.refreshToken,
+      expiresAt: account.expiresAt,
+      profileArn: account.profileArn,
+      provider: account.provider,
+      clientId: account.clientId,
+      clientSecret: account.clientSecret,
+      registrationExpiresAt: account.registrationExpiresAt,
+    }
+  }
+
+  private mirrorLocalLoginsIfSelected(account: KiroAccount): void {
+    if (account.authMethod === "api_key") return
+    if (!account.accessToken || !account.refreshToken) return
+
+    const targets = this.readLocalLoginTargets()
+    const exportInput = this.buildLocalLoginExportInput(account)
+
+    if (this.accountMatchesLocalLoginTarget(account, targets.ide)) {
+      try {
+        writeKiroIdeLogin(exportInput)
+        this.logger.log(
+          `[Kiro] Mirrored refreshed token into local Kiro IDE for ${account.label || account.stateKey.slice(0, 12)}`
+        )
+      } catch (error) {
+        this.logger.warn(
+          `[Kiro] Failed to mirror refreshed token into local Kiro IDE: ${(error as Error).message}`
+        )
+      }
+    }
+
+    if (this.accountMatchesLocalLoginTarget(account, targets.cli)) {
+      try {
+        writeKiroCliLogin(exportInput)
+        this.logger.log(
+          `[Kiro] Mirrored refreshed token into local Kiro CLI for ${account.label || account.stateKey.slice(0, 12)}`
+        )
+      } catch (error) {
+        this.logger.warn(
+          `[Kiro] Failed to mirror refreshed token into local Kiro CLI: ${(error as Error).message}`
+        )
+      }
+    }
+  }
+
   /** Read the accounts JSON file as a list, returning [] when missing. */
   private readAccountsFile(): KiroAccountFileEntry[] {
     const filePath = this.getAccountsFilePath()
@@ -2302,6 +3397,7 @@ export class KiroService implements OnModuleInit {
           }
           // Persist refreshed token to disk so next restart has fresh creds.
           this.persistTokenToDisk(account)
+          this.mirrorLocalLoginsIfSelected(account)
           this.logger.log(
             `[Kiro] Background refresh OK: ${account.label || account.stateKey.slice(0, 12)} (expires=${new Date(result.expiresAt * 1000).toISOString()})`
           )
@@ -2336,6 +3432,7 @@ export class KiroService implements OnModuleInit {
           refreshToken: account.refreshToken,
           expiresAt: account.expiresAt,
           profileArn: account.profileArn,
+          registrationExpiresAt: account.registrationExpiresAt,
         }
         this.writeAccountsFile(entries)
       }
@@ -2499,6 +3596,8 @@ export class KiroService implements OnModuleInit {
       accessToken: token.accessToken,
       refreshToken: token.refreshToken,
       expiresAt: token.expiresAt || undefined,
+      registrationExpiresAt:
+        token.registrationExpiresAt || existing?.registrationExpiresAt,
       profileArn: token.profileArn || existing?.profileArn,
       provider: token.provider || existing?.provider,
       machineId: existing?.machineId,
@@ -2536,6 +3635,7 @@ export class KiroService implements OnModuleInit {
       expiresAt: number
       clientId: string
       clientSecret: string
+      registrationExpiresAt?: number
       region: string
     },
     session: KiroDeviceAuthSession
@@ -2561,6 +3661,7 @@ export class KiroService implements OnModuleInit {
       expiresAt: result.expiresAt,
       clientId: result.clientId,
       clientSecret: result.clientSecret,
+      registrationExpiresAt: result.registrationExpiresAt,
     }
     if (idx >= 0) {
       entries[idx] = merged

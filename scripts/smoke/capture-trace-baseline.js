@@ -70,6 +70,17 @@ function resolveSmokeDir() {
     : path.resolve(os.homedir(), ".agent-vibes", "smoke")
 }
 
+function resolveBridgeLogPath() {
+  // Mirrors apps/vscode-extension/src/services/bridge-manager.ts:
+  //   path.join(os.tmpdir(), "agent-vibes-bridge.log").
+  // Allow override via $BRIDGE_LOG so the smoke prompt and this script agree
+  // even on hosts with non-standard tmpdirs.
+  if (process.env.BRIDGE_LOG) {
+    return path.resolve(process.env.BRIDGE_LOG)
+  }
+  return path.join(os.tmpdir(), "agent-vibes-bridge.log")
+}
+
 function baselineStatePath() {
   return path.join(resolveSmokeDir(), ".trace-baseline.json")
 }
@@ -225,11 +236,26 @@ function resetSmokeFixtures() {
     path: path.join(dir, "env.txt"),
     changed: writeIfChanged(path.join(dir, "env.txt"), "PLACEHOLDER_ENV=old"),
   })
-  // Remove created_by_test.txt if it exists (stale from a previous run).
-  const orphan = path.join(dir, "created_by_test.txt")
-  if (fs.existsSync(orphan)) {
-    fs.unlinkSync(orphan)
-    ops.push({ path: orphan, changed: true, removed: true })
+  // Remove any created_by_test*.txt orphans (stale from previous runs).
+  // The smoke prompt's task 3d names new files like
+  // `created_by_test_<RUN_ID>.txt` so multiple parallel sessions don't race
+  // on a shared filename, and any of those leftovers should also be cleaned.
+  for (const entry of fs.readdirSync(dir)) {
+    if (
+      entry === "created_by_test.txt" ||
+      (entry.startsWith("created_by_test_") && entry.endsWith(".txt"))
+    ) {
+      const orphan = path.join(dir, entry)
+      try {
+        const stat = fs.statSync(orphan)
+        if (stat.isFile()) {
+          fs.unlinkSync(orphan)
+          ops.push({ path: orphan, changed: true, removed: true })
+        }
+      } catch {
+        // Race with another session — ignore.
+      }
+    }
   }
   return { dir, ops }
 }
@@ -237,13 +263,28 @@ function resetSmokeFixtures() {
 function captureCommand() {
   const tracePath = resolveTracePath()
   const stat = safeStat(tracePath)
+  const bridgeLogPath = resolveBridgeLogPath()
+  const bridgeLogStat = safeStat(bridgeLogPath)
   const baseline = {
     captured_at: new Date().toISOString(),
+    // Echo the smoke run id so post-hoc tooling can correlate this baseline
+    // with the agent's report. The spec exports SMOKE_RUN_ID before calling
+    // capture; if it isn't set we emit null so consumers can detect that
+    // RUN_ID-based isolation wasn't used.
+    smoke_run_id: process.env.SMOKE_RUN_ID || null,
+    smoke_dir: resolveSmokeDir(),
     trace_path: tracePath,
     trace_exists: !!stat,
     bytes: stat ? stat.size : 0,
     line_count: stat ? countLinesSync(tracePath) : 0,
     mtime: stat ? stat.mtime.toISOString() : null,
+    // Bridge log offset so smoke prompts can grep only bytes written after
+    // baseline capture. Helpful when multiple smoke sessions share the same
+    // bridge process (and thus the same global bridge log).
+    bridge_log_path: bridgeLogPath,
+    bridge_log_exists: !!bridgeLogStat,
+    bridge_log_size_bytes: bridgeLogStat ? bridgeLogStat.size : 0,
+    bridge_log_mtime: bridgeLogStat ? bridgeLogStat.mtime.toISOString() : null,
   }
   const dir = ensureSmokeDir()
   if (isInsideRepo(dir)) {

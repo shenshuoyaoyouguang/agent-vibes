@@ -378,10 +378,26 @@ function summarizeServerMessage(
 }
 
 export class CursorProtocolTraceService {
+  private static readonly DEFAULT_MAX_TRACE_BYTES = 64 * 1024 * 1024
+  private static readonly TRACE_SIZE_CHECK_INTERVAL_MS = 5000
+  private static lastTraceSizeCheckAt = 0
+
   private static enabled(): boolean {
     const raw = process.env.CURSOR_PROTOCOL_TRACE
     if (raw === undefined || raw.trim() === "") return true
     return !["0", "false", "no", "off"].includes(raw.trim().toLowerCase())
+  }
+
+  private static maxTraceBytes(): number {
+    const raw = process.env.CURSOR_PROTOCOL_TRACE_MAX_BYTES
+    if (raw === undefined || raw.trim() === "") {
+      return this.DEFAULT_MAX_TRACE_BYTES
+    }
+    const parsed = Number(raw)
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      return this.DEFAULT_MAX_TRACE_BYTES
+    }
+    return parsed
   }
 
   private static tracePath(): string {
@@ -458,9 +474,36 @@ export class CursorProtocolTraceService {
     try {
       const filePath = this.tracePath()
       fs.mkdirSync(path.dirname(filePath), { recursive: true })
+      this.rotateTraceIfNeeded(filePath)
       fs.appendFileSync(filePath, `${JSON.stringify(record)}\n`, "utf8")
     } catch {
       // Tracing must never break protocol handling.
+    }
+  }
+
+  private static rotateTraceIfNeeded(filePath: string): void {
+    const maxBytes = this.maxTraceBytes()
+    if (maxBytes <= 0) return
+
+    const now = Date.now()
+    if (now - this.lastTraceSizeCheckAt < this.TRACE_SIZE_CHECK_INTERVAL_MS) {
+      return
+    }
+    this.lastTraceSizeCheckAt = now
+
+    try {
+      const stat = fs.statSync(filePath)
+      if (stat.size < maxBytes) return
+
+      const rotatedPath = `${filePath}.1`
+      try {
+        fs.rmSync(rotatedPath, { force: true })
+        fs.renameSync(filePath, rotatedPath)
+      } catch {
+        fs.truncateSync(filePath, 0)
+      }
+    } catch {
+      // Missing/unreadable trace file: nothing to rotate.
     }
   }
 

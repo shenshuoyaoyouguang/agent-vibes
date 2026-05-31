@@ -144,6 +144,18 @@ export function findToolResultAppendPlan(
       message.role === "assistant" &&
       extractToolUseIds(message.content).has(toolCallId)
     ) {
+      const immediateNext = messages[index + 1]
+      if (
+        immediateNext?.role === "user" &&
+        isToolResultOnlyUserMessage(immediateNext.content)
+      ) {
+        return {
+          mode: "merge_into_existing_user_message",
+          assistantMessageIndex: index,
+          userMessageIndex: index + 1,
+        }
+      }
+
       return trailingUserResultMessageIndex == null
         ? {
             mode: "append_new_user_message",
@@ -156,12 +168,11 @@ export function findToolResultAppendPlan(
           }
     }
 
-    // A non-tool-result user message breaks the contiguous run of
-    // tool-result-only user messages.  Reset the trailing index so we
-    // don't attempt to merge across a separating user message.
-    if (message.role === "user") {
-      trailingUserResultMessageIndex = undefined
-    }
+    // Any non-matching envelope breaks the contiguous run of tool-result-only
+    // user messages.  Reset the trailing index so we don't merge a result
+    // across an intervening assistant turn, which would create:
+    // assistant(tool_use A), assistant(tool_use B), user(tool_result A).
+    trailingUserResultMessageIndex = undefined
     // Continue scanning instead of breaking — the matching assistant
     // message may be further back when non-tool user messages or
     // non-matching assistant messages intervene.
@@ -284,4 +295,64 @@ export function formatLineNumberedSnippet(
     endLine: visibleEnd,
     truncated: lineCount > visibleCount,
   }
+}
+
+/**
+ * Order buffered tool_result ids for the per-turn join barrier flush.
+ *
+ * The join barrier holds every tool_result of a multi-member assistant
+ * batch until the last one settles, then flushes them in the model's
+ * DECLARATION order so the persisted message log is born well-ordered
+ * (eliminating the "第 1 类" displaced-tool_result repair).
+ *
+ * Flush order rules:
+ *   1. Every id present in `declarationOrder` is emitted first, in that
+ *      exact order — but only if it was actually buffered.
+ *   2. Any buffered id NOT named in `declarationOrder` (defensive: should
+ *      not normally happen) is appended afterwards in ascending
+ *      `arrivalSeq` order so this function never silently drops one.
+ *      NOTE: the caller (`flushBufferedToolResults`) deliberately does NOT
+ *      write these — a non-declared buffered id can only be a stale leftover
+ *      from a prior/abandoned batch, and emitting it would inject a stale
+ *      tool_result into the current turn. The ordering here is kept purely so
+ *      the contract is total and testable; the service drops non-declared ids.
+ *   3. Duplicates are emitted once.
+ *
+ * Pure function over ids + arrival sequence so the ordering contract can
+ * be unit-tested without the stream service's ~100 dependencies.
+ */
+export function orderBufferedToolResultIdsForFlush(
+  declarationOrder: string[],
+  buffered: Array<{ toolCallId: string; arrivalSeq: number }>
+): string[] {
+  const bufferedById = new Map<string, number>()
+  for (const entry of buffered) {
+    if (
+      typeof entry.toolCallId === "string" &&
+      entry.toolCallId.length > 0 &&
+      !bufferedById.has(entry.toolCallId)
+    ) {
+      bufferedById.set(entry.toolCallId, entry.arrivalSeq)
+    }
+  }
+
+  const ordered: string[] = []
+  const emitted = new Set<string>()
+
+  for (const toolCallId of declarationOrder) {
+    if (bufferedById.has(toolCallId) && !emitted.has(toolCallId)) {
+      ordered.push(toolCallId)
+      emitted.add(toolCallId)
+    }
+  }
+
+  const stragglers = [...bufferedById.entries()]
+    .filter(([toolCallId]) => !emitted.has(toolCallId))
+    .sort((a, b) => a[1] - b[1])
+  for (const [toolCallId] of stragglers) {
+    ordered.push(toolCallId)
+    emitted.add(toolCallId)
+  }
+
+  return ordered
 }

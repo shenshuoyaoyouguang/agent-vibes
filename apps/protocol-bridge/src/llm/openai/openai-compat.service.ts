@@ -1,7 +1,7 @@
 /**
  * OpenAI-Compatible Backend Service
  *
- * Translates Claude/Anthropic Messages API requests into standard OpenAI
+ * Translates Claude/Anthropic API requests into standard OpenAI
  * Chat Completions API format for forwarding to third-party providers
  * (e.g. one-api, new-api, or any OpenAI-compatible endpoint).
  *
@@ -14,26 +14,23 @@ import { Injectable, Logger, OnModuleInit } from "@nestjs/common"
 import { ConfigService } from "@nestjs/config"
 import * as crypto from "crypto"
 import * as fs from "fs"
+import { PersistenceService } from "../../persistence"
 import type { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
 import type { AnthropicResponse, ContentBlock } from "../../shared/anthropic"
 import { getAccountConfigPathCandidates } from "../../shared/protocol-bridge-paths"
-import { PersistenceService } from "../../persistence"
 import { UsageStatsService } from "../../usage"
-import { translateClaudeToCodex } from "./codex-request-translator"
-import { resolveThinkingIntentFromDto } from "../shared/thinking-intent"
 import {
-  createStreamState as createCodexStreamState,
-  translateCodexSseEvent,
-  translateCodexToClaudeNonStream,
-} from "./codex-response-translator"
-import { buildReverseMapFromClaudeTools } from "./tool-name-shortener"
+  createAbortPromise,
+  createAbortSignalWithTimeout,
+  toUpstreamRequestAbortedError,
+} from "../shared/abort-signal"
 import {
   type CooldownableAccount,
   clearAccountDisablement,
   disableAccount,
+  getEarliestRecovery,
   isAccountAvailableForModel,
   isAccountDisabled,
-  getEarliestRecovery,
   markAccountCooldown,
   markAccountSuccess,
   pickAvailableAccount,
@@ -50,12 +47,15 @@ import {
   BackendPoolEntryState,
   BackendPoolStatus,
 } from "../shared/backend-pool-status"
-import {
-  createAbortPromise,
-  createAbortSignalWithTimeout,
-  toUpstreamRequestAbortedError,
-} from "../shared/abort-signal"
 import { sanitizeOpenAiChatToolCallIntegrity } from "../shared/openai-tool-call-integrity"
+import { resolveThinkingIntentFromDto } from "../shared/thinking-intent"
+import { translateClaudeToCodex } from "./codex-request-translator"
+import {
+  createStreamState as createCodexStreamState,
+  translateCodexSseEvent,
+  translateCodexToClaudeNonStream,
+} from "./codex-response-translator"
+import { buildReverseMapFromClaudeTools } from "./tool-name-shortener"
 
 // ── Types for OpenAI Chat Completions API ──────────────────────────────
 

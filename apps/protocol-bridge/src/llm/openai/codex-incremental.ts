@@ -7,7 +7,24 @@ export interface CodexLastResponseSnapshot {
 
 export type CodexIncrementalInputResult =
   | { ok: true; input: CodexInputItem[] }
-  | { ok: false; reason: "static_fields_changed" | "input_not_extension" }
+  | {
+      ok: false
+      reason: "static_fields_changed"
+      changedStaticKeys: string[]
+    }
+  | {
+      ok: false
+      reason: "input_not_extension"
+      inputMismatch: CodexInputMismatch
+    }
+
+export interface CodexInputMismatch {
+  baselineLength: number
+  requestLength: number
+  mismatchIndex?: number
+  baselineType?: string
+  requestType?: string
+}
 
 const TRANSPORT_ONLY_REQUEST_FIELDS = new Set([
   "input",
@@ -51,11 +68,13 @@ export function getCodexIncrementalInput(
   lastResponse: CodexLastResponseSnapshot,
   allowEmptyDelta: boolean
 ): CodexIncrementalInputResult {
-  if (
-    codexRequestIncrementalSignature(request) !==
-    codexRequestIncrementalSignature(previousRequest)
-  ) {
-    return { ok: false, reason: "static_fields_changed" }
+  const changedStaticKeys = diffCodexStaticRequestKeys(request, previousRequest)
+  if (changedStaticKeys.length > 0) {
+    return {
+      ok: false,
+      reason: "static_fields_changed",
+      changedStaticKeys,
+    }
   }
 
   const previousInput = getCodexInputItems(previousRequest)
@@ -65,7 +84,14 @@ export function getCodexIncrementalInput(
     requestInput.length < baseline.length ||
     (!allowEmptyDelta && requestInput.length === baseline.length)
   ) {
-    return { ok: false, reason: "input_not_extension" }
+    return {
+      ok: false,
+      reason: "input_not_extension",
+      inputMismatch: {
+        baselineLength: baseline.length,
+        requestLength: requestInput.length,
+      },
+    }
   }
 
   for (let index = 0; index < baseline.length; index++) {
@@ -73,11 +99,48 @@ export function getCodexIncrementalInput(
       stableCodexJsonStringify(requestInput[index]) !==
       stableCodexJsonStringify(baseline[index])
     ) {
-      return { ok: false, reason: "input_not_extension" }
+      return {
+        ok: false,
+        reason: "input_not_extension",
+        inputMismatch: {
+          baselineLength: baseline.length,
+          requestLength: requestInput.length,
+          mismatchIndex: index,
+          baselineType: getCodexInputItemType(baseline[index]),
+          requestType: getCodexInputItemType(requestInput[index]),
+        },
+      }
     }
   }
 
   return { ok: true, input: requestInput.slice(baseline.length) }
+}
+
+function diffCodexStaticRequestKeys(
+  request: Record<string, unknown>,
+  previousRequest: Record<string, unknown>
+): string[] {
+  const current = stripCodexRequestForIncrementalCompare(request)
+  const previous = stripCodexRequestForIncrementalCompare(previousRequest)
+  const keys = new Set([...Object.keys(current), ...Object.keys(previous)])
+  const changed: string[] = []
+  for (const key of [...keys].sort()) {
+    if (
+      stableCodexJsonStringify(current[key]) !==
+      stableCodexJsonStringify(previous[key])
+    ) {
+      changed.push(key)
+    }
+  }
+  return changed
+}
+
+function getCodexInputItemType(item: CodexInputItem | undefined): string {
+  const type =
+    item && typeof (item as { type?: unknown }).type === "string"
+      ? ((item as { type: string }).type || "").trim()
+      : ""
+  return type || "unknown"
 }
 
 function getCodexInputItems(

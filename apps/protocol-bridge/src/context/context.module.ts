@@ -1,21 +1,24 @@
 import { Module } from "@nestjs/common"
+import { CompactWarningHookService } from "./compact-warning-hook.service"
+import { CompactWarningStateService } from "./compact-warning-state.service"
 import { ContextAttachmentBuilderService } from "./context-attachment-builder.service"
 import { CodexContextAdapterService } from "./codex-context-adapter.service"
+import { ContextCollapseService } from "./context-collapse.service"
 import { ContextCompactRunnerService } from "./context-compact-runner.service"
 import { ContextCompactionService } from "./context-compaction.service"
 import { ContextHookExecutorService } from "./context-hook-executor.service"
 import { ContextManagerService } from "./context-manager.service"
-import { ContextNativeCacheEditService } from "./context-native-cache-edit.service"
 import { ContextNativeManagementService } from "./context-native-management.service"
 import { ContextPipelineService } from "./context-pipeline.service"
 import { ContextProjectionService } from "./context-projection.service"
 import { ContextRequestPlannerService } from "./context-request-planner.service"
 import { ContextTelemetryService } from "./context-telemetry.service"
 import { ContextUsageLedgerService } from "./context-usage-ledger.service"
+import { PostCompactCleanupService } from "./post-compact-cleanup.service"
+import { ReasoningMemoryService } from "./reasoning-memory.service"
 import { TokenCounterService } from "./token-counter.service"
 import { SessionMemoryCompactionService } from "./session-memory-compaction.service"
 import { ToolIntegrityService } from "./tool-integrity.service"
-import { ToolResultCompactionService } from "./tool-result-compaction.service"
 import { ToolResultStorageService } from "./tool-result-storage.service"
 
 /**
@@ -25,14 +28,13 @@ import { ToolResultStorageService } from "./tool-result-storage.service"
  *
  * Components:
  * - TokenCounterService: Accurate token counting (tiktoken)
- * - ToolIntegrityService: Tool use/result pair integrity
+ * - ToolIntegrityService: Tool-pair-aware truncation helpers (no repair)
  * - ContextProjectionService: Read-time API view over transcript + compaction boundary
  * - ContextCompactRunnerService: No-tools backend compact-summary execution
  * - ContextCompactionService: Boundary-based compaction + explicit budget failure
  * - ContextManagerService: Single orchestration entry point for session and stateless requests
  * - ContextRequestPlannerService: Request budget + pre-send projection planner
  * - ContextNativeManagementService: Provider-native context edit strategy builder
- * - ContextNativeCacheEditService: Claude cache-edit lifecycle for warm prompt-cache tool-result deletion
  * - SessionMemoryCompactionService: Durable structured memory extracted at compaction boundaries
  * - ContextTelemetryService: Lightweight in-memory event counters for diagnostics
  *
@@ -45,10 +47,13 @@ import { ToolResultStorageService } from "./tool-result-storage.service"
   providers: [
     TokenCounterService,
     CodexContextAdapterService,
+    CompactWarningStateService,
+    CompactWarningHookService,
+    PostCompactCleanupService,
     ToolIntegrityService,
-    ToolResultCompactionService,
     ToolResultStorageService,
     ContextAttachmentBuilderService,
+    ContextCollapseService,
     ContextCompactRunnerService,
     ContextPipelineService,
     ContextProjectionService,
@@ -57,18 +62,21 @@ import { ToolResultStorageService } from "./tool-result-storage.service"
     ContextCompactionService,
     ContextHookExecutorService,
     ContextManagerService,
-    ContextNativeCacheEditService,
     ContextNativeManagementService,
     ContextRequestPlannerService,
+    ReasoningMemoryService,
     SessionMemoryCompactionService,
   ],
   exports: [
     TokenCounterService,
     CodexContextAdapterService,
+    CompactWarningStateService,
+    CompactWarningHookService,
+    PostCompactCleanupService,
     ToolIntegrityService,
-    ToolResultCompactionService,
     ToolResultStorageService,
     ContextAttachmentBuilderService,
+    ContextCollapseService,
     ContextCompactRunnerService,
     ContextPipelineService,
     ContextProjectionService,
@@ -77,9 +85,9 @@ import { ToolResultStorageService } from "./tool-result-storage.service"
     ContextCompactionService,
     ContextHookExecutorService,
     ContextManagerService,
-    ContextNativeCacheEditService,
     ContextNativeManagementService,
     ContextRequestPlannerService,
+    ReasoningMemoryService,
     SessionMemoryCompactionService,
   ],
 })

@@ -1,11 +1,11 @@
 export { AuthController } from "./controllers/auth.controller"
-export { ChatSessionManager } from "./session/chat-session.service"
+export { SessionLifecycleService } from "./session/session-lifecycle.service"
 export type {
-  ChatSession,
+  SessionRecord,
   PendingToolCall,
   SessionTodoItem,
   SessionTodoStatus,
-} from "./session/chat-session.service"
+} from "./session/session-lifecycle.service"
 export { CursorAdapterController } from "./controllers/cursor-adapter.controller"
 export { CursorAuthService } from "./cursor-auth.service"
 export { CursorConnectStreamService } from "./cursor-connect-stream.service"

@@ -1,7 +1,30 @@
 import { Logger } from "@nestjs/common"
 import type { FastifyInstance, FastifyRequest } from "fastify"
-import type { Readable } from "stream"
+import { PassThrough, type Readable } from "stream"
 import * as zlib from "zlib"
+
+/**
+ * Augment Fastify's FastifyRequest with a `bidiPayload` property that
+ * the ConnectRPC handler reads from. ContentTypeParser keeps listening
+ * to the underlying payload after `done()` and forwards every chunk
+ * here, so the handler does not have to race the body parser for the
+ * raw HTTP/2 stream.
+ *
+ * Why not use `req.raw` directly? Fastify body-parsers run before the
+ * route handler. For BiDi streams we have to call `done(buffer)` before
+ * the handler can be invoked, but Fastify treats the body as fully
+ * consumed at that point — subsequent chunks emitted by `req.raw` will
+ * be silently dropped during the window between `done()` and the
+ * handler attaching its own `for await` listener (in production this
+ * window can be seconds while the first turn parses 250KB of rules
+ * and tool definitions). Routing later chunks through a PassThrough
+ * we own avoids that race entirely.
+ */
+declare module "fastify" {
+  interface FastifyRequest {
+    bidiPayload?: PassThrough
+  }
+}
 
 /**
  * Register custom content type parsers for gRPC/ConnectRPC.
@@ -34,18 +57,23 @@ export function registerContentTypeParsers(
         return
       }
 
-      // For BiDi streams, we process the first chunk immediately
-      // because the client keeps the stream open for tool results
+      // BiDi data plane: every chunk emitted by `payload` is mirrored to
+      // this PassThrough so the ConnectRPC handler can drain it without
+      // racing Fastify for `req.raw`. We attach the listeners ONCE here
+      // and never detach — anything else opens a window where chunks
+      // emitted between detach and the handler's reattach are dropped.
+      const bidiPayload = new PassThrough()
+      request.bidiPayload = bidiPayload
+
       let firstChunkReceived = false
       let doneCalled = false
-      const chunks: Buffer[] = []
+      const initialChunks: Buffer[] = []
       let firstChunkTimer: NodeJS.Timeout | null = null
       let emptyBodyTimer: NodeJS.Timeout | null = null
-      let onData: (chunk: Buffer) => void = () => undefined
-      let onEnd: () => void = () => undefined
-      let onError: (err: Error) => void = () => undefined
 
-      const cleanup = () => {
+      const settleDone = (err: Error | null, body?: Buffer) => {
+        if (doneCalled) return
+        doneCalled = true
         if (firstChunkTimer) {
           clearTimeout(firstChunkTimer)
           firstChunkTimer = null
@@ -54,50 +82,50 @@ export function registerContentTypeParsers(
           clearTimeout(emptyBodyTimer)
           emptyBodyTimer = null
         }
-        payload.off("data", onData)
-        payload.off("end", onEnd)
-        payload.off("error", onError)
+        done(err, body)
       }
 
       const finalize = (source: string) => {
         if (doneCalled) return
-        doneCalled = true
-        cleanup()
-        const buffer = Buffer.concat(chunks)
+        const buffer = Buffer.concat(initialChunks)
         logger.debug(
           `[ContentTypeParser] application/connect+proto: received ${buffer.length} bytes (${source})`
         )
-        done(null, buffer)
+        settleDone(null, buffer)
       }
 
-      onData = (chunk: Buffer) => {
-        if (doneCalled) {
-          return
-        }
+      const onData = (chunk: Buffer) => {
+        // Mirror EVERY chunk into the BiDi PassThrough — including those
+        // that arrive after `done()` was already called. This is the
+        // critical bit that prevents the IDE's lsResult / readResult
+        // from being silently dropped during the body-parser handoff.
+        bidiPayload.write(chunk)
 
-        logger.debug(
-          `[ContentTypeParser] Received chunk: ${chunk.length} bytes`
-        )
-        chunks.push(chunk)
+        if (!doneCalled) {
+          logger.debug(
+            `[ContentTypeParser] Received chunk: ${chunk.length} bytes`
+          )
+          initialChunks.push(chunk)
 
-        // For BiDi streams, process immediately after first chunk
-        // HTTP/2 BiDi streams don't emit 'end' until client closes
-        if (!firstChunkReceived) {
-          firstChunkReceived = true
-          // Wait a bit longer to allow more data to arrive
-          firstChunkTimer = setTimeout(() => {
-            if (chunks.length > 0 && !doneCalled) {
-              finalize("BiDi first chunk")
-            }
-          }, 50)
+          // For BiDi streams, process immediately after first chunk
+          // HTTP/2 BiDi streams don't emit 'end' until client closes
+          if (!firstChunkReceived) {
+            firstChunkReceived = true
+            // Wait a bit longer to allow more data to arrive
+            firstChunkTimer = setTimeout(() => {
+              if (initialChunks.length > 0 && !doneCalled) {
+                finalize("BiDi first chunk")
+              }
+            }, 50)
+          }
         }
       }
 
-      onEnd = () => {
-        // This may not fire for BiDi streams
+      const onEnd = () => {
         logger.debug(
-          `[ContentTypeParser] application/connect+proto: stream end event, firstChunkReceived=${firstChunkReceived}, chunks=${chunks.length}`
+          `[ContentTypeParser] application/connect+proto: stream end event, firstChunkReceived=${firstChunkReceived}, chunks=${initialChunks.length}`
         )
+        bidiPayload.end()
         if (!doneCalled) {
           // Wait a short time for any pending data
           firstChunkTimer = setTimeout(() => {
@@ -106,19 +134,17 @@ export function registerContentTypeParsers(
         }
       }
 
-      onError = (err: Error) => {
-        cleanup()
+      const onError = (err: Error) => {
         if (err.name === "AbortError" || err.message.includes("aborted")) {
           logger.debug(`[ContentTypeParser] Stream closed (normal disconnect)`)
+          bidiPayload.end()
         } else {
           logger.error(
             `[ContentTypeParser] Error reading stream: ${err.message}`
           )
+          bidiPayload.destroy(err)
         }
-        if (!doneCalled) {
-          doneCalled = true
-          done(err)
-        }
+        settleDone(err)
       }
 
       payload.on("data", onData)
@@ -127,7 +153,7 @@ export function registerContentTypeParsers(
 
       // For HTTP/2, also set a timeout to handle cases where no data arrives
       emptyBodyTimer = setTimeout(() => {
-        if (!doneCalled && chunks.length === 0) {
+        if (!doneCalled && initialChunks.length === 0) {
           logger.warn(
             "[ContentTypeParser] application/connect+proto: timeout with no data, returning empty buffer"
           )

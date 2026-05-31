@@ -21,12 +21,17 @@ import {
   UserMessageSchema,
 } from "../../../gen/agent/v1_pb"
 import { parseModelRequest } from "../../../llm/shared/model-request"
+import { doesModelSupportThinking } from "../../../llm/shared/model-registry"
 import { normalizeRequestedThinkingEffort } from "../../../llm/shared/thinking-intent"
 import { parseCursorVariantString } from "../cursor-model-protocol"
 import {
   getDefaultAgentToolNames,
   isCursorBuiltInToolAllowed,
 } from "./cursor-tool-mapper"
+import {
+  parseSubagentModelOverrides,
+  type SubagentModelOverridesMap,
+} from "../subagents/subagent-model-override"
 import {
   getCursorSkillMetadata,
   normalizeSkillName,
@@ -221,6 +226,20 @@ export interface ParsedCursorRequest {
   thinkingLevel: number
   thinkingDetailsRequested?: boolean
 
+  /**
+   * Per-subagent model selection captured from
+   * `AgentRunRequest.subagent_model_overrides`. Refreshed on every
+   * AgentRun (Cursor sends the full table per turn). Consumers:
+   *   - `ToolUseSummaryService` (helper LLM call for the per-tool-batch
+   *     label) — looks up the synthetic `_tool_use_summary` slot.
+   *   - `executeSubAgentTask` / `spawnBackgroundSubAgent` — looks up
+   *     the real Cursor subagent_type the model named in `task` args.
+   *
+   * Defaults to an empty map (no overrides) for `EXEC` / control
+   * messages and for older clients that don't emit field 20.
+   */
+  subagentModelOverrides?: SubagentModelOverridesMap
+
   // 模式和能力
   unifiedMode: "CHAT" | "AGENT" | "EDIT" | "CUSTOM"
   isAgentic: boolean
@@ -390,6 +409,17 @@ export interface ParsedCursorRequest {
 
 /**
  * Agent 模式 ExecClientMessage 中 oneof 的字段名映射
+ *
+ * @gen/agent/v1_pb 把 protobuf 的 snake_case 字段名转成 camelCase
+ * 暴露给 TypeScript（`shell_result` → `shellResult`），但下游
+ * `cursor-connect-stream.service.ts` 在分支决策里用的是 protobuf 原始
+ * snake_case 名称（例如 `resultCase === "shell_stream"`）。这个 map
+ * 把 oneof case 的 camelCase 还原回 snake_case 标签，保持下游分支
+ * 与 proto 字段一一对应。
+ *
+ * 当 cursor 协议新增 ExecClientMessage 的 oneof case 时，需要在这里
+ * 同步加一项（即使 bridge 自己永远不会主动触发该工具的执行流，
+ * 客户端 IDE 仍可能主动发起这些 precheck/diagnostics 请求）。
  */
 const EXEC_RESULT_CASE_MAP: Record<string, string> = {
   shellResult: "shell_result",
@@ -415,11 +445,18 @@ const EXEC_RESULT_CASE_MAP: Record<string, string> = {
   redactedReadResult: "redacted_read_result",
   forceBackgroundShellResult: "force_background_shell_result",
   forceBackgroundSubagentResult: "force_background_subagent_result",
-  canvasGetUrlResult: "canvas_get_url_result",
-  canvasDestroyResult: "canvas_destroy_result",
-  canvasRegisterResult: "canvas_register_result",
   mcpStateExecResult: "mcp_state_exec_result",
   subagentAwaitResult: "subagent_await_result",
+  // 与最新 cursor agent.v1 ExecClientMessage 对齐：客户端在 IDE 端做
+  // smart-mode 分类、canvas diagnostics、shell/mcp/web_fetch 准入
+  // 检查（allowlist precheck）后会通过 BiDi 上行带这五种结果。
+  // bridge 自身不发起这些工具，但仍需识别字段，避免下游把 camelCase
+  // 字符串当作未知 case 走兜底路径而丢失上下文。
+  smartModeClassifierResult: "smart_mode_classifier_result",
+  canvasDiagnosticsResult: "canvas_diagnostics_result",
+  shellAllowlistPrecheckResult: "shell_allowlist_precheck_result",
+  mcpAllowlistPrecheckResult: "mcp_allowlist_precheck_result",
+  webFetchAllowlistPrecheckResult: "web_fetch_allowlist_precheck_result",
 }
 
 type ParsedBackgroundTaskCompletion = NonNullable<
@@ -1813,6 +1850,34 @@ export class CursorRequestParser {
       req.modelDetails?.modelId
     )
 
+    // Per-subagent model selection (Cursor settings UI: Subagents → Explore /
+    // Plan / ... → "Inherit from parent" | "Disable" | <model>). The proto
+    // ships the full table on every AgentRunRequest so we re-parse here and
+    // hand it to SessionRecord (refreshed-per-turn semantics, mirroring how we
+    // refresh `model` / `thinkingLevel`). Empty result means "no overrides
+    // declared" — every consumer treats that as inherit-from-parent.
+    const subagentModelOverrides = parseSubagentModelOverrides(req)
+    if (!subagentModelOverrides.isEmpty()) {
+      this.logger.debug(
+        `AgentRunRequest subagent_model_overrides: ${subagentModelOverrides
+          .keys()
+          .map((subagentType) => {
+            const decision = subagentModelOverrides.lookup(subagentType)!
+            switch (decision.kind) {
+              case "inherit":
+                return `${subagentType}=inherit`
+              case "disabled":
+                return `${subagentType}=disabled`
+              case "model":
+                return `${subagentType}=${decision.modelId}${decision.maxMode ? "[max]" : ""}`
+              default:
+                return subagentType
+            }
+          })
+          .join(", ")}`
+      )
+    }
+
     // 提取 conversationId
     const conversationId = req.conversationId || undefined
 
@@ -2242,13 +2307,21 @@ export class CursorRequestParser {
     // 推导 thinkingLevel
     // - modelDetails.maxMode 或 requestedModel.maxMode → 最大 thinking (level 2)
     // - modelDetails.thinkingDetails 存在（presence）→ thinking 已启用 (level 1)
+    // - registry 标记 isThinking 的模型 (e.g. claude-opus-4-7-thinking)
+    //   → level 1（契约级，不是猜测：Cursor 暴露这个变体名给用户即承诺
+    //   thinking 开启；registry.doesModelSupportThinking 反映这条契约）。
     //
-    // 不再根据 model-registry 自动猜测 thinking：
-    // Cursor 是否显式请求 think 应以协议字段为准，避免 bridge 擅自开启。
+    // 协议字段（thinkingDetails / maxMode / requestedThinkingLevel）始终
+    // 优先于 registry 兜底——用户的显式偏好覆盖默认承诺。
     const hasThinkingDetails = !!req.modelDetails?.thinkingDetails
     const requestedThinkingLevel = this.resolveRequestedThinkingLevel(
       requestedModelParameters
     )
+    const modelIdForCapability =
+      req.modelDetails?.modelId || req.requestedModel?.modelId || ""
+    const registryDeclaresThinking = modelIdForCapability
+      ? doesModelSupportThinking(modelIdForCapability)
+      : false
     let thinkingLevel = 0
     if (
       modelMaxMode ||
@@ -2261,6 +2334,8 @@ export class CursorRequestParser {
       thinkingLevel = 1
     } else if (requestedThinkingLevel !== undefined) {
       thinkingLevel = requestedThinkingLevel
+    } else if (registryDeclaresThinking) {
+      thinkingLevel = 1
     }
 
     // thinkingDetailsRequested 表示客户端希望看到详细的 thinking 内容（不仅是“启用 thinking”）。
@@ -2273,13 +2348,15 @@ export class CursorRequestParser {
     // - modelDetails.thinkingDetails 存在
     // - requestedModel/modelDetails 进入 maxMode
     // - 通过 requestedModelParameters 解析出非零 thinking level
+    // - registry 契约级别声明 isThinking（如 *-thinking 后缀模型）
     const thinkingDetailsRequested =
       hasThinkingDetails ||
       modelMaxMode ||
       requestedMaxMode ||
       requestedVariantMaxMode ||
       modelDetailsVariantMaxMode ||
-      (requestedThinkingLevel !== undefined && requestedThinkingLevel > 0)
+      (requestedThinkingLevel !== undefined && requestedThinkingLevel > 0) ||
+      registryDeclaresThinking
 
     if (thinkingLevel > 0) {
       this.logger.log(
@@ -2357,6 +2434,7 @@ export class CursorRequestParser {
           resumePendingToolCallIds: statePendingToolCallIds,
           statePendingToolCallIds,
           mcpToolDefs: mcpToolDefs.length > 0 ? mcpToolDefs : undefined,
+          subagentModelOverrides,
         }
       }
 
@@ -2515,6 +2593,7 @@ export class CursorRequestParser {
           requestContextEnv,
           statePendingToolCallIds,
           mcpToolDefs: mcpToolDefs.length > 0 ? mcpToolDefs : undefined,
+          subagentModelOverrides,
         }
       }
 
@@ -2565,6 +2644,7 @@ export class CursorRequestParser {
           agentControlType: "other",
           statePendingToolCallIds,
           mcpToolDefs: mcpToolDefs.length > 0 ? mcpToolDefs : undefined,
+          subagentModelOverrides,
         }
       }
 
@@ -2619,6 +2699,7 @@ export class CursorRequestParser {
       statePendingToolCallIds,
       mcpToolDefs: mcpToolDefs.length > 0 ? mcpToolDefs : undefined,
       attachedImages: attachedImages.length > 0 ? attachedImages : undefined,
+      subagentModelOverrides,
     }
   }
 

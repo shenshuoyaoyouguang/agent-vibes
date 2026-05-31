@@ -1,10 +1,20 @@
 import * as fs from "fs"
 import type { logger as LoggerInstance } from "../utils/logger"
 import { getCursorWorkbenchPath } from "../utils/platform"
+import { CursorChecksumsService } from "./cursor-checksums"
+import { CursorPatchBaselineService } from "./cursor-patch-baseline"
 
 type Logger = typeof LoggerInstance
 
 const BACKUP_SUFFIX = ".transport_backup"
+
+const IDLE_EXTENSION_HOST_KILLER_PATCH: PatchRule = {
+  name: "Disable Cursor Idle Extension Host Killer",
+  find: /async maybeStopExtensionHostsForIdle\(\)\{if\(this\.extensionHostsKilledForIdle\|\|this\.stopExtensionHostsForIdleInFlight\)return;/,
+  replace:
+    "async maybeStopExtensionHostsForIdle(){/*[AGENT_VIBES_DISABLE_IDLE_EXTENSION_HOST_KILLER]*/return;if(this.extensionHostsKilledForIdle||this.stopExtensionHostsForIdleInFlight)return;",
+  marker: "[AGENT_VIBES_DISABLE_IDLE_EXTENSION_HOST_KILLER]",
+}
 
 /**
  * Patch rules for Cursor's workbench.desktop.main.js.
@@ -19,6 +29,7 @@ interface PatchRule {
 }
 
 const TRANSPORT_PATCHES: PatchRule[] = [
+  IDLE_EXTENSION_HOST_KILLER_PATCH,
   {
     name: "Transport Request Initiation",
     find: /this\.structuredLogService\.debug\("transport","Initiating stream AI connect",\{service:e\.typeName,method:t\.name,streamId:(\w+),requestId:(\w+)\?\?"not-found"/,
@@ -74,15 +85,123 @@ export interface PatchStatus {
   isPatched: boolean
 }
 
+export interface CursorSinglePatchStatus {
+  filePath: string | null
+  fileExists: boolean
+  applied: boolean
+  canApply: boolean
+  managedBaseline: boolean
+  legacyBackupExists: boolean
+  legacyBackupClean: boolean
+}
+
+export interface CursorPatchApplyResult {
+  success: boolean
+  applied: number
+  checksumApplied: boolean
+  checksumUpdated: number
+  errors: string[]
+}
+
 /**
  * CursorPatchService — Manages patching and restoring Cursor's
  * workbench.desktop.main.js to inject transport-layer traffic capture.
  */
 export class CursorPatchService {
   private readonly logger: Logger
+  private readonly baseline = new CursorPatchBaselineService()
+  private readonly checksums = new CursorChecksumsService()
 
   constructor(logger: Logger) {
     this.logger = logger
+  }
+
+  getIdleExtensionHostKillerStatus(): CursorSinglePatchStatus {
+    const filePath = getCursorWorkbenchPath()
+    const result: CursorSinglePatchStatus = {
+      filePath,
+      fileExists: false,
+      applied: false,
+      canApply: false,
+      managedBaseline: false,
+      legacyBackupExists: false,
+      legacyBackupClean: false,
+    }
+
+    if (!filePath || !fs.existsSync(filePath)) {
+      return result
+    }
+
+    result.fileExists = true
+    result.managedBaseline = this.baseline.hasOriginal(filePath)
+    const legacyBackupPath = filePath + BACKUP_SUFFIX
+    result.legacyBackupExists = fs.existsSync(legacyBackupPath)
+    if (result.legacyBackupExists) {
+      const backupContent = fs.readFileSync(legacyBackupPath, "utf-8")
+      result.legacyBackupClean = !backupContent.includes(
+        IDLE_EXTENSION_HOST_KILLER_PATCH.marker
+      )
+    }
+
+    const content = fs.readFileSync(filePath, "utf-8")
+    result.applied = content.includes(IDLE_EXTENSION_HOST_KILLER_PATCH.marker)
+    result.canApply =
+      result.applied || IDLE_EXTENSION_HOST_KILLER_PATCH.find.test(content)
+
+    return result
+  }
+
+  applyIdleExtensionHostKillerPatch(): CursorPatchApplyResult {
+    const filePath = getCursorWorkbenchPath()
+    if (!filePath || !fs.existsSync(filePath)) {
+      return {
+        success: false,
+        applied: 0,
+        checksumApplied: false,
+        checksumUpdated: 0,
+        errors: ["Cursor workbench file not found"],
+      }
+    }
+
+    const content = fs.readFileSync(filePath, "utf-8")
+    if (content.includes(IDLE_EXTENSION_HOST_KILLER_PATCH.marker)) {
+      if (!this.baseline.hasOriginal(filePath)) {
+        const legacyBackupPath = filePath + BACKUP_SUFFIX
+        if (fs.existsSync(legacyBackupPath)) {
+          const backupContent = fs.readFileSync(legacyBackupPath, "utf-8")
+          if (
+            !backupContent.includes(IDLE_EXTENSION_HOST_KILLER_PATCH.marker)
+          ) {
+            this.baseline.captureOriginalFromFile(filePath, legacyBackupPath)
+            this.logger.info(
+              "Captured existing Cursor idle killer patch baseline from legacy backup"
+            )
+          }
+        }
+      }
+      return this.finalizePatchApply({ applied: 0, forceChecksum: true })
+    }
+
+    if (!IDLE_EXTENSION_HOST_KILLER_PATCH.find.test(content)) {
+      return {
+        success: false,
+        applied: 0,
+        checksumApplied: false,
+        checksumUpdated: 0,
+        errors: [
+          "Pattern not found: Disable Cursor Idle Extension Host Killer",
+        ],
+      }
+    }
+
+    this.baseline.ensureOriginals([filePath])
+    const nextContent = content.replace(
+      IDLE_EXTENSION_HOST_KILLER_PATCH.find,
+      IDLE_EXTENSION_HOST_KILLER_PATCH.replace
+    )
+    fs.writeFileSync(filePath, nextContent, "utf-8")
+    this.logger.info("Applied patch: Disable Cursor Idle Extension Host Killer")
+    return this.finalizePatchApply({ applied: 1 })
   }
 
   /** Get the current patch status of the Cursor installation */
@@ -116,7 +235,7 @@ export class CursorPatchService {
   }
 
   /** Apply transport patches to Cursor workbench */
-  applyPatches(): { success: boolean; applied: number; errors: string[] } {
+  applyPatches(): CursorPatchApplyResult {
     const errors: string[] = []
     const filePath = getCursorWorkbenchPath()
 
@@ -124,6 +243,8 @@ export class CursorPatchService {
       return {
         success: false,
         applied: 0,
+        checksumApplied: false,
+        checksumUpdated: 0,
         errors: ["Cursor workbench file not found"],
       }
     }
@@ -136,6 +257,8 @@ export class CursorPatchService {
         return {
           success: false,
           applied: 0,
+          checksumApplied: false,
+          checksumUpdated: 0,
           errors: [
             "Cannot create clean backup — file is already patched. Reinstall Cursor first.",
           ],
@@ -167,7 +290,63 @@ export class CursorPatchService {
       fs.writeFileSync(filePath, content, "utf-8")
     }
 
-    return { success: errors.length === 0, applied, errors }
+    return this.finalizePatchApply({ applied, errors })
+  }
+
+  private finalizePatchApply(input: {
+    applied: number
+    errors?: string[]
+    forceChecksum?: boolean
+  }): CursorPatchApplyResult {
+    const patchErrors = input.errors ?? []
+    const shouldApplyChecksum =
+      input.applied > 0 || input.forceChecksum === true
+    if (!shouldApplyChecksum) {
+      return {
+        success: patchErrors.length === 0,
+        applied: input.applied,
+        checksumApplied: false,
+        checksumUpdated: 0,
+        errors: patchErrors,
+      }
+    }
+
+    const checksumResult = this.applyChecksumsAfterPatch()
+    const errors = [...patchErrors, ...checksumResult.errors]
+    return {
+      success: errors.length === 0,
+      applied: input.applied,
+      checksumApplied: checksumResult.applied,
+      checksumUpdated: checksumResult.updated,
+      errors,
+    }
+  }
+
+  private applyChecksumsAfterPatch(): {
+    applied: boolean
+    updated: number
+    errors: string[]
+  } {
+    const status = this.checksums.getStatus()
+    if (!status.productExists || !status.hasChecksums) {
+      return { applied: false, updated: 0, errors: [] }
+    }
+
+    const result = this.checksums.apply()
+    if (!result.success) {
+      return {
+        applied: false,
+        updated: 0,
+        errors: result.errors.map(
+          (error) => `Checksum repair failed: ${error}`
+        ),
+      }
+    }
+
+    this.logger.info(
+      `Applied Cursor checksum repair after patch (updated=${result.updated})`
+    )
+    return { applied: true, updated: result.updated, errors: [] }
   }
 
   /** Restore Cursor workbench from backup */

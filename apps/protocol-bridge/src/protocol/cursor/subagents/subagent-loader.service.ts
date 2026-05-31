@@ -1,6 +1,7 @@
 /**
- * Loads custom sub-agent definitions from `.cursor/agents/*.md` (project)
- * and `~/.cursor/agents/*.md` (user).
+ * Loads custom sub-agent definitions from project `.cursor/agents`
+ * (each definition a `.md` file under the project root) and user
+ * `~/.cursor/agents` (same shape, user scope).
  *
  * Mirrors claude-code/packages/builtin-tools/src/tools/AgentTool/
  * loadAgentsDir.ts, but adapted to the bridge:
@@ -8,14 +9,15 @@
  *     and project, so we keep the loader to those two scopes.
  *   - The frontmatter shape (`name`, `description`, optional `tools`,
  *     `disallowedTools`, `model`, `maxTurns`) is exactly what
- *     `claude-code` parses, so a `.cursor/agents/*.md` file authored for
+ *     `claude-code` parses, so an `agents` markdown file authored for
  *     plain Cursor / claude-code drops in with no rewriting.
  *   - Project-scope wins on name conflicts, matching Cursor's documented
  *     precedence ("Project subagents take precedence when names conflict").
  *
  * The loader is read-on-demand and cheap (one `readdir` + per-file
- * `readFile`), so we don't aggressively memoise — `getCustomSubagents()`
- * is invoked once per `task` tool dispatch.
+ * `readFile`); we add a short-TTL fingerprint cache below so tool-result
+ * continuation loops in the cursor stream service don't re-tokenize and
+ * re-parse the same markdown files dozens of times per turn.
  */
 
 import { Injectable, Logger } from "@nestjs/common"
@@ -37,9 +39,57 @@ interface ParsedSubagentFrontmatter {
   maxTurns?: number
 }
 
+/**
+ * Cache-key fingerprint for a single `.cursor/agents` directory.
+ *
+ * Composed of the directory's listed `.md` filenames each annotated
+ * with `(mtimeMs, size)`.  Sorted to make the comparison
+ * order-insensitive (file-system order is not contractual).
+ *
+ * If the fingerprint matches a cached one, the directory's contents
+ * are guaranteed to be byte-identical to last time — POSIX `mtime`
+ * resolution is sub-millisecond on every supported platform, and
+ * `size` catches the edge case of a same-millisecond rewrite that
+ * preserves length.
+ */
+type DirectoryFingerprint = string
+
+/**
+ * Per-directory cache entry.  We track the fingerprint that produced
+ * the cached definitions, plus the wall-clock time of the last
+ * fingerprint computation, so warm-path reads can elide the stat
+ * sweep entirely within a short TTL.
+ */
+interface DirectoryCacheEntry {
+  fingerprint: DirectoryFingerprint
+  fingerprintedAt: number
+  definitions: ReadonlyArray<CustomSubagentDefinition>
+}
+
+/**
+ * Window during which we accept the cached fingerprint without
+ * re-stating the directory.  Short enough that a developer editing
+ * a `.cursor/agents` markdown file mid-session will see the change on
+ * the next turn (turn boundaries are typically ≥ 1 s of network +
+ * model latency anyway), long enough that a tool-result
+ * continuation burst within a single turn never touches the
+ * filesystem more than once.
+ */
+const DIRECTORY_FINGERPRINT_TTL_MS = 1000
+
 @Injectable()
 export class SubagentLoaderService {
   private readonly logger = new Logger(SubagentLoaderService.name)
+
+  /**
+   * Per-directory cache, keyed by absolute directory path.
+   *
+   * Two directories can be active simultaneously (one user, one
+   * project), and the same project path can be revisited across
+   * sessions, so the cache is keyed on the absolute resolved path
+   * rather than the `(scope, cwd)` pair the public API uses.
+   */
+  private readonly directoryCache: Map<string, DirectoryCacheEntry> = new Map()
 
   /**
    * Load all custom subagent definitions from disk. Project entries
@@ -71,24 +121,85 @@ export class SubagentLoaderService {
     dir: string,
     source: "user" | "project"
   ): CustomSubagentDefinition[] {
+    const cached = this.directoryCache.get(dir)
+    const now = Date.now()
+    // Hot path: within the TTL window we trust the cache without
+    // touching the filesystem at all.  This is what makes the
+    // tool-result continuation loop on cursor-connect-stream IO-free
+    // on its warm-path verify.
+    if (cached && now - cached.fingerprintedAt < DIRECTORY_FINGERPRINT_TTL_MS) {
+      return [...cached.definitions]
+    }
+
     let entries: string[]
     try {
       const stats = statSync(dir)
-      if (!stats.isDirectory()) return []
+      if (!stats.isDirectory()) {
+        // The directory disappeared (or was never present).  Drop the
+        // cache entry rather than serving stale definitions.
+        this.directoryCache.delete(dir)
+        return []
+      }
       entries = readdirSync(dir)
     } catch {
       // Directory does not exist — that's the normal case, not an error.
+      this.directoryCache.delete(dir)
       return []
     }
 
+    // Cool path: TTL expired, but the contents may still be unchanged.
+    // Build a stat-only fingerprint (cheap — one `statSync` per .md
+    // file) and short-circuit if it matches the cached fingerprint.
+    const mdEntries = entries.filter((entry) =>
+      entry.toLowerCase().endsWith(".md")
+    )
+    const fingerprint = this.computeDirectoryFingerprint(dir, mdEntries)
+    if (cached && cached.fingerprint === fingerprint) {
+      // Refresh the TTL so the next warm path gets the cheap path
+      // again, but do not re-parse the files.
+      cached.fingerprintedAt = now
+      return [...cached.definitions]
+    }
+
+    // Cold path: re-parse every .md file.  This is what the loader
+    // used to do unconditionally on every call.
     const result: CustomSubagentDefinition[] = []
-    for (const entry of entries) {
-      if (!entry.toLowerCase().endsWith(".md")) continue
+    for (const entry of mdEntries) {
       const filePath = join(dir, entry)
       const definition = this.loadFromFile(filePath, source)
       if (definition) result.push(definition)
     }
+    this.directoryCache.set(dir, {
+      fingerprint,
+      fingerprintedAt: now,
+      definitions: result,
+    })
     return result
+  }
+
+  /**
+   * Build a fingerprint from `(filename, mtimeMs, size)` triples.
+   * Files that fail to stat are folded into the fingerprint as an
+   * `?` placeholder so a transient EACCES still produces a stable
+   * key (the next call retries naturally because the cache compares
+   * fingerprints, not error states).
+   */
+  private computeDirectoryFingerprint(
+    dir: string,
+    mdEntries: string[]
+  ): DirectoryFingerprint {
+    const parts: string[] = []
+    for (const entry of mdEntries) {
+      const full = join(dir, entry)
+      try {
+        const stat = statSync(full)
+        parts.push(`${entry}:${stat.mtimeMs}:${stat.size}`)
+      } catch {
+        parts.push(`${entry}:?`)
+      }
+    }
+    parts.sort()
+    return parts.join("|")
   }
 
   private loadFromFile(

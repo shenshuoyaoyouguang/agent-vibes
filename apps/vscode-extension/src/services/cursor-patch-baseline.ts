@@ -88,6 +88,71 @@ export class CursorPatchBaselineService {
     return fs.existsSync(backupPath)
   }
 
+  captureOriginalFromFile(filePath: string, sourceFilePath: string): string[] {
+    const appRootPath = getCursorAppRootPath()
+    if (!appRootPath) {
+      throw new Error("Cursor installation not found")
+    }
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`Cursor file not found: ${filePath}`)
+    }
+    if (!fs.existsSync(sourceFilePath)) {
+      throw new Error(`Cursor baseline source not found: ${sourceFilePath}`)
+    }
+
+    const installVersion = getCursorInstallVersion()
+    const installFingerprint = getCursorInstallFingerprint()
+    const status = this.getStatus()
+    const backupRootPath = status.backupRootPath
+    const manifestPath = status.manifestPath
+    if (!backupRootPath || !manifestPath) {
+      throw new Error("Cursor patch backup paths are unavailable")
+    }
+
+    ensureDir(backupRootPath)
+
+    const manifest =
+      this.readManifest(manifestPath) ??
+      ({
+        version: 1,
+        appRootPath,
+        installVersion,
+        installFingerprint,
+        files: [],
+      } satisfies CursorPatchManifest)
+
+    const relativePath = path.relative(appRootPath, filePath)
+    if (
+      relativePath.startsWith("..") ||
+      path.isAbsolute(relativePath) ||
+      relativePath.length === 0
+    ) {
+      throw new Error(`File is outside Cursor app root: ${filePath}`)
+    }
+
+    const backupPath = this.getBackupFilePath(
+      appRootPath,
+      installFingerprint,
+      relativePath
+    )
+
+    const added: string[] = []
+    if (!fs.existsSync(backupPath)) {
+      ensureDir(path.dirname(backupPath))
+      fs.copyFileSync(sourceFilePath, backupPath)
+      added.push(relativePath)
+    }
+
+    if (!manifest.files.includes(relativePath)) {
+      manifest.files.push(relativePath)
+      added.push(relativePath)
+    }
+
+    manifest.files.sort()
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n")
+    return Array.from(new Set(added))
+  }
+
   ensureOriginals(filePaths: string[]): string[] {
     const appRootPath = getCursorAppRootPath()
     if (!appRootPath) {

@@ -4,6 +4,19 @@ import * as vscode from "vscode"
 import { ensureDir, getDefaultDataDir } from "../utils/platform"
 
 /**
+ * Normalize a raw Kiro `authMethod` value to one of the three canonical
+ * methods the bridge understands. Mirrors the classification in
+ * `KiroService.findMatchingEntryIndex` so dashboard-side identity matching
+ * stays consistent with how the bridge pins accounts.
+ */
+function normalizeKiroAuthMethod(value: string | undefined): string {
+  const raw = (value || "").trim().toLowerCase()
+  if (raw === "api_key" || raw === "apikey") return "api_key"
+  if (raw === "social") return "social"
+  return "idc"
+}
+
+/**
  * Manages the extension's configuration and data directory (~/.agent-vibes/).
  */
 export class ConfigManager {
@@ -268,6 +281,73 @@ export class ConfigManager {
 
     if (nextAccounts.length !== accounts.length) {
       this.writeAccounts(filePath, nextAccounts)
+    }
+  }
+
+  /**
+   * Remove a Kiro account by stable identity rather than array position.
+   *
+   * Kiro entries have no single id field, so we match on the same composite
+   * identity the bridge uses to pin an account
+   * (`KiroService.findMatchingEntryIndex`): authMethod + region, then the
+   * refresh/access token (api_key accounts match on the key itself, IdC
+   * accounts may fall back to clientId). This makes removal immune to the
+   * bridge reordering/refreshing `kiro-accounts.json` between render and
+   * click, which previously caused the wrong account to be deleted.
+   */
+  removeKiroAccount(
+    filePath: string,
+    identity: {
+      authMethod?: string
+      region?: string
+      refreshToken?: string
+      accessToken?: string
+      clientId?: string
+      kiroApiKey?: string
+    }
+  ): void {
+    const norm = (value: unknown): string =>
+      typeof value === "string" ? value.trim() : ""
+    const normRegion = (value: unknown): string => norm(value) || "us-east-1"
+
+    const wantAuth = normalizeKiroAuthMethod(identity.authMethod)
+    const wantRegion = normRegion(identity.region)
+    const wantRefresh = norm(identity.refreshToken)
+    const wantAccess = norm(identity.accessToken)
+    const wantClient = norm(identity.clientId)
+    const wantApiKey = norm(identity.kiroApiKey)
+
+    const accounts = this.readAccounts(filePath)
+    const idx = accounts.findIndex((entry) => {
+      const entryAuth = normalizeKiroAuthMethod(
+        entry.authMethod as string | undefined
+      )
+      if (entryAuth !== wantAuth) return false
+      if (normRegion(entry.region) !== wantRegion) return false
+
+      if (wantAuth === "api_key") {
+        const entryApiKey = norm(entry.kiroApiKey)
+        return wantApiKey !== "" && wantApiKey === entryApiKey
+      }
+
+      // Refresh token is the most stable anchor (survives access-token
+      // refresh); fall back to access token, then clientId for IdC.
+      const entryRefresh = norm(entry.refreshToken)
+      if (wantRefresh && entryRefresh && wantRefresh === entryRefresh) {
+        return true
+      }
+      const entryAccess = norm(entry.accessToken)
+      if (wantAccess && entryAccess && wantAccess === entryAccess) {
+        return true
+      }
+      if (wantAuth !== "idc") return false
+      const entryClient = norm(entry.clientId)
+      return wantClient !== "" && wantClient === entryClient
+    })
+
+    if (idx >= 0) {
+      accounts.splice(idx, 1)
+      this.writeAccounts(filePath, accounts)
     }
   }
 

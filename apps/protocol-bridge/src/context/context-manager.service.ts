@@ -86,7 +86,6 @@ export class ContextManagerService {
       predictiveCompactTokenLimit?: number
       integrityMode?: "strict-adjacent" | "global"
       pendingToolUseIds?: Iterable<string>
-      nativeCacheEdits?: boolean
       strategy?: "auto" | "manual" | "reactive"
       dryRun?: boolean
     }
@@ -104,7 +103,6 @@ export class ContextManagerService {
       predictiveCompactTokenLimit?: number
       integrityMode?: "strict-adjacent" | "global"
       pendingToolUseIds?: Iterable<string>
-      nativeCacheEdits?: boolean
       strategy?: "auto" | "manual" | "reactive"
       dryRun?: boolean
     }
@@ -196,7 +194,6 @@ export class ContextManagerService {
       predictiveCompactTokenLimit?: number
       integrityMode?: "strict-adjacent" | "global"
       pendingToolUseIds?: Iterable<string>
-      nativeCacheEdits?: boolean
       dryRun?: boolean
     },
     request: ReactiveRecoveryRequest,
@@ -259,13 +256,11 @@ export class ContextManagerService {
       integrityMode: previousOptions.integrityMode,
       pendingToolUseIds: previousOptions.pendingToolUseIds,
       strategy: "reactive",
-      nativeCacheEdits: previousOptions.nativeCacheEdits,
     })
 
     if (
       !result.wasCompacted &&
       !result.snipCompaction?.changed &&
-      !result.microcompactCompaction?.changed &&
       result.estimatedTokens >= previousOptions.maxTokens
     ) {
       this.telemetry.recordEvent({
@@ -322,7 +317,6 @@ export class ContextManagerService {
       predictiveCompactTokenLimit?: number
       integrityMode?: "strict-adjacent" | "global"
       pendingToolUseIds?: Iterable<string>
-      nativeCacheEdits?: boolean
       dryRun?: boolean
     },
     request: ReactiveRecoveryRequest,
@@ -416,12 +410,6 @@ export class ContextManagerService {
         replacementByToolUseId: {},
         storedByToolUseId: {},
         records: [],
-      },
-      nativeCacheEditState: {
-        toolOrder: [],
-        deletedToolUseIds: [],
-        pinnedEdits: [],
-        toolsSentToApi: false,
       },
       investigationMemory: [],
       sessionMemory: [],

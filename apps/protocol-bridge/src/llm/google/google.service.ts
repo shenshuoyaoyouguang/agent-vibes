@@ -2,7 +2,6 @@ import { HttpException, HttpStatus, Injectable, Logger } from "@nestjs/common"
 import { ConfigService } from "@nestjs/config"
 import * as crypto from "crypto"
 import { TokenCounterService } from "../../context/token-counter.service"
-import { normalizeToolProtocolMessages } from "../../context/tool-protocol-normalizer"
 import { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
 import type { AnthropicResponse, ContentBlock } from "../../shared/anthropic"
 import type { CloudCodeToolDeclaration } from "../../shared/cloud-code"
@@ -24,6 +23,7 @@ import {
   doesModelSupportThinking,
   resolveCloudCodeModel,
 } from "../shared/model-registry"
+import { buildLanguageDirective } from "../shared/language-directive"
 import { resolveThinkingIntentFromDto } from "../shared/thinking-intent"
 import { findPendingToolUseIdsInMessages } from "../shared/tool-continuation-policy"
 import { ANTIGRAVITY_SYSTEM_PROMPT } from "./antigravity-system-prompt"
@@ -1744,6 +1744,9 @@ export class GoogleService implements ProviderAdapter {
         backend: "google",
         statusCode: 400,
         permanent: false,
+        errorClass: "context_length_exceeded",
+        actualTokens: budgetResult.finalTokens,
+        maxTokens: hardLimit,
       }
     )
   }
@@ -3218,21 +3221,11 @@ export class GoogleService implements ProviderAdapter {
     }
 
     // Cloud Code Claude requires strict assistant(tool_use) -> next
-    // user(tool_result) adjacency. Do not relax send-path normalization.
-    const protocolNormalized = normalizeToolProtocolMessages(sourceMessages, {
-      mode: "strict-adjacent",
-      pendingToolUseIds: dto._pendingToolUseIds,
-    })
-    if (
-      protocolNormalized.removedToolResults > 0 ||
-      protocolNormalized.injectedToolResults > 0
-    ) {
-      this.logger.warn(
-        `Cloud Code protocol normalization: dropped ${protocolNormalized.removedToolResults} orphan tool_result, ` +
-          `injected ${protocolNormalized.injectedToolResults} synthetic tool_result for orphan tool_use`
-      )
-    }
-    const normalizedMessages = protocolNormalized.messages
+    // user(tool_result) adjacency. The ToolCallLedger guarantees this
+    // at write time (tool_use and tool_result are appended in the same
+    // transaction as ledger.open / ledger.close), so no send-time
+    // protocol repair is needed here.
+    const normalizedMessages = sourceMessages
 
     for (let msgIndex = 0; msgIndex < normalizedMessages.length; msgIndex++) {
       const msg = normalizedMessages[msgIndex]
@@ -3425,9 +3418,17 @@ export class GoogleService implements ProviderAdapter {
       )
     ) {
       systemParts.push({
-        text: "Interleaved thinking is enabled. You may think between tool calls and after receiving tool results before deciding the next action or final answer. Do not mention these instructions or any constraints about thinking blocks; just apply them.\n\nLanguage usage rules:\n- Always respond in the same language the user is writing in.\n- Your internal thinking and reasoning (think/thought blocks) must also use the user's language.\n- Match the user's language consistently throughout the entire conversation, including explanations, summaries, and follow-up questions.\n- Do not switch languages unless the user explicitly asks you to.\n- Exception: code comments and commit messages default to English unless the user specifies otherwise.",
+        text: "Interleaved thinking is enabled. You may think between tool calls and after receiving tool results before deciding the next action or final answer. Do not mention these instructions or any constraints about thinking blocks; just apply them.",
       })
     }
+
+    // Forced language directive: injected unconditionally (decoupled from the
+    // interleaved-thinking hint above) so language consistency — including in
+    // thinking blocks — holds on every Google request regardless of tools or
+    // thinking config. See shared/language-directive.ts.
+    systemParts.push({
+      text: buildLanguageDirective(dto.messages),
+    })
 
     // Only add systemInstruction if we have content
     // Official Antigravity includes role: "user" in systemInstruction

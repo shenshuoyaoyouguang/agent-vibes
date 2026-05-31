@@ -12,7 +12,8 @@ import {
 import { ApiOperation, ApiTags } from "@nestjs/swagger"
 import { ContextTelemetryService } from "./context"
 import { CursorConnectStreamService } from "./protocol/cursor/cursor-connect-stream.service"
-import { ChatSessionManager } from "./protocol/cursor/session/chat-session.service"
+import { SessionLifecycleService } from "./protocol/cursor/session/session-lifecycle.service"
+import { ContextStateService } from "./protocol/cursor/session/context-state.service"
 
 interface ManualCompactRequestBody {
   /** Cursor session id whose contextState we should compact. */
@@ -59,7 +60,8 @@ export class ContextController {
 
   constructor(
     private readonly telemetry: ContextTelemetryService,
-    private readonly chatSessions: ChatSessionManager,
+    private readonly chatSessions: SessionLifecycleService,
+    private readonly contextState: ContextStateService,
     private readonly cursorStream: CursorConnectStreamService
   ) {}
 
@@ -255,6 +257,80 @@ export class ContextController {
       estimatedTokens: result.estimatedTokens,
       archivedMessageCount: result.archivedMessageCount,
       summaryTokenCount: result.summaryTokenCount,
+    }
+  }
+
+  @Post(":conversationId/force-snip")
+  @ApiOperation({
+    summary:
+      "Force-snip the conversation: hide every message older than the most " +
+      "recent N from the model-facing view (default keep_recent=4). Mirrors " +
+      "Claude Code's /force-snip slash command.",
+  })
+  forceSnip(
+    @Param("conversationId") conversationId: string,
+    @Body() body: { keep_recent?: number; reason?: string } | undefined
+  ): {
+    ok: boolean
+    conversationId: string
+    applied: boolean
+    snippedCount: number
+    keptCount: number
+    totalRecords: number
+    boundaryId?: string
+    reason?: string
+  } {
+    const session = this.chatSessions.getSession(conversationId)
+    if (!session) {
+      throw new HttpException(
+        `Session not found: ${conversationId}`,
+        HttpStatus.NOT_FOUND
+      )
+    }
+
+    const requestedKeep =
+      typeof body?.keep_recent === "number" && Number.isFinite(body.keep_recent)
+        ? Math.max(2, Math.floor(body.keep_recent))
+        : 4
+    const trimmedReason =
+      typeof body?.reason === "string" && body.reason.trim().length > 0
+        ? body.reason.trim().slice(0, 240)
+        : "user-triggered force-snip"
+
+    const targets = this.contextState.resolveSnipTargets(
+      conversationId,
+      requestedKeep
+    )
+    if (targets.removedRecordIds.length === 0) {
+      return {
+        ok: true,
+        conversationId,
+        applied: false,
+        snippedCount: 0,
+        keptCount: targets.keptCount,
+        totalRecords: targets.totalCount,
+      }
+    }
+
+    const boundary = this.contextState.registerSnipBoundary(conversationId, {
+      removedRecordIds: targets.removedRecordIds,
+      trigger: "user",
+      reason: trimmedReason,
+    })
+
+    this.logger.warn(
+      `Force-snip applied for ${conversationId}: removed ${targets.removedRecordIds.length} record(s), kept ${targets.keptCount}, boundary=${boundary?.id}`
+    )
+
+    return {
+      ok: true,
+      conversationId,
+      applied: Boolean(boundary),
+      snippedCount: targets.removedRecordIds.length,
+      keptCount: targets.keptCount,
+      totalRecords: targets.totalCount,
+      boundaryId: boundary?.id,
+      reason: trimmedReason,
     }
   }
 

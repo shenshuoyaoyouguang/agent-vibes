@@ -21,7 +21,7 @@
  *
  * The bridge keeps no per-conversation state beyond the toolCallId →
  * waiter map; conversation-level state lives in
- * `ChatSession.subAgentContexts` (one entry per concurrent sub-agent,
+ * `SessionRecord.subAgentContexts` (one entry per concurrent sub-agent,
  * keyed by subagentId).
  */
 

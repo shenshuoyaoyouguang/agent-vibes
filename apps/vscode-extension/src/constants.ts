@@ -39,8 +39,10 @@ export const CMD = {
   OPEN_CONFIG: "agentVibes.openConfig",
   OPEN_DASHBOARD: "agentVibes.openDashboard",
   APPLY_CURSOR_CHECKSUMS: "agentVibes.applyCursorChecksums",
+  APPLY_CURSOR_IDLE_KILLER_PATCH: "agentVibes.applyCursorIdleKillerPatch",
   RESET_CURSOR_PATCHES: "agentVibes.resetCursorPatches",
   COMPACT_CURRENT_SESSION: "agentVibes.compactCurrentSession",
+  CLEAR_CACHE: "agentVibes.clearCache",
 } as const
 
 // Default configuration values

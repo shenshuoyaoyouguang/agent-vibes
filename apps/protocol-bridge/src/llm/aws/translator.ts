@@ -1,5 +1,5 @@
 /**
- * Translates Claude/Anthropic Messages API requests into Kiro's
+ * Translates Claude/Anthropic API requests into Kiro's
  * `generateAssistantResponse` payload shape.
  *
  * Reference: https://github.com/Quorinex/Kiro-Go (proxy/translator.go)
@@ -12,7 +12,9 @@
 
 import { randomUUID } from "crypto"
 import type { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
+import { appendLanguageDirectiveToText } from "../shared/language-directive"
 import type {
+  KiroAdditionalModelRequestFields,
   KiroHistoryMessage,
   KiroImage,
   KiroPayload,
@@ -31,6 +33,8 @@ const MODEL_MAP_ORDERED: readonly ModelMappingPair[] = [
   ["claude-sonnet-4.5", "claude-sonnet-4.5"],
   ["claude-sonnet-4-6", "claude-sonnet-4.6"],
   ["claude-sonnet-4.6", "claude-sonnet-4.6"],
+  ["claude-opus-4-8", "claude-opus-4.8"],
+  ["claude-opus-4.8", "claude-opus-4.8"],
   ["claude-opus-4-7", "claude-opus-4.7"],
   ["claude-opus-4.7", "claude-opus-4.7"],
   ["claude-haiku-4-5", "claude-haiku-4.5"],
@@ -51,8 +55,25 @@ const MAX_TOOL_NAME_LENGTH = 64
 const MINIMAL_FALLBACK_USER_CONTENT = "."
 
 export interface ClaudeToKiroOptions {
-  /** Reserved: Kiro 自己通过 reasoningContentEvent 暴露 thinking，无需在 prompt 注入。 */
-  thinking?: boolean
+  /**
+   * Per-request thinking behavior to surface as
+   * `userInputMessage.additionalModelRequestFields.thinking`.
+   *
+   * When omitted, the translator does not write the field at all and the
+   * Kiro backend uses its model default (Opus 4.7 default ≈ `adaptive` +
+   * `summarized`, which adds 5–40s of `reasoningContentEvent` frames before
+   * any tool/assistant output even on trivial continuations).
+   *
+   * Set explicitly to `{ type: "disabled", display: "omitted" }` to skip
+   * extended thinking entirely. Verified accepted by the live endpoint.
+   */
+  thinking?: KiroAdditionalModelRequestFields["thinking"]
+  /** Optional effort override surfaced as `output_config.effort`. */
+  effort?: KiroAdditionalModelRequestFields["output_config"] extends infer T
+    ? T extends { effort?: infer E }
+      ? E
+      : never
+    : never
   /** Override the agent continuation id (otherwise random UUID v4). */
   agentContinuationId?: string
   /** Override the conversation id (otherwise random UUID v4). */
@@ -121,7 +142,10 @@ export function claudeToKiro(
   const modelId = mapKiroModel(dto.model || "")
   const origin = "AI_EDITOR"
 
-  const systemPrompt = extractSystemPromptText(dto.system)
+  const systemPrompt = appendLanguageDirectiveToText(
+    extractSystemPromptText(dto.system),
+    dto.messages
+  )
   const history: KiroHistoryMessage[] = []
   let currentContent = ""
   let currentImages: KiroImage[] = []
@@ -187,8 +211,15 @@ export function claudeToKiro(
   const trimmedHistory = sanitizeKiroHistoryToolAdjacency(
     trimLeadingAssistantHistory(history)
   )
-  const safeCurrentToolResults = sanitizeCurrentToolResultsForHistory(
-    currentToolResults,
+  // Kiro requires every history assistant `toolUses` to be answered. The
+  // adjacency pass covers assistant→user pairs *inside* history; when history
+  // ends on an assistant that still has open toolUses (e.g. a
+  // background-shell continuation whose tool_result never came back), those
+  // ids must be answered by the current message's toolResults instead — this
+  // is the same shape Kiro emits for a normal tool continuation. Backfill any
+  // ids the real current toolResults do not already cover.
+  const safeCurrentToolResults = backfillTrailingAssistantToolResults(
+    sanitizeCurrentToolResultsForHistory(currentToolResults, trimmedHistory),
     trimmedHistory
   )
 
@@ -276,6 +307,17 @@ export function claudeToKiro(
     payload.conversationState.history = trimmedHistory
   }
 
+  // additionalModelRequestFields — verified accepted by the live endpoint
+  // (claude-opus-4.7) at userInputMessage scope. Thinking on Opus 4.7 is
+  // adaptive-by-default with summarized display, which can add 5–40s of
+  // `reasoningContentEvent` frames to every tool continuation. Callers can
+  // override via options.thinking / options.effort.
+  const amrf = buildAdditionalModelRequestFields(options)
+  if (amrf) {
+    payload.conversationState.currentMessage.userInputMessage.additionalModelRequestFields =
+      amrf
+  }
+
   // 抓包里顶层无 inferenceConfig（官方客户端不发）；
   // 我们也不再附带，避免触发上游的 schema 校验。
 
@@ -283,6 +325,38 @@ export function claudeToKiro(
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
+
+/**
+ * Build the `additionalModelRequestFields` object to splice onto the
+ * outbound `userInputMessage`, or return `undefined` to leave it off the
+ * wire (so the backend uses its model default).
+ *
+ * Today we only emit the field when the caller explicitly requested
+ * `thinking` or `effort`. We deliberately do NOT inject a default — the
+ * Kiro backend's own default is already adaptive thinking, and writing
+ * the field unconditionally would change cache keys for every existing
+ * caller. The bridge layer above (e.g. cursor-connect-stream) is the one
+ * that decides whether to disable thinking based on the cursor-side
+ * thinkingLevel.
+ */
+function buildAdditionalModelRequestFields(
+  options: ClaudeToKiroOptions
+): KiroAdditionalModelRequestFields | undefined {
+  const thinking = options.thinking
+  const effort = options.effort
+  if (!thinking && !effort) return undefined
+
+  const out: KiroAdditionalModelRequestFields = {}
+  if (thinking) {
+    out.thinking = thinking.display
+      ? { type: thinking.type, display: thinking.display }
+      : { type: thinking.type }
+  }
+  if (effort) {
+    out.output_config = { effort }
+  }
+  return out
+}
 
 function extractSystemPromptText(system: CreateMessageDto["system"]): string {
   if (!system) return ""
@@ -395,6 +469,15 @@ function extractClaudeAssistantContent(
       if (id && name) {
         result.toolUses.push({ toolUseId: id, name, input })
       }
+    } else if (type === "thinking" || type === "redacted_thinking") {
+      // Kiro / CodeWhisperer has no on-the-wire thinking slot. Any thinking
+      // blocks that survive into this translator are residual storage
+      // artifacts — the send-time pipeline in
+      // apps/protocol-bridge/src/llm/shared/normalize-for-api.ts is the
+      // authoritative drop point for non-anthropic backends. Skip here as a
+      // defensive fallback so we never accidentally splice reasoning text
+      // into the user-visible Kiro payload.
+      continue
     }
   }
   return result
@@ -572,6 +655,45 @@ function sanitizeCurrentToolResultsForHistory(
   )
   if (allowedToolUseIds.size === 0) return []
   return toolResults.filter((result) => allowedToolUseIds.has(result.toolUseId))
+}
+
+/**
+ * Ensure the trailing history `assistantResponseMessage`'s `toolUses` are all
+ * answered by the current message's `toolResults`.
+ *
+ * Kiro rejects a payload whose history ends on an assistant turn with open
+ * toolUses that nothing answers (`Improperly formed request`, HTTP 400,
+ * reason=null). This happens on control-frame resumes — most notably a
+ * background-shell task completion — where the last real assistant turn
+ * spawned a tool whose result never returned, and the resume carries only
+ * text.
+ *
+ * For every trailing toolUseId not already covered by `toolResults`, append a
+ * synthetic interrupted result so the pair is closed. Ids are only backfilled
+ * when history actually ends on an assistant entry; an assistant followed by a
+ * user entry is already handled by `sanitizeKiroHistoryToolAdjacency`.
+ */
+function backfillTrailingAssistantToolResults(
+  toolResults: KiroToolResult[],
+  history: KiroHistoryMessage[]
+): KiroToolResult[] {
+  const lastEntry = history[history.length - 1]
+  const trailingAssistant = lastEntry?.assistantResponseMessage
+  if (!trailingAssistant) return toolResults
+
+  const trailingToolUseIds = (trailingAssistant.toolUses || [])
+    .map((toolUse) => toolUse.toolUseId)
+    .filter((id) => id.length > 0)
+  if (trailingToolUseIds.length === 0) return toolResults
+
+  const coveredIds = new Set(toolResults.map((result) => result.toolUseId))
+  const missing = trailingToolUseIds.filter((id) => !coveredIds.has(id))
+  if (missing.length === 0) return toolResults
+
+  return [
+    ...toolResults,
+    ...missing.map(createSyntheticInterruptedKiroToolResult),
+  ]
 }
 
 function createSyntheticInterruptedKiroToolResult(

@@ -119,7 +119,7 @@ const GEMINI_MODELS: Record<
     isThinking: false,
   },
   "gemini-3-flash": {
-    cloudCodeId: "gemini-3-flash-preview",
+    cloudCodeId: "gemini-3-flash",
     displayName: "Gemini 3 Flash",
     isThinking: false,
   },
@@ -150,6 +150,38 @@ const CLAUDE_MODELS: Record<
   string,
   Omit<ModelEntry, "family" | "isClaudeThroughGoogle">
 > = {
+  // --- Opus 4.8 ---
+  "claude-opus-4-8": {
+    cloudCodeId: "claude-opus-4-8-thinking",
+    displayName: "Claude Opus 4.8",
+    isThinking: false,
+  },
+  "claude-opus-4.8": {
+    cloudCodeId: "claude-opus-4-8-thinking",
+    displayName: "Claude Opus 4.8",
+    isThinking: false,
+  },
+  "claude-opus-4-8-thinking": {
+    cloudCodeId: "claude-opus-4-8-thinking",
+    displayName: "Claude Opus 4.8 Thinking",
+    isThinking: true,
+  },
+  "claude-opus-4.8-thinking": {
+    cloudCodeId: "claude-opus-4-8-thinking",
+    displayName: "Claude Opus 4.8 Thinking",
+    isThinking: true,
+  },
+  "claude-4.8-opus": {
+    cloudCodeId: "claude-opus-4-8-thinking",
+    displayName: "Claude Opus 4.8",
+    isThinking: true,
+  },
+  "claude-4.8-opus-thinking": {
+    cloudCodeId: "claude-opus-4-8-thinking",
+    displayName: "Claude Opus 4.8 Thinking",
+    isThinking: true,
+  },
+
   // --- Opus 4.7 ---
   "claude-opus-4-7": {
     cloudCodeId: "claude-opus-4-7-thinking",
@@ -248,12 +280,12 @@ const CLAUDE_MODELS: Record<
 
   // --- Generic Opus (resolve to latest) ---
   "claude-opus-4": {
-    cloudCodeId: "claude-opus-4-7-thinking",
+    cloudCodeId: "claude-opus-4-8-thinking",
     displayName: "Claude Opus 4",
     isThinking: true,
   },
   "claude-4-opus": {
-    cloudCodeId: "claude-opus-4-7-thinking",
+    cloudCodeId: "claude-opus-4-8-thinking",
     displayName: "Claude Opus 4",
     isThinking: true,
   },
@@ -310,6 +342,33 @@ const CLAUDE_MODELS: Record<
     cloudCodeId: "claude-sonnet-4-5-thinking",
     displayName: "Claude Sonnet 4.5 Thinking",
     isThinking: true,
+  },
+
+  // --- Haiku 4.5 ---
+  "claude-haiku-4-5": {
+    cloudCodeId: "claude-haiku-4-5",
+    displayName: "Claude Haiku 4.5",
+    isThinking: false,
+  },
+  "claude-haiku-4.5": {
+    cloudCodeId: "claude-haiku-4-5",
+    displayName: "Claude Haiku 4.5",
+    isThinking: false,
+  },
+  "claude-haiku-4-5-20251001": {
+    cloudCodeId: "claude-haiku-4-5",
+    displayName: "Claude Haiku 4.5",
+    isThinking: false,
+  },
+  "claude-4-5-haiku": {
+    cloudCodeId: "claude-haiku-4-5",
+    displayName: "Claude Haiku 4.5",
+    isThinking: false,
+  },
+  "claude-4.5-haiku": {
+    cloudCodeId: "claude-haiku-4-5",
+    displayName: "Claude Haiku 4.5",
+    isThinking: false,
   },
 
   // --- Legacy 3.x (map to latest equivalents) ---
@@ -635,6 +694,16 @@ const PUBLIC_MODEL_METADATA: Record<string, PublicModelMetadata> = {
     ownedBy: "anthropic",
     displayName: "Claude 3.5 Haiku",
   },
+  "claude-haiku-4-5-20251001": {
+    createdAt: 1759276800,
+    ownedBy: "anthropic",
+    displayName: "Claude Haiku 4.5",
+  },
+  "claude-haiku-4-5": {
+    createdAt: 1759276800,
+    ownedBy: "anthropic",
+    displayName: "Claude Haiku 4.5",
+  },
   "claude-opus-4-6-thinking": {
     createdAt: 1770318000,
     ownedBy: "antigravity",
@@ -956,6 +1025,14 @@ export interface CursorDisplayModel {
   idAliases?: string[]
   cloudMigrateToModel?: string
   upgradeModelId?: string
+  /**
+   * Optional badge/subtitle rendered next to the model name in the Cursor
+   * picker (e.g. `Fast`, `Beta`). When set, this wins over the default
+   * `buildCursorAvailableModel` fallback that derives a tagline from the
+   * variant config or the display name. Used today for the Antigravity
+   * `gemini-3.5-flash-*` family which Antigravity's own UI badges as `Fast`.
+   */
+  tagline?: string
 }
 
 export interface CursorDisplayModelOptions {
@@ -1039,6 +1116,20 @@ export const GEMINI_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
 ]
 
 export const CLAUDE_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
+  {
+    name: "claude-opus-4-8",
+    displayName: "Claude Opus 4.8",
+    shortName: "Opus 4.8",
+    family: "claude",
+    isThinking: false,
+  },
+  {
+    name: "claude-opus-4-8-thinking",
+    displayName: "Claude Opus 4.8 (Thinking)",
+    shortName: "Opus 4.8 Thinking",
+    family: "claude",
+    isThinking: true,
+  },
   {
     name: "claude-opus-4-7",
     displayName: "Claude Opus 4.7",
@@ -1418,15 +1509,47 @@ export function getCursorDisplayModels(
     ? allModels.filter((model) => !model.name.includes("max"))
     : allModels
 
+  // Two-pass merge: the first occurrence anchors the display position so the
+  // curated static order (Claude → Gemini → Codex) is preserved. Subsequent
+  // occurrences with the same name only refresh the label fields, and only
+  // when the upstream value is non-degenerate — i.e. trimmed, non-empty, and
+  // not just the modelId echoed back as a fallback. This lets dynamic Cloud
+  // Code metadata correct stale hand-coded `displayName`/`shortName` (e.g.
+  // `Gemini 3.1 Pro High` → `Gemini 3.1 Pro (High)`) without letting an
+  // adapter that fell back to the modelId ever overwrite a curated label.
   const dedupedModels: CursorDisplayModel[] = []
-  const seen = new Set<string>()
+  const indexByName = new Map<string, number>()
   for (const model of filteredModels) {
     const normalized = model.name.toLowerCase().trim()
-    if (!normalized || seen.has(normalized)) {
+    if (!normalized) {
       continue
     }
-    seen.add(normalized)
-    dedupedModels.push(model)
+    const existingIndex = indexByName.get(normalized)
+    if (existingIndex === undefined) {
+      indexByName.set(normalized, dedupedModels.length)
+      dedupedModels.push(model)
+      continue
+    }
+    const existing = dedupedModels[existingIndex]!
+    const merged: CursorDisplayModel = { ...existing }
+    const idLower = normalized
+    const refinedDisplayName = model.displayName?.trim()
+    if (
+      refinedDisplayName &&
+      refinedDisplayName.length > 0 &&
+      refinedDisplayName.toLowerCase() !== idLower
+    ) {
+      merged.displayName = refinedDisplayName
+    }
+    const refinedShortName = model.shortName?.trim()
+    if (
+      refinedShortName &&
+      refinedShortName.length > 0 &&
+      refinedShortName.toLowerCase() !== idLower
+    ) {
+      merged.shortName = refinedShortName
+    }
+    dedupedModels[existingIndex] = merged
   }
 
   return dedupedModels

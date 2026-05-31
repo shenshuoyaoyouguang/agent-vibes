@@ -28,6 +28,10 @@ export type ContextTelemetryEvent =
   | "compaction.native_cache_edits_inserted"
   | "compaction.native_cache_edit_state_pruned"
   | "compaction.projection_budget_exceeded"
+  | "compaction.cross_process_restart_recovery"
+  | "compaction.in_process_turn_repair"
+  | "compaction.stream_interruption_tool_repair"
+  | "compaction.parent_cancel_tool_repair"
   // Reactive prompt-too-long recovery
   | "reactive.recovery_attempted"
   | "reactive.recovery_success"
@@ -36,6 +40,24 @@ export type ContextTelemetryEvent =
   // Tool integrity repairs (read-time safety net)
   | "integrity.orphan_tool_result_removed"
   | "integrity.synthetic_tool_result_injected"
+  // Prompt-cache break attribution (cc parity)
+  | "prompt_cache.break"
+  // Predictive compaction warning (cc parity: TokenWarning hook)
+  | "compaction.warning_imminent"
+  // Aggregate post-compaction cleanup completion
+  | "compaction.post_cleanup"
+  // ToolUseSummary generator (cc parity)
+  | "tool_use.summary"
+  // Reasoning continuity (cross-turn thinking memory)
+  | "reasoning_memory.append"
+  | "reasoning_memory.invalidated"
+  | "reasoning_memory.cleared"
+  | "reasoning_memory.dropped"
+  | "reasoning_memory.preamble_built"
+  | "reasoning_memory.preamble_skipped"
+  | "reasoning_memory.consolidated"
+  // Backend capability drift (declared vs observed wire behavior)
+  | "backend_capability.thinking_disabled_violation"
 
 export interface ContextTelemetryEventDetail {
   event: ContextTelemetryEvent

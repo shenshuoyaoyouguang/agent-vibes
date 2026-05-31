@@ -1,13 +1,36 @@
 import { Injectable, Logger, OnModuleInit } from "@nestjs/common"
 import {
+  type CursorDisplayModel,
+  detectModelFamily,
+  getCursorDisplayModel,
   getDefaultModelIds,
   isSupportedModel as isRegistrySupported,
+  resolveCloudCodeModel,
 } from "../shared/model-registry"
 import { ProcessPoolService } from "./process-pool.service"
 import {
   GOOGLE_STARTUP_UPSTREAM_CHECK_ENV,
   isGoogleStartupUpstreamCheckEnabled,
 } from "./startup-probe-policy"
+
+/**
+ * Title-case a Gemini model id when neither the dynamic Cloud Code metadata
+ * nor the static registry provides a usable display name. Mirrors the simple
+ * casing logic in cursor-model-protocol's `formatFallbackModelName` so the
+ * resulting label feels consistent with the rest of the Cursor model picker.
+ */
+function formatGeminiFallbackName(modelId: string): string {
+  return modelId
+    .split("-")
+    .filter((segment) => segment.length > 0)
+    .map((segment) => {
+      if (segment === "gemini") return "Gemini"
+      if (segment === "mini") return "Mini"
+      if (segment === "max") return "Max"
+      return segment.charAt(0).toUpperCase() + segment.slice(1)
+    })
+    .join(" ")
+}
 
 /**
  * Model info from Cloud Code API
@@ -19,6 +42,20 @@ interface GeminiModelInfo {
   supportsThinking?: boolean
   thinkingBudget?: number
   minThinkingBudget?: number
+  /**
+   * Cloud Code-driven badge displayed next to the model name (e.g. `Fast`,
+   * `New`). Antigravity's UI renders this as a colored chip alongside the
+   * display name. Verified empirically against `fetchAvailableModels` raw
+   * responses — only a subset of Gemini models carry it.
+   */
+  tagTitle?: string
+  /**
+   * Optional secondary text Cloud Code pairs with `tagTitle` (e.g.
+   * `Limited time` for the `Fast` chip). We don't surface this directly in
+   * the Cursor picker today, but cache it so future UI work doesn't need
+   * another upstream roundtrip.
+   */
+  tagDescription?: string
 }
 
 /**
@@ -100,6 +137,12 @@ export class GoogleModelCacheService implements OnModuleInit {
             thinkingBudget?: number
             minThinkingBudget?: number
             quotaInfo?: { remainingFraction?: number; resetTime?: string }
+            // Antigravity-driven badge metadata. `tagTitle` is the chip
+            // text (e.g. `Fast`, `New`) and `tagDescription` is the
+            // optional secondary line (`Limited time`). Verified
+            // empirically against the raw `fetchAvailableModels` payload.
+            tagTitle?: string
+            tagDescription?: string
           }
         >
       }
@@ -121,6 +164,16 @@ export class GoogleModelCacheService implements OnModuleInit {
             minThinkingBudget:
               typeof modelData.minThinkingBudget === "number"
                 ? modelData.minThinkingBudget
+                : undefined,
+            tagTitle:
+              typeof modelData.tagTitle === "string" &&
+              modelData.tagTitle.trim().length > 0
+                ? modelData.tagTitle.trim()
+                : undefined,
+            tagDescription:
+              typeof modelData.tagDescription === "string" &&
+              modelData.tagDescription.trim().length > 0
+                ? modelData.tagDescription.trim()
                 : undefined,
           })
         }
@@ -183,6 +236,96 @@ export class GoogleModelCacheService implements OnModuleInit {
    */
   getModelInfo(modelId: string): GeminiModelInfo | undefined {
     return this.modelCache.get(modelId)
+  }
+
+  /**
+   * Build Cursor display entries for every Gemini model currently in cache.
+   *
+   * Static `GEMINI_CURSOR_DISPLAY_MODELS` only enumerates the IDs hard-coded at
+   * build time. Newer Antigravity Cloud Code releases keep adding Gemini models
+   * (e.g. `gemini-3.5-flash-low`, `gemini-pro-agent`); we want those to surface
+   * in Cursor's AvailableModels response without a code change.
+   *
+   * Strategy:
+   * - If a static entry exists for the cached id, reuse it verbatim so the
+   *   curated `shortName` / capability flags win.
+   * - Otherwise synthesize a minimum entry from the cached Cloud Code metadata.
+   *
+   * Callers inject the result via `getCursorDisplayModels({ extraModels })`.
+   * Its dedup logic keeps the first occurrence, so static entries always take
+   * precedence and dynamic ones only fill the gaps.
+   */
+  getCursorDisplayModels(): CursorDisplayModel[] {
+    const result: CursorDisplayModel[] = []
+    for (const [modelId, info] of this.modelCache.entries()) {
+      if (detectModelFamily(modelId) !== "gemini") {
+        continue
+      }
+
+      const staticEntry = getCursorDisplayModel(modelId)
+
+      // Antigravity Cloud Code is the source of truth for Gemini display
+      // names (e.g. `Gemini 3.1 Pro (High)`). Prefer the dynamic
+      // `displayName` whenever the worker returned a real label — i.e. it
+      // is non-empty and not just the modelId echoed back by
+      // `addDefaultModels` before the API roundtrip completes. This keeps
+      // the curated `shortName` / capability flags from the static entry
+      // while letting the official Antigravity label win over our hand
+      // -written fallback.
+      const trimmedDisplay = info.displayName?.trim()
+      const dynamicDisplayName =
+        trimmedDisplay &&
+        trimmedDisplay.length > 0 &&
+        trimmedDisplay.toLowerCase() !== modelId.toLowerCase()
+          ? trimmedDisplay
+          : undefined
+
+      // Antigravity's UI renders a chip badge from Cloud Code's
+      // `tagTitle` field (e.g. `Fast`, `New`). Mirror it verbatim — the
+      // raw `fetchAvailableModels` response is the only data-driven
+      // badge source we have, verified empirically. The previous
+      // `startsWith("gemini-3.5-flash") → Fast` heuristic was both too
+      // narrow (missed `gemini-3-flash-agent` which also carries `Fast`)
+      // and too broad (couldn't represent `gemini-3.1-pro-high`'s `New`).
+      const upstreamTagline = info.tagTitle
+
+      if (staticEntry) {
+        const merged: CursorDisplayModel = { ...staticEntry }
+        if (dynamicDisplayName) {
+          merged.displayName = dynamicDisplayName
+          merged.shortName = dynamicDisplayName
+        }
+        if (upstreamTagline && !staticEntry.tagline) {
+          merged.tagline = upstreamTagline
+        }
+        result.push(merged)
+        continue
+      }
+
+      const resolved = resolveCloudCodeModel(modelId)
+      const isThinking =
+        info.supportsThinking === true ||
+        typeof info.thinkingBudget === "number" ||
+        typeof info.minThinkingBudget === "number" ||
+        modelId.toLowerCase().includes("thinking")
+
+      const displayName =
+        dynamicDisplayName ??
+        (resolved?.displayName &&
+        resolved.displayName.toLowerCase() !== modelId.toLowerCase()
+          ? resolved.displayName
+          : formatGeminiFallbackName(modelId))
+
+      result.push({
+        name: modelId,
+        displayName,
+        shortName: displayName,
+        family: "gemini",
+        isThinking,
+        tagline: upstreamTagline,
+      })
+    }
+    return result
   }
 
   /**

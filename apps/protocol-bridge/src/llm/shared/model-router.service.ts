@@ -1,8 +1,6 @@
-import { HttpException, Injectable, Logger } from "@nestjs/common"
-import {
-  BackendAccountPoolUnavailableError,
-  BackendApiError,
-} from "./backend-errors"
+import { Injectable, Logger } from "@nestjs/common"
+import { BackendAccountPoolUnavailableError } from "./backend-errors"
+import { classifyBackendError, RETRY_POLICY } from "./backend-error-class"
 import {
   canPublicClaudeModelUseGoogle,
   canPublicClaudeModelUseKiro,
@@ -397,30 +395,6 @@ export class ModelRouterService {
     )
   }
 
-  private parseBackendErrorStatus(error: unknown): number | null {
-    if (error instanceof HttpException) {
-      return error.getStatus()
-    }
-
-    if (error instanceof BackendApiError) {
-      return typeof error.statusCode === "number" ? error.statusCode : null
-    }
-
-    const message =
-      error instanceof Error
-        ? error.message
-        : typeof error === "string"
-          ? error
-          : ""
-    const match = message.match(/(?:api error|status=|status\s)(\d{3})/i)
-    if (!match?.[1]) {
-      return null
-    }
-
-    const status = Number.parseInt(match[1], 10)
-    return Number.isFinite(status) ? status : null
-  }
-
   shouldFallbackFromBackend(
     error: unknown,
     currentBackend: BackendType,
@@ -448,37 +422,24 @@ export class ModelRouterService {
       }
     }
 
-    const message =
-      error instanceof Error
-        ? error.message.toLowerCase()
-        : typeof error === "string"
-          ? error.toLowerCase()
-          : ""
-    const status = this.parseBackendErrorStatus(error)
+    // Class-driven decision. Producer-attached BackendApiError.errorClass
+    // is the source of truth; classifyBackendError falls back to a
+    // structured-field-aware inference for legacy throw sites that
+    // haven't been migrated yet (HTTP status + upstream enum codes,
+    // not message regex). Per-class fallback intent comes from the
+    // RETRY_POLICY table — no decision logic lives in this method.
+    const errorClass = classifyBackendError(error)
+    if (RETRY_POLICY[errorClass].fallbackAcrossBackend) {
+      return true
+    }
 
+    // BackendAccountPoolUnavailableError is a transient pool exhaustion
+    // signal — always worth a cross-backend try.
     if (error instanceof BackendAccountPoolUnavailableError) {
       return true
     }
 
-    if (status != null) {
-      if ([401, 403, 404, 408, 409, 429, 500, 502, 503, 504].includes(status)) {
-        return true
-      }
-
-      if (status === 400) {
-        return /model|provider|upstream|quota|rate limit|unavailable|unsupported|overloaded|temporar|prompt too long|prompt limit|context(?: is)? too large|token limit|too many tokens|exceeds?.*limit/.test(
-          message
-        )
-      }
-
-      if (status === 422) {
-        return false
-      }
-    }
-
-    return /timeout|timed out|fetch failed|socket hang up|econn|enotfound|eai_again|network|html page|anti-bot|captcha|blocked|not configured|missing api key|missing base url|no available providers|temporarily unavailable|service unavailable|quota|rate(?:-| )limit(?:ed)?|retry after|all openai-compat accounts|all claude api accounts|all kiro accounts|anthropic|kiro/.test(
-      message
-    )
+    return false
   }
 
   /**

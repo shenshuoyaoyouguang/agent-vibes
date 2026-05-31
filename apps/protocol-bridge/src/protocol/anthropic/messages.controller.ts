@@ -18,6 +18,10 @@ import {
 } from "@nestjs/swagger"
 import type { FastifyReply } from "fastify"
 import { ApiKeyGuard } from "../../shared/api-key.guard"
+import {
+  type AnthropicErrorEnvelope,
+  renderAnthropicError,
+} from "./anthropic-error"
 import { CountTokensDto } from "./dto/count-tokens.dto"
 import { CreateMessageDto } from "./dto/create-message.dto"
 import { MessagesService } from "./messages.service"
@@ -95,56 +99,17 @@ export class MessagesController {
     )
   }
 
-  private getRetryAfterSeconds(error: unknown): number | null {
-    const retryAfterSeconds = (
-      error as { retryAfterSeconds?: unknown } | null | undefined
-    )?.retryAfterSeconds
-
-    return typeof retryAfterSeconds === "number" && retryAfterSeconds > 0
-      ? retryAfterSeconds
-      : null
-  }
-
-  private buildStreamErrorPayload(error: unknown): {
-    type: string
-    error: { type: string; message: string }
-  } {
-    if (error instanceof HttpException) {
-      const response = error.getResponse()
-      let message = error.message
-      if (typeof response === "string") {
-        message = response
-      } else if (
-        response &&
-        typeof response === "object" &&
-        typeof (response as { message?: unknown }).message === "string"
-      ) {
-        message = (response as { message: string }).message
-      }
-      return {
-        type: "error",
-        error: {
-          type: "api_error",
-          message,
-        },
-      }
-    }
-
-    return {
+  private buildMissingModelError(): HttpException {
+    const envelope: AnthropicErrorEnvelope = {
       type: "error",
-      error: {
-        type: "api_error",
-        message:
-          error instanceof Error
-            ? error.message
-            : "Streaming request failed unexpectedly",
-      },
+      error: { type: "invalid_request_error", message: "missing model" },
     }
+    return new HttpException(envelope, 400)
   }
 
   @Post("messages")
   @HttpCode(200)
-  @ApiOperation({ summary: "Create a message (Anthropic Messages API)" })
+  @ApiOperation({ summary: "Create a message (Anthropic API)" })
   @ApiHeader({ name: "x-api-key", description: "API Key", required: false })
   @ApiHeader({
     name: "anthropic-version",
@@ -174,13 +139,7 @@ export class MessagesController {
       typeof createMessageDto?.model !== "string" ||
       createMessageDto.model.trim() === ""
     ) {
-      throw new HttpException(
-        {
-          type: "error",
-          error: { type: "invalid_request_error", message: "missing model" },
-        },
-        400
-      )
+      throw this.buildMissingModelError()
     }
     const forwardHeaders = this.pickAnthropicForwardHeaders(headers)
     const codexForwardHeaders = this.pickCodexForwardHeaders(headers)
@@ -207,23 +166,25 @@ export class MessagesController {
           res.raw.write(chunk)
         }
       } catch (error) {
-        if (!headersWritten && error instanceof HttpException) {
-          res.status(error.getStatus())
+        const rendered = renderAnthropicError(error)
+        if (!headersWritten) {
+          res.status(rendered.status)
         }
-        const retryAfterSeconds = this.getRetryAfterSeconds(error)
-        if (retryAfterSeconds != null) {
-          res.header("Retry-After", String(retryAfterSeconds))
+        if (rendered.retryAfterSeconds != null) {
+          res.header("Retry-After", String(rendered.retryAfterSeconds))
         }
         ensureHeaders()
-        const payload = this.buildStreamErrorPayload(error)
-        res.raw.write(`event: error\ndata: ${JSON.stringify(payload)}\n\n`)
+        res.raw.write(
+          `event: error\ndata: ${JSON.stringify(rendered.body)}\n\n`
+        )
       } finally {
         res.raw.end()
       }
       return
     }
 
-    // Non-streaming mode
+    // Non-streaming mode: render uniform Anthropic error envelopes so CC CLI
+    // can branch on `error.type` for retry decisions.
     try {
       return await this.messagesService.createMessage(
         createMessageDto,
@@ -231,11 +192,11 @@ export class MessagesController {
         codexForwardHeaders
       )
     } catch (error) {
-      const retryAfterSeconds = this.getRetryAfterSeconds(error)
-      if (res && retryAfterSeconds != null) {
-        res.header("Retry-After", String(retryAfterSeconds))
+      const rendered = renderAnthropicError(error)
+      if (res && rendered.retryAfterSeconds != null) {
+        res.header("Retry-After", String(rendered.retryAfterSeconds))
       }
-      throw error
+      throw new HttpException(rendered.body, rendered.status)
     }
   }
 
@@ -249,8 +210,21 @@ export class MessagesController {
     required: false,
   })
   @ApiBody({ type: CountTokensDto })
-  countTokens(@Body() body: Record<string, unknown>) {
-    return this.messagesService.countTokens(body as unknown as CountTokensDto)
+  async countTokens(
+    @Body() body: Record<string, unknown>,
+    @Res({ passthrough: true }) res?: FastifyReply
+  ) {
+    try {
+      return await this.messagesService.countTokens(
+        body as unknown as CountTokensDto
+      )
+    } catch (error) {
+      const rendered = renderAnthropicError(error)
+      if (res && rendered.retryAfterSeconds != null) {
+        res.header("Retry-After", String(rendered.retryAfterSeconds))
+      }
+      throw new HttpException(rendered.body, rendered.status)
+    }
   }
 
   @Get("anthropic/models")

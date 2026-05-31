@@ -1,6 +1,12 @@
 import { Body, Controller, Get, Logger, Post } from "@nestjs/common"
 import { ConfigService } from "@nestjs/config"
 import { createHash, randomUUID } from "crypto"
+import { AnthropicApiService } from "../../../llm/anthropic/anthropic-api.service"
+import {
+  connectClaudeCli,
+  disconnectClaudeCli,
+  getClaudeCliIntegrationStatus,
+} from "../../../llm/anthropic/cc-cli-integration"
 import { KiroService } from "../../../llm/aws/kiro.service"
 import { AntigravityIdeSyncService } from "../antigravity-ide-sync.service"
 import { CursorAuthService } from "../cursor-auth.service"
@@ -26,7 +32,8 @@ export class AuthController {
     private readonly configService: ConfigService,
     private readonly cursorAuthService: CursorAuthService,
     private readonly antigravityIdeSyncService: AntigravityIdeSyncService,
-    private readonly kiroService: KiroService
+    private readonly kiroService: KiroService,
+    private readonly anthropicApiService: AnthropicApiService
   ) {}
 
   private getCursorIdentity(): CursorIdentity {
@@ -186,6 +193,40 @@ export class AuthController {
     }
   }
 
+  // ── Kiro: force an existing pool account into local Kiro IDE ────────
+
+  @Post("kiro/force-ide-login")
+  async forceKiroIdeLogin(
+    @Body()
+    body: {
+      authMethod?: string
+      region?: string
+      refreshToken?: string
+      accessToken?: string
+      clientId?: string
+      kiroApiKey?: string
+      label?: string
+    } = {}
+  ) {
+    return this.kiroService.forceLoginToKiroIde(body)
+  }
+
+  @Post("kiro/force-cli-login")
+  async forceKiroCliLogin(
+    @Body()
+    body: {
+      authMethod?: string
+      region?: string
+      refreshToken?: string
+      accessToken?: string
+      clientId?: string
+      kiroApiKey?: string
+      label?: string
+    } = {}
+  ) {
+    return this.kiroService.forceLoginToKiroCli(body)
+  }
+
   // ── Kiro: manual JSON paste fallback ───────────────────────────────────
 
   @Post("kiro/import")
@@ -213,5 +254,229 @@ export class AuthController {
         error: message,
       }
     }
+  }
+
+  // ── Claude Code CLI: Anthropic OAuth + PKCE redirect flow ──────────────
+
+  @Post("claude/login/start")
+  startClaudeOAuthLogin() {
+    return this.anthropicApiService.startOAuthLogin()
+  }
+
+  @Post("claude/login/poll")
+  pollClaudeOAuthLogin(@Body() body: { sessionId?: string } = {}) {
+    const sessionId = (body.sessionId || "").trim()
+    if (!sessionId) {
+      return Promise.resolve({
+        status: "expired" as const,
+        message: "missing sessionId",
+      })
+    }
+    return this.anthropicApiService.pollOAuthLogin(sessionId)
+  }
+
+  @Post("claude/login/cancel")
+  cancelClaudeOAuthLogin(@Body() body: { sessionId?: string } = {}) {
+    const sessionId = (body.sessionId || "").trim()
+    return {
+      cancelled: sessionId
+        ? this.anthropicApiService.cancelOAuthLogin(sessionId)
+        : false,
+    }
+  }
+
+  // ── Claude Code CLI: bridge integration (settings.json wiring) ─────────
+
+  @Get("claude/integration/status")
+  getClaudeCliIntegrationStatus() {
+    const bridgeApiKey = this.configService.get<string>("PROXY_API_KEY")
+    return getClaudeCliIntegrationStatus(bridgeApiKey)
+  }
+
+  /**
+   * Reveal the bridge's runtime PROXY_API_KEY.
+   *
+   * Loopback-only by design: the API tab's diagnostics panel can call
+   * this to compare the bridge's expected key against what's stored in
+   * `~/.claude/settings.json` and copy the correct value to the
+   * clipboard. The reply never includes the key when no PROXY_API_KEY
+   * is configured (loopback no-auth mode), so the panel can render
+   * "no guard" instead of leaking a placeholder.
+   */
+  @Post("claude/integration/reveal-key")
+  revealBridgeApiKey() {
+    const raw = this.configService.get<string>("PROXY_API_KEY")
+    const trimmed = typeof raw === "string" ? raw.trim() : ""
+    if (!trimmed) {
+      return { configured: false as const }
+    }
+    return { configured: true as const, apiKey: trimmed }
+  }
+
+  /**
+   * Generic in-process probe for the API tab's "Test" button.
+   *
+   * Why a server-side probe instead of having the extension fire its
+   * own HTTPS request: keeps the test honest about what the bridge
+   * currently accepts (same TLS context, same auth guard) and lets us
+   * surface end-to-end timing without round-tripping through the
+   * webview's strict CSP. Inputs are constrained to bridge-relative
+   * paths and a small allow-list of methods.
+   */
+  @Post("claude/integration/probe")
+  async probeBridgeEndpoint(
+    @Body()
+    body: {
+      path?: string
+      method?: string
+      headers?: Record<string, string>
+      body?: string
+      timeoutMs?: number
+    } = {}
+  ) {
+    const rawPath = (body.path || "").trim()
+    if (!rawPath || !rawPath.startsWith("/")) {
+      return {
+        ok: false as const,
+        error: "path must be an absolute bridge-relative URL (start with /)",
+      }
+    }
+
+    const method = (body.method || "GET").toUpperCase()
+    const allowedMethods = new Set(["GET", "POST", "HEAD", "OPTIONS"])
+    if (!allowedMethods.has(method)) {
+      return {
+        ok: false as const,
+        error: `unsupported method: ${method}`,
+      }
+    }
+
+    const timeoutMs = Math.min(
+      Math.max(Number(body.timeoutMs) || 8_000, 1_000),
+      30_000
+    )
+
+    const httpsModule = await import("https")
+    const httpModule = await import("http")
+    const port = Number(this.configService.get<string>("PORT") || 2026)
+
+    // The bridge listens on HTTPS when certs are present (the SEA build
+    // mounts both); fall through to HTTP only if HTTPS handshake fails.
+    return new Promise<{
+      ok: boolean
+      status?: number
+      durationMs?: number
+      bodyPreview?: string
+      contentType?: string
+      error?: string
+    }>((resolve) => {
+      const start = Date.now()
+      const headers: Record<string, string> = {
+        host: `localhost:${port}`,
+        accept: "application/json,text/plain;q=0.8,*/*;q=0.5",
+        "user-agent": "agent-vibes-bridge-probe/1",
+        ...(body.headers || {}),
+      }
+
+      const payload =
+        method === "POST" && typeof body.body === "string" ? body.body : ""
+      if (payload.length > 0 && !headers["content-type"]) {
+        headers["content-type"] = "application/json"
+      }
+      if (payload.length > 0) {
+        headers["content-length"] = String(Buffer.byteLength(payload))
+      }
+
+      const tryRequest = (
+        client: typeof httpsModule | typeof httpModule,
+        rejectUnauthorized: boolean
+      ) => {
+        const req = client.request(
+          {
+            hostname: "127.0.0.1",
+            port,
+            path: rawPath,
+            method,
+            headers,
+            ...(client === httpsModule ? { rejectUnauthorized } : {}),
+          },
+          (res) => {
+            const chunks: Buffer[] = []
+            let total = 0
+            const cap = 1024
+            res.on("data", (chunk: Buffer) => {
+              if (total < cap) {
+                chunks.push(chunk)
+                total += chunk.length
+              }
+            })
+            res.on("end", () => {
+              const merged = Buffer.concat(chunks)
+                .slice(0, cap)
+                .toString("utf8")
+              resolve({
+                ok: true,
+                status: res.statusCode ?? 0,
+                durationMs: Date.now() - start,
+                bodyPreview: merged,
+                contentType:
+                  typeof res.headers["content-type"] === "string"
+                    ? res.headers["content-type"]
+                    : undefined,
+              })
+            })
+          }
+        )
+        req.on("error", (err) => {
+          // First failure on HTTPS: retry over plain HTTP in case the
+          // bridge is running unencrypted (test fixtures, no certs).
+          if (client === httpsModule) {
+            tryRequest(httpModule, rejectUnauthorized)
+            return
+          }
+          resolve({
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+            durationMs: Date.now() - start,
+          })
+        })
+        req.setTimeout(timeoutMs, () => {
+          req.destroy(new Error(`probe timed out after ${timeoutMs}ms`))
+        })
+        if (payload.length > 0) {
+          req.write(payload)
+        }
+        req.end()
+      }
+
+      tryRequest(httpsModule, false)
+    })
+  }
+
+  @Post("claude/integration/connect")
+  connectClaudeCliToBridge(
+    @Body()
+    body: {
+      bridgeUrl?: string
+      apiKey?: string
+      caCertPath?: string
+    } = {}
+  ) {
+    const bridgeUrl = (body.bridgeUrl || "").trim()
+    if (!bridgeUrl) {
+      return Promise.resolve({
+        error: "missing bridgeUrl",
+      } as const)
+    }
+    return connectClaudeCli({
+      bridgeUrl,
+      apiKey: body.apiKey?.trim() || undefined,
+      caCertPath: body.caCertPath?.trim() || undefined,
+    })
+  }
+
+  @Post("claude/integration/disconnect")
+  disconnectClaudeCliFromBridge() {
+    return disconnectClaudeCli()
   }
 }

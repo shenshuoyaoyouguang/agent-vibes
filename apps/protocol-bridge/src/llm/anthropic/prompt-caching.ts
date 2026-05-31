@@ -344,6 +344,42 @@ export function disableThinkingIfToolChoiceForced(payload: PayloadBody): void {
   }
 }
 
+/**
+ * Anthropic rejects requests that pin a temperature other than 1 when
+ * thinking is enabled / adaptive / auto. Force the temperature to 1 in
+ * that case so CC CLI's default `temperature: 0` (or any custom value)
+ * does not surface as a 400 from the upstream.
+ */
+export function normalizeClaudeTemperatureForThinking(
+  payload: PayloadBody
+): void {
+  if (!Object.prototype.hasOwnProperty.call(payload, "temperature")) {
+    return
+  }
+
+  const thinking = payload.thinking as { type?: unknown } | undefined | null
+  const thinkingType =
+    thinking &&
+    typeof thinking === "object" &&
+    typeof thinking.type === "string"
+      ? thinking.type.trim().toLowerCase()
+      : ""
+
+  if (
+    thinkingType !== "enabled" &&
+    thinkingType !== "adaptive" &&
+    thinkingType !== "auto"
+  ) {
+    return
+  }
+
+  if (payload.temperature === 1) {
+    return
+  }
+
+  payload.temperature = 1
+}
+
 // ───────────────── combined optimization entry point ─────────────────
 
 /**
@@ -352,9 +388,11 @@ export function disableThinkingIfToolChoiceForced(payload: PayloadBody): void {
  *
  * Operations performed:
  * 1. Disable thinking if tool_choice forces tool use
- * 2. Auto-inject cache_control breakpoints if none exist
- * 3. Enforce cache_control block limit (max 4)
- * 4. Normalize TTL values to prevent ordering violations
+ * 2. Normalize temperature to 1 when thinking is enabled (Anthropic
+ *    rejects any other value)
+ * 3. Auto-inject cache_control breakpoints if none exist
+ * 4. Enforce cache_control block limit (max 4)
+ * 5. Normalize TTL values to prevent ordering violations
  */
 export function applyPromptCachingOptimizations(
   body: Record<string, unknown>
@@ -364,12 +402,15 @@ export function applyPromptCachingOptimizations(
   // 1. Thinking safety
   disableThinkingIfToolChoiceForced(payload)
 
-  // 2. Auto-inject cache_control if missing
+  // 2. Temperature must be 1 when thinking is active
+  normalizeClaudeTemperatureForThinking(payload)
+
+  // 3. Auto-inject cache_control if missing
   ensureCacheControl(payload)
 
-  // 3. Enforce cache_control block limit
+  // 4. Enforce cache_control block limit
   enforceCacheControlLimit(payload)
 
-  // 4. Normalize TTL ordering
+  // 5. Normalize TTL ordering
   normalizeCacheControlTTL(payload)
 }

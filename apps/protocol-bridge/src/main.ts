@@ -21,6 +21,33 @@ import { ModelRouterService } from "./llm/shared/model-router.service"
 import { registerContentTypeParsers } from "./shared/content-type-parsers"
 import { registerRequestHooks } from "./shared/request-hooks"
 
+// ── Global crash guards ───────────────────────────────────────────────
+// The bridge is a long-lived daemon spawned detached from the IDE
+// extension host. Without these handlers a single unhandled promise
+// rejection (e.g. an OAuth token refresh that rejects on a bad Claude
+// account) terminates the whole process under Node's default policy,
+// which the extension surfaces as "the whole extension crashed". Log the
+// failure and keep serving — request-scoped errors are already rendered
+// into proper HTTP/SSE error envelopes by the controllers, so a stray
+// rejection escaping a non-awaited path must not be fatal.
+//
+// Installed at module top-level so the guards are active regardless of
+// entry point (direct `main.ts` or the SEA `sea-entry.ts`, which imports
+// this module).
+const crashGuardLogger = new Logger("CrashGuard")
+
+process.on("unhandledRejection", (reason: unknown) => {
+  const detail =
+    reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)
+  crashGuardLogger.error(`Unhandled promise rejection (non-fatal): ${detail}`)
+})
+
+process.on("uncaughtException", (error: Error) => {
+  crashGuardLogger.error(
+    `Uncaught exception (non-fatal): ${error.stack ?? error.message}`
+  )
+})
+
 // ── Auto-configure NODE_EXTRA_CA_CERTS for mkcert CA ──────────────────
 // Electron/Node.js does NOT read macOS System Keychain for TLS trust.
 // This ensures the mkcert root CA is trusted by all Node.js HTTPS clients.
@@ -383,7 +410,7 @@ ${line(`  GPT / O-series      ${c.dim}→${c.reset}  ${gptRoute}`)}
 ${empty}
 ${sep}
 ${line(`${c.orange}${c.bold}API Endpoints${c.reset}`)}
-${line(`  ${c.purple}POST${c.reset} /v1/messages ${c.dim}·· Anthropic Messages API${c.reset}`)}
+${line(`  ${c.purple}POST${c.reset} /v1/messages ${c.dim}·· Anthropic API${c.reset}`)}
 ${line(`  ${c.purple}GET ${c.reset} /v1/models   ${c.dim}·· List available models${c.reset}`)}
 ${line(`  ${c.purple}POST${c.reset} /agent.v1.*  ${c.dim}·· Cursor gRPC endpoints${c.reset}`)}
 ${line(`  ${c.purple}GET ${c.reset} /health      ${c.dim}·· Health check${c.reset}`)}

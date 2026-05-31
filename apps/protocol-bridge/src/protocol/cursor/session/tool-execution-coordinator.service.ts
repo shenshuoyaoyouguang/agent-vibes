@@ -1,8 +1,11 @@
 import { Injectable, Logger } from "@nestjs/common"
 import * as fs from "fs"
 import * as path from "path"
-import type { ChatSession, PendingToolCall } from "./chat-session.service"
-import { ChatSessionManager } from "./chat-session.service"
+import type {
+  SessionRecord,
+  PendingToolCall,
+} from "./session-lifecycle.service"
+import { SessionLifecycleService } from "./session-lifecycle.service"
 import type {
   ToolExecutionOwner,
   ToolExecutionRecoveryReason,
@@ -19,7 +22,7 @@ export interface ToolInputEofRecoveryPlan {
 export class ToolExecutionCoordinatorService {
   private readonly logger = new Logger(ToolExecutionCoordinatorService.name)
 
-  constructor(private readonly sessionManager: ChatSessionManager) {}
+  constructor(private readonly sessionManager: SessionLifecycleService) {}
 
   classifyOwner(toolName: string): ToolExecutionOwner {
     return this.isBridgeLocalInputEofFallbackTool(toolName)
@@ -29,7 +32,12 @@ export class ToolExecutionCoordinatorService {
 
   registerPendingTool(conversationId: string, toolCallId: string): void {
     const session = this.sessionManager.getSession(conversationId)
-    const pending = session?.pendingToolCalls.get(toolCallId)
+    const pending = session
+      ? this.sessionManager.getPendingToolCall(
+          session.conversationId,
+          toolCallId
+        )
+      : undefined
     if (!session || !pending) return
 
     this.sessionManager.updatePendingToolExecution(conversationId, toolCallId, {
@@ -79,7 +87,9 @@ export class ToolExecutionCoordinatorService {
     }
 
     const candidateSet = new Set(candidateToolCallIds.filter(Boolean))
-    const pendingIds = Array.from(session.pendingToolCalls.entries())
+    const pendingIds = Array.from(
+      this.sessionManager.listPendingToolCallEntries(session.conversationId)
+    )
       .filter(([toolCallId, pending]) => {
         if (candidateSet.size > 0 && !candidateSet.has(toolCallId)) return false
         return pending.streamId === streamId
@@ -96,7 +106,10 @@ export class ToolExecutionCoordinatorService {
     const unresolvedToolCallIds: string[] = []
 
     for (const toolCallId of pendingIds) {
-      const pending = session.pendingToolCalls.get(toolCallId)
+      const pending = this.sessionManager.getPendingToolCall(
+        session.conversationId,
+        toolCallId
+      )
       if (!pending) continue
       const canRunBridgeLocal = this.canRunBridgeLocalInputEofFallback(
         session,
@@ -155,7 +168,7 @@ export class ToolExecutionCoordinatorService {
   }
 
   canRunBridgeLocalInputEofFallback(
-    session: ChatSession,
+    session: SessionRecord,
     pendingToolCall: PendingToolCall
   ): boolean {
     const normalized = pendingToolCall.toolName.trim().toLowerCase()
@@ -174,7 +187,7 @@ export class ToolExecutionCoordinatorService {
     })
   }
 
-  private hasLocalWorkspaceRoot(session: ChatSession): boolean {
+  private hasLocalWorkspaceRoot(session: SessionRecord): boolean {
     const roots = new Set<string>()
     const rootPath = session.projectContext?.rootPath?.trim()
     if (rootPath) roots.add(rootPath)

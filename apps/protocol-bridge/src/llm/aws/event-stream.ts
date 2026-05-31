@@ -41,6 +41,7 @@ export async function parseKiroEventStream(
   let outputTokens = 0
   let totalCredits = 0
   let currentToolUse: ToolUseState | null = null
+  let producedContent = false
 
   const append = (chunk: Uint8Array): void => {
     if (pending.length === 0) {
@@ -135,6 +136,7 @@ export async function parseKiroEventStream(
               // before yielding to consumers — match that behavior exactly.
               // No dedup/overlap handling: each event is a clean delta.
               callback.onText(unescapeHtmlEntities(content), false)
+              producedContent = true
             }
             break
           }
@@ -142,10 +144,19 @@ export async function parseKiroEventStream(
             const text = readString(event, "text")
             if (text && callback.onText) {
               callback.onText(unescapeHtmlEntities(text), true)
+              producedContent = true
             }
             break
           }
           case "toolUseEvent": {
+            // Mark the stream as productive on the FRAME (not the
+            // post-handle state): handleToolUseEvent returns null when
+            // the same frame both opens and closes the tool call (it
+            // calls finishToolUse → onToolUse synchronously). Gating
+            // producedContent on the post-handle state would miss
+            // single-frame tool calls and re-trigger the empty-stream
+            // guard erroneously.
+            producedContent = true
             currentToolUse = handleToolUseEvent(event, currentToolUse, callback)
             break
           }
@@ -204,6 +215,25 @@ export async function parseKiroEventStream(
     if (currentToolUse) {
       finishToolUse(currentToolUse, callback)
       currentToolUse = null
+    }
+
+    // Detect "stream ended but produced nothing useful". AWS Event
+    // Stream framing lets the upstream close the connection cleanly
+    // without ever emitting an assistantResponseEvent / toolUseEvent
+    // / error frame — observed in practice on Kiro IDE when the
+    // gateway times out a long compaction summary request mid-flight.
+    // If we let the parser return normally here, the caller emits a
+    // synthetic message_delta + message_stop and CC CLI accepts the
+    // empty body as a successful compact summary, silently corrupting
+    // the conversation (history gets replaced with an empty <summary>
+    // and the next turn immediately recreates the over-cap condition).
+    // Surface an explicit error so the caller treats it as a stream
+    // failure and the controller renders an SSE event:error envelope
+    // CC CLI can recover from via PTL retry / visible failure.
+    if (!producedContent) {
+      throw new Error(
+        "Kiro stream closed without producing any assistant content"
+      )
     }
 
     if (callback.onCredits && totalCredits > 0) {

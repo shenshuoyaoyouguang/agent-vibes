@@ -12,7 +12,7 @@ import type {
   BackendPoolStatus,
   CodexRateLimitWindow,
 } from "./llm/shared/backend-pool-status"
-import { ChatSessionManager } from "./protocol/cursor/session/chat-session.service"
+import { SessionLifecycleService } from "./protocol/cursor/session/session-lifecycle.service"
 import { UsageStatsService } from "./usage"
 
 type NativePoolStatusSummary = Pick<
@@ -65,7 +65,7 @@ export class HealthController {
     private readonly anthropicApiService: AnthropicApiService,
     private readonly kiroService: KiroService,
     private readonly usageStats: UsageStatsService,
-    private readonly chatSessions: ChatSessionManager
+    private readonly chatSessions: SessionLifecycleService
   ) {}
 
   /** Throttled reloadAccounts: executes at most once per 15 seconds */
@@ -372,6 +372,17 @@ export class HealthController {
       timestamp: new Date().toISOString(),
       totalAccounts: accounts.length,
       accounts,
+    }
+  }
+
+  @Post("maintenance/clear-cache")
+  @ApiOperation({ summary: "Clear bridge-managed session cache and temp data" })
+  clearCache() {
+    const result = this.chatSessions.clearAllSessionCaches()
+    return {
+      timestamp: new Date().toISOString(),
+      ok: result.warnings.length === 0,
+      ...result,
     }
   }
 

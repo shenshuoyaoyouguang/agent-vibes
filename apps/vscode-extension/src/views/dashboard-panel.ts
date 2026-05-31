@@ -24,6 +24,7 @@ import { BridgeManager } from "../services/bridge-manager"
 import { startCodexOAuthFlow } from "../services/codex-oauth-service"
 import { ConfigManager } from "../services/config-manager"
 import { CursorChecksumsService } from "../services/cursor-checksums"
+import { CursorPatchService } from "../services/cursor-patch"
 import { CursorPatchManagerService } from "../services/cursor-patch-manager"
 import { NetworkManager } from "../services/network-manager"
 import { startOAuthFlow } from "../services/oauth-service"
@@ -97,6 +98,7 @@ export class DashboardPanel {
   private accountFileWatchers: vscode.FileSystemWatcher[] = []
   private accountFileDebounceTimer: ReturnType<typeof setTimeout> | null = null
   private readonly cursorPatchManager = new CursorPatchManagerService()
+  private readonly cursorPatchService = new CursorPatchService(logger)
   private readonly cursorChecksums = new CursorChecksumsService()
 
   private constructor(
@@ -121,6 +123,15 @@ export class DashboardPanel {
         channel?: string
         index?: number
         accountId?: string
+        identity?: {
+          authMethod?: string
+          region?: string
+          refreshToken?: string
+          accessToken?: string
+          clientId?: string
+          kiroApiKey?: string
+          label?: string
+        }
         raw?: string
         data?: Record<string, unknown>
         key?: string
@@ -128,6 +139,10 @@ export class DashboardPanel {
         testId?: string
         apiKey?: string
         label?: string
+        // copy-to-clipboard text and endpoint test url (used by the
+        // API tab's Copy / Test buttons).
+        text?: string
+        url?: string
       }) => this.handleMessage(msg),
       null,
       this.disposables
@@ -212,6 +227,14 @@ export class DashboardPanel {
     channel?: string
     index?: number
     accountId?: string
+    identity?: {
+      authMethod?: string
+      region?: string
+      refreshToken?: string
+      accessToken?: string
+      clientId?: string
+      kiroApiKey?: string
+    }
     raw?: string
     data?: Record<string, unknown>
     key?: string
@@ -219,6 +242,10 @@ export class DashboardPanel {
     testId?: string
     apiKey?: string
     label?: string
+    // copy-to-clipboard text and endpoint test url (used by the
+    // API tab's Copy / Test buttons).
+    text?: string
+    url?: string
   }): Promise<void> {
     switch (msg.type) {
       case "getAll":
@@ -254,19 +281,32 @@ export class DashboardPanel {
       case "runCommand":
         if (msg.command) {
           const fwdBefore = this.network.isForwardingActive()
-          const commandPromise = vscode.commands.executeCommand(msg.command)
+          const command = msg.command
+          const commandPromise = vscode.commands.executeCommand(command)
           // Push the changed state quickly so toggles/buttons can reflect
           // the command result before any follow-up notification is dismissed.
           setTimeout(() => this.sendAllData(), 50)
           try {
             await commandPromise
+          } catch (err) {
+            // Command threw — log and let finally below release the
+            // pending lock. Without an explicit catch, an unhandled
+            // rejection can bubble out of this onDidReceiveMessage
+            // handler and skip the finally branch on some hosts.
+            logger.warn(
+              `Command ${command} rejected: ${err instanceof Error ? err.message : String(err)}`
+            )
           } finally {
+            // Always release the webview pending lock, even when the
+            // panel is hidden / disposed (postMessage is a no-op on a
+            // disposed webview, so this is safe).
+            this.sendCommandFinished(command)
             setTimeout(() => this.sendAllData(), 1000)
             // For forwarding commands that run async in terminal (sudo),
             // poll until the state actually changes or timeout after 30s.
             if (
-              msg.command.includes("Forwarding") ||
-              msg.command.includes("forwarding")
+              command.includes("Forwarding") ||
+              command.includes("forwarding")
             ) {
               let polls = 0
               const maxPolls = 15
@@ -289,6 +329,11 @@ export class DashboardPanel {
           if (filePath) {
             if (msg.channel === "codex" && msg.accountId) {
               this.config.removeCodexAccount(filePath, msg.accountId)
+            } else if (msg.channel === "kiro" && msg.identity) {
+              // Kiro entries have no single id field and the bridge rewrites
+              // kiro-accounts.json out of band, so remove by stable identity
+              // instead of array position to avoid deleting the wrong row.
+              this.config.removeKiroAccount(filePath, msg.identity)
             } else if (msg.index !== undefined) {
               this.config.removeAccount(filePath, msg.index)
             }
@@ -300,6 +345,18 @@ export class DashboardPanel {
       case "activateCodexCli":
         if (msg.index !== undefined) {
           this.activateCodexCliAccount(msg.index)
+        }
+        break
+
+      case "forceKiroIdeLogin":
+        if (msg.identity) {
+          void this.handleForceKiroIdeLogin(msg.identity)
+        }
+        break
+
+      case "forceKiroCliLogin":
+        if (msg.identity) {
+          void this.handleForceKiroCliLogin(msg.identity)
         }
         break
 
@@ -372,6 +429,22 @@ export class DashboardPanel {
         void this.handleStartKiroOAuth()
         break
 
+      case "startClaudeOAuth":
+        void this.handleStartClaudeOAuth()
+        break
+
+      case "claudeIntegrationStatus":
+        void this.handleClaudeIntegrationStatus()
+        break
+
+      case "claudeIntegrationConnect":
+        void this.handleClaudeIntegrationConnect()
+        break
+
+      case "claudeIntegrationDisconnect":
+        void this.handleClaudeIntegrationDisconnect()
+        break
+
       case "importKiroToken":
         if (msg.raw) {
           this.handleImportKiroToken(msg.raw)
@@ -383,6 +456,107 @@ export class DashboardPanel {
           this.handleImportKiroApiKey(msg.apiKey, msg.label)
         }
         break
+
+      case "copyToClipboard": {
+        const text: unknown = msg.text
+        if (typeof text === "string" && text.length > 0) {
+          void vscode.env.clipboard.writeText(text)
+        }
+        break
+      }
+
+      case "testEndpoint": {
+        const url: unknown = msg.url
+        if (typeof url === "string" && url.length > 0) {
+          void this.handleTestEndpoint(url)
+        }
+        break
+      }
+    }
+  }
+
+  /**
+   * Probe an exposed bridge endpoint with a `/health` GET and surface
+   * the result as a toast. Called from the API tab's Test buttons.
+   *
+   * Lives in the extension host (not the webview) for two reasons:
+   *   1. The webview's strict CSP forbids fetch() against `localhost`
+   *      under HTTPS with a self-signed cert.
+   *   2. We hold the mkcert CA chain already.
+   */
+  private async handleTestEndpoint(url: string): Promise<void> {
+    try {
+      const https = await import("https")
+      const http = await import("http")
+      const { URL } = await import("url")
+      const head = url.trim().split(/\s+/)[0] || url.trim()
+      const target = new URL(head)
+      const isHttps = target.protocol === "https:"
+      const port = target.port ? Number(target.port) : isHttps ? 443 : 80
+      const apiPath = target.pathname || "/health"
+
+      const headers: Record<string, string> = {
+        accept: "application/json,text/plain;q=0.8,*/*;q=0.5",
+        "user-agent": "agent-vibes-extension-probe/1",
+      }
+
+      // Trust the mkcert CA the bridge uses for HTTPS, but don't fail
+      // hard if the cert file went missing — fall back to skipping
+      // verification (the bridge only listens on localhost).
+      const fs = require("fs") as typeof import("fs")
+      const caData =
+        isHttps &&
+        this.config.caCertPath &&
+        fs.existsSync(this.config.caCertPath)
+          ? fs.readFileSync(this.config.caCertPath)
+          : undefined
+
+      const result = await new Promise<{
+        ok: boolean
+        status: number
+      }>((resolve, reject) => {
+        const client = isHttps ? https : http
+        const req = client.request(
+          {
+            hostname: target.hostname,
+            port,
+            path: apiPath,
+            method: "GET",
+            headers,
+            ...(isHttps
+              ? caData
+                ? { ca: caData, rejectUnauthorized: true }
+                : { rejectUnauthorized: false }
+              : {}),
+          },
+          (res) => {
+            res.on("data", () => {})
+            res.on("end", () => {
+              const code = res.statusCode ?? 0
+              resolve({
+                ok: code >= 200 && code < 300,
+                status: code,
+              })
+            })
+          }
+        )
+        req.on("error", (err) => reject(err))
+        req.setTimeout(8000, () => req.destroy(new Error("Request timed out")))
+        req.end()
+      })
+
+      if (result.ok) {
+        void vscode.window.showInformationMessage(
+          `Endpoint reachable (HTTP ${result.status})`
+        )
+      } else {
+        void vscode.window.showWarningMessage(
+          `Endpoint responded with HTTP ${result.status}`
+        )
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      void vscode.window.showErrorMessage(`Endpoint test failed: ${message}`)
     }
   }
 
@@ -964,6 +1138,46 @@ export class DashboardPanel {
       locale,
       checksumStatusDescRaw
     )
+    const idlePatchStatus =
+      this.cursorPatchService.getIdleExtensionHostKillerStatus()
+    const idlePatchValue = !idlePatchStatus.fileExists
+      ? translateNotFound(locale, "Not found")
+      : idlePatchStatus.applied
+        ? translateOnOff(locale, "On")
+        : idlePatchStatus.canApply
+          ? translateOnOff(locale, "Off")
+          : locale === "zh"
+            ? "不可用"
+            : "Unavailable"
+    const idlePatchHint = !idlePatchStatus.fileExists
+      ? locale === "zh"
+        ? "未找到 Cursor workbench 文件。"
+        : "Cursor workbench file was not found."
+      : idlePatchStatus.applied && idlePatchStatus.managedBaseline
+        ? locale === "zh"
+          ? "补丁已生效，并已纳入重置基线。"
+          : "Patch is active and managed by the reset baseline."
+        : idlePatchStatus.applied && idlePatchStatus.legacyBackupClean
+          ? locale === "zh"
+            ? "补丁已生效；点击应用可把原始备份纳入重置基线。"
+            : "Patch is active; click Apply to register its original backup for Reset All."
+          : idlePatchStatus.applied
+            ? locale === "zh"
+              ? "补丁已生效，但未找到可用于重置的原始备份。"
+              : "Patch is active, but no clean original backup was found for Reset All."
+            : idlePatchStatus.canApply
+              ? locale === "zh"
+                ? "阻止 Cursor 在空闲时停止扩展宿主，降低长会话中断概率。"
+                : "Prevents Cursor from stopping extension hosts during long idle sessions."
+              : locale === "zh"
+                ? "当前 Cursor 构建未匹配到可应用的补丁位置。"
+                : "No matching patch location was found in this Cursor build."
+    const canApplyIdlePatch =
+      idlePatchStatus.fileExists &&
+      ((!idlePatchStatus.applied && idlePatchStatus.canApply) ||
+        (idlePatchStatus.applied &&
+          !idlePatchStatus.managedBaseline &&
+          idlePatchStatus.legacyBackupClean))
     const channelAccountsData = {
       codex: this.getChannelData("codex"),
       "openai-compat": this.getChannelData("openai-compat"),
@@ -1179,6 +1393,21 @@ export class DashboardPanel {
                 value: cursorBuildValue,
               },
               {
+                label: st.groups.patch.items.idleKiller.label,
+                desc: st.groups.patch.items.idleKiller.desc,
+                type: "actions",
+                value: idlePatchValue,
+                hint: idlePatchHint,
+                actions: [
+                  {
+                    label: st.patch.applyIdleKiller,
+                    command: CMD.APPLY_CURSOR_IDLE_KILLER_PATCH,
+                    tone: "secondary",
+                    disabled: !canApplyIdlePatch,
+                  },
+                ],
+              },
+              {
                 label: st.groups.patch.items.resetPatches.label,
                 desc: st.groups.patch.items.resetPatches.desc,
                 type: "actions",
@@ -1325,6 +1554,13 @@ export class DashboardPanel {
         (overallState === "ready" ? CMD.RESTART_SERVER : undefined),
       steps,
     }
+  }
+
+  public sendCommandFinished(command: string): void {
+    this.panel.webview.postMessage({
+      type: "commandFinished",
+      command,
+    })
   }
 
   /**
@@ -2054,6 +2290,277 @@ export class DashboardPanel {
   }
 
   /**
+   * Anthropic OAuth + PKCE flow for the Claude Code CLI channel.
+   *
+   * Mirrors the Kiro Builder ID flow: ask the bridge to start a session
+   * (which spins up a one-shot listener on an OS-allocated ephemeral
+   * port), open the auth URL in the user's browser, then poll until the
+   * listener captures the callback. The bridge handles token exchange +
+   * persistence + reload.
+   */
+  private async handleStartClaudeOAuth(): Promise<void> {
+    try {
+      this.panel.webview.postMessage({
+        type: "claudeOAuthStatus",
+        data: { status: "loading", message: "Starting Anthropic OAuth..." },
+      })
+
+      const startResult = await this.callBridgeApi<{
+        sessionId: string
+        authUrl: string
+        expiresAt: number
+      }>("/api/claude/login/start", "POST", {})
+
+      if (!startResult?.sessionId || !startResult.authUrl) {
+        throw new Error("Bridge returned invalid Claude OAuth session")
+      }
+
+      await vscode.env.openExternal(vscode.Uri.parse(startResult.authUrl))
+
+      this.panel.webview.postMessage({
+        type: "claudeOAuthStatus",
+        data: {
+          status: "loading",
+          message: "Waiting for Anthropic authorization...",
+        },
+      })
+
+      // Poll the bridge until the session reports completed/expired/error.
+      const intervalMs = 2000
+      const deadline = startResult.expiresAt || Date.now() + 600_000
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, intervalMs))
+
+        const poll = await this.callBridgeApi<{
+          status: string
+          accountCount?: number
+          email?: string
+          replaced?: boolean
+          path?: string
+          message?: string
+        }>("/api/claude/login/poll", "POST", {
+          sessionId: startResult.sessionId,
+        })
+
+        if (!poll) {
+          throw new Error("Bridge poll returned empty response")
+        }
+
+        if (poll.status === "completed") {
+          const who = poll.email || "anthropic-oauth"
+          const verb = poll.replaced ? "updated" : "added"
+          this.panel.webview.postMessage({
+            type: "claudeOAuthStatus",
+            data: {
+              status: "success",
+              message: `Claude Code CLI account ${verb}: ${who} (${
+                poll.accountCount ?? 0
+              } total)`,
+            },
+          })
+          this.sendAllData()
+          return
+        }
+
+        if (poll.status === "expired") {
+          throw new Error(poll.message || "Anthropic OAuth session expired")
+        }
+
+        if (poll.status === "error") {
+          throw new Error(poll.message || "Anthropic OAuth failed")
+        }
+      }
+
+      // Timed out without completing — best-effort cancel.
+      try {
+        await this.callBridgeApi("/api/claude/login/cancel", "POST", {
+          sessionId: startResult.sessionId,
+        })
+      } catch {
+        // Ignore — the bridge may have already evicted the session.
+      }
+      throw new Error("Anthropic OAuth authorization timed out")
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err)
+      logger.error("Claude OAuth flow failed", err)
+
+      this.panel.webview.postMessage({
+        type: "claudeOAuthStatus",
+        data: { status: "error", message: errorMsg },
+      })
+    }
+  }
+
+  /**
+   * Read the current `~/.claude/settings.json` integration state and
+   * push it to the webview so the Claude Code CLI Integration panel can
+   * render Connect / Disconnect.
+   */
+  private async handleClaudeIntegrationStatus(): Promise<void> {
+    try {
+      const status = await this.callBridgeApi<{
+        connected: boolean
+        settingsPath: string
+        backupPath: string
+        managedBridgeUrl?: string
+        managedAt?: string
+        backupExists: boolean
+        settingsExists: boolean
+      }>("/api/claude/integration/status", "GET")
+
+      this.panel.webview.postMessage({
+        type: "claudeIntegrationUpdate",
+        data: { kind: "status", payload: status },
+      })
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err)
+      this.panel.webview.postMessage({
+        type: "claudeIntegrationUpdate",
+        data: { kind: "error", message: errorMsg },
+      })
+    }
+  }
+
+  /**
+   * Connect CC CLI to this Bridge. The Bridge endpoint atomically
+   * rewrites `~/.claude/settings.json` and snapshots the original.
+   */
+  private async handleClaudeIntegrationConnect(): Promise<void> {
+    try {
+      this.panel.webview.postMessage({
+        type: "claudeIntegrationUpdate",
+        data: { kind: "loading", message: "Connecting CC CLI to bridge..." },
+      })
+
+      const bridgeBaseUrl = this.resolveBridgeBaseUrl()
+      const apiKey = this.resolveBridgeApiKey()
+      const caCertPath = this.resolveBridgeCaCertPath()
+
+      const result = await this.callBridgeApi<{
+        status?: string
+        settingsPath?: string
+        managedBridgeUrl?: string
+        backupCreated?: boolean
+        error?: string
+      }>("/api/claude/integration/connect", "POST", {
+        bridgeUrl: bridgeBaseUrl,
+        apiKey,
+        caCertPath,
+      })
+
+      if (!result || result.error || result.status !== "connected") {
+        throw new Error(
+          result?.error || "Bridge returned an unexpected connect response"
+        )
+      }
+
+      this.panel.webview.postMessage({
+        type: "claudeIntegrationUpdate",
+        data: {
+          kind: "success",
+          message: result.backupCreated
+            ? `Connected — original settings backed up`
+            : `Connected to ${result.managedBridgeUrl}`,
+        },
+      })
+
+      // Refresh status panel to show the new connected state.
+      await this.handleClaudeIntegrationStatus()
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err)
+      logger.error("Claude integration connect failed", err)
+      this.panel.webview.postMessage({
+        type: "claudeIntegrationUpdate",
+        data: { kind: "error", message: errorMsg },
+      })
+    }
+  }
+
+  /**
+   * Disconnect CC CLI — restore the backup if available, otherwise
+   * surgically remove our managed env keys.
+   */
+  private async handleClaudeIntegrationDisconnect(): Promise<void> {
+    try {
+      this.panel.webview.postMessage({
+        type: "claudeIntegrationUpdate",
+        data: { kind: "loading", message: "Disconnecting CC CLI..." },
+      })
+
+      const result = await this.callBridgeApi<{
+        status?: string
+        settingsPath?: string
+        restoredFromBackup?: boolean
+      }>("/api/claude/integration/disconnect", "POST", {})
+
+      if (!result) {
+        throw new Error("Bridge returned empty disconnect response")
+      }
+
+      const status = result.status || "disconnected"
+      this.panel.webview.postMessage({
+        type: "claudeIntegrationUpdate",
+        data: {
+          kind: "success",
+          message:
+            status === "settings-missing"
+              ? "No settings file to disconnect"
+              : status === "not-managed"
+                ? "Settings were not managed by Agent Vibes"
+                : result.restoredFromBackup
+                  ? "Disconnected — original settings restored"
+                  : "Disconnected — managed entries removed",
+        },
+      })
+
+      await this.handleClaudeIntegrationStatus()
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err)
+      logger.error("Claude integration disconnect failed", err)
+      this.panel.webview.postMessage({
+        type: "claudeIntegrationUpdate",
+        data: { kind: "error", message: errorMsg },
+      })
+    }
+  }
+
+  /**
+   * Compute the Bridge URL that CC CLI should target. Defaults to the
+   * locally-running bridge's HTTPS endpoint; honours `agentVibes.port`
+   * if the user has overridden it.
+   */
+  private resolveBridgeBaseUrl(): string {
+    const port = this.config.port
+    // The bridge auto-selects HTTPS when mkcert certs are present,
+    // otherwise plain HTTP. Mirror that detection here so CC CLI ends
+    // up with the correct scheme — fs.existsSync on the cert path is
+    // the cheapest check.
+    const useHttps = this.bridgeIsHttps()
+    const protocol = useHttps ? "https" : "http"
+    return `${protocol}://localhost:${port}`
+  }
+
+  private resolveBridgeApiKey(): string | undefined {
+    const fromEnv = process.env.PROXY_API_KEY?.trim()
+    return fromEnv || undefined
+  }
+
+  private resolveBridgeCaCertPath(): string | undefined {
+    if (!this.bridgeIsHttps()) return undefined
+    const fs = require("fs") as typeof import("fs")
+    if (!fs.existsSync(this.config.caCertPath)) return undefined
+    return this.config.caCertPath
+  }
+
+  private bridgeIsHttps(): boolean {
+    const fs = require("fs") as typeof import("fs")
+    return (
+      fs.existsSync(this.config.serverCertPath) &&
+      fs.existsSync(this.config.serverKeyPath)
+    )
+  }
+
+  /**
    * Kiro manual token paste — calls bridge /api/kiro/import.
    */
   private handleImportKiroToken(raw: string): void {
@@ -2319,6 +2826,100 @@ export class DashboardPanel {
       logger.error("Failed to write Codex CLI auth file", err)
       void vscode.window.showErrorMessage(
         tFmt("dash.codex.activateFailed", { message: errMsg })
+      )
+    }
+  }
+
+  /** Force the local Kiro IDE to sign in as an existing pool account. */
+  private async handleForceKiroIdeLogin(identity: {
+    authMethod?: string
+    region?: string
+    refreshToken?: string
+    accessToken?: string
+    clientId?: string
+    kiroApiKey?: string
+    label?: string
+  }): Promise<void> {
+    if (this.bridge.state !== "running") {
+      void vscode.window.showWarningMessage(t("dash.kiro.bridgeNotRunning"))
+      return
+    }
+    try {
+      const result = await this.callBridgeApi<{
+        success: boolean
+        label: string
+        tokenPath?: string
+        registrationPath?: string
+        profilePath?: string
+        error?: string
+      }>("/api/kiro/force-ide-login", "POST", identity)
+
+      if (result?.success) {
+        const label = result.label || identity.label || "Kiro account"
+        void vscode.window.showInformationMessage(
+          tFmt("dash.kiro.forceLoginOk", { label })
+        )
+        logger.info(
+          `Kiro IDE force-login succeeded for ${label} (${result.tokenPath})`
+        )
+      } else {
+        const message = result?.error || t("dash.kiro.forceLoginFailedGeneric")
+        void vscode.window.showErrorMessage(
+          tFmt("dash.kiro.forceLoginFailed", { message })
+        )
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      logger.error("Kiro IDE force-login failed", err)
+      void vscode.window.showErrorMessage(
+        tFmt("dash.kiro.forceLoginFailed", { message })
+      )
+    }
+  }
+
+  /** Force the local Kiro CLI to sign in as an existing pool account. */
+  private async handleForceKiroCliLogin(identity: {
+    authMethod?: string
+    region?: string
+    refreshToken?: string
+    accessToken?: string
+    clientId?: string
+    kiroApiKey?: string
+    label?: string
+  }): Promise<void> {
+    if (this.bridge.state !== "running") {
+      void vscode.window.showWarningMessage(t("dash.kiro.bridgeNotRunning"))
+      return
+    }
+    try {
+      const result = await this.callBridgeApi<{
+        success: boolean
+        label: string
+        dbPath?: string
+        tokenPath?: string
+        error?: string
+      }>("/api/kiro/force-cli-login", "POST", identity)
+
+      if (result?.success) {
+        const label = result.label || identity.label || "Kiro account"
+        void vscode.window.showInformationMessage(
+          tFmt("dash.kiro.forceCliLoginOk", { label })
+        )
+        logger.info(
+          `Kiro CLI force-login succeeded for ${label} (${result.dbPath})`
+        )
+      } else {
+        const message =
+          result?.error || t("dash.kiro.forceCliLoginFailedGeneric")
+        void vscode.window.showErrorMessage(
+          tFmt("dash.kiro.forceCliLoginFailed", { message })
+        )
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      logger.error("Kiro CLI force-login failed", err)
+      void vscode.window.showErrorMessage(
+        tFmt("dash.kiro.forceCliLoginFailed", { message })
       )
     }
   }

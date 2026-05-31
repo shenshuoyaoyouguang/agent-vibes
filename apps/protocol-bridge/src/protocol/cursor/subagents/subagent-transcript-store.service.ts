@@ -31,6 +31,7 @@ import {
 } from "fs"
 import { homedir } from "os"
 import { join } from "path"
+import type { ToolInterruptionReason } from "../session/tool-interruption"
 
 export type SubagentTaskStatus =
   | "running"
@@ -53,8 +54,9 @@ export interface SubagentTaskMetadata {
   modifiedFiles: string[]
   /** Final assistant text (also written to result.txt). */
   finalText?: string
-  /** Set when status === "failed"; populated with the error message. */
+  /** Set when terminal status is not completed; kept parseable for automation. */
   errorMessage?: string
+  errorReason?: ToolInterruptionReason
   /**
    * Serialised TaskSuccess.conversationSteps[] payload — assistant /
    * thinking / toolCall steps as the worker accumulates them. Stored as

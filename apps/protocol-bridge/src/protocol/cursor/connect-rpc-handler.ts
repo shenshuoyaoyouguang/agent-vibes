@@ -289,10 +289,69 @@ export class ConnectRPCHandler {
   private async *createInputStream(req: FastifyRequest): AsyncIterable<Buffer> {
     this.logger.log(">>> createInputStream started")
 
-    // First, yield the initial request body
-    const initialBody = req.body as Buffer
-    let pendingBuffer: Buffer = Buffer.alloc(0)
     const compressionEncoding = this.resolveRequestCompressionEncoding(req)
+    let pendingBuffer: Buffer = Buffer.alloc(0)
+
+    // Preferred path: drain the BiDi PassThrough installed by the
+    // application/connect+proto ContentTypeParser. The parser keeps
+    // listening to the underlying HTTP/2 readable for the entire BiDi
+    // session and mirrors every chunk into this PassThrough — including
+    // the initial-body chunks that were also handed to Fastify via
+    // `done(buffer)`. By draining the PassThrough exclusively we avoid
+    // racing Fastify for `req.raw`, which is the failure mode that
+    // silently dropped the IDE's first lsResult / readResult and
+    // produced 90 s deadline-expire warnings.
+    //
+    // Fallback to `req.body` + `req.raw` is kept for non-BiDi routes
+    // (unary protobuf, etc.) where ContentTypeParser does not install
+    // bidiPayload.
+    const bidiPayload = req.bidiPayload
+    if (bidiPayload) {
+      this.logger.log(">>> Draining bidiPayload (BiDi mirror channel)")
+      try {
+        for await (const chunk of bidiPayload) {
+          const chunkBuffer = Buffer.isBuffer(chunk)
+            ? chunk
+            : Buffer.from(chunk as Uint8Array)
+          this.logger.log(`>>> Received chunk: ${chunkBuffer.length} bytes`)
+
+          pendingBuffer =
+            pendingBuffer.length === 0
+              ? chunkBuffer
+              : Buffer.concat([pendingBuffer, chunkBuffer])
+
+          const parsed = this.parseMessagesWithRemainder(
+            pendingBuffer,
+            compressionEncoding
+          )
+          pendingBuffer = parsed.remaining
+
+          for (const message of parsed.messages) {
+            this.logger.log(
+              `>>> Yielding message: ${message.data.length} bytes`
+            )
+            yield message.data
+          }
+        }
+
+        this.logger.log(">>> bidiPayload ended normally")
+        if (pendingBuffer.length > 0) {
+          this.logger.warn(
+            `>>> bidiPayload ended with ${pendingBuffer.length} unparsed trailing bytes`
+          )
+        }
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "unknown"
+        this.logger.error(`>>> bidiPayload error: ${errorMessage}`)
+      }
+
+      this.logger.log(">>> Input stream completed")
+      return
+    }
+
+    // Legacy / unary fallback: parse the buffered body, then read any
+    // remaining chunks straight from req.raw.
+    const initialBody = req.body as Buffer
     this.logger.log(
       `>>> Initial body: ${initialBody ? initialBody.length : 0} bytes (encoding=${compressionEncoding})`
     )

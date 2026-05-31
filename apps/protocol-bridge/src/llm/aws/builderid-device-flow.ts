@@ -31,6 +31,7 @@ export interface KiroDeviceAuthSession {
   region: string
   clientId: string
   clientSecret: string
+  registrationExpiresAt?: number
   deviceCode: string
   userCode: string
   verificationUri: string
@@ -46,6 +47,7 @@ export interface KiroDevicePollSuccess {
   expiresAt: number
   clientId: string
   clientSecret: string
+  registrationExpiresAt?: number
   region: string
 }
 
@@ -119,6 +121,7 @@ export async function startKiroBuilderIdDeviceFlow(options?: {
   const register = await postJson<{
     clientId?: string
     clientSecret?: string
+    clientSecretExpiresAt?: number
   }>(
     `${oidcBase}/client/register`,
     {
@@ -186,6 +189,11 @@ export async function startKiroBuilderIdDeviceFlow(options?: {
     region,
     clientId: register.data.clientId,
     clientSecret: register.data.clientSecret,
+    registrationExpiresAt:
+      typeof register.data.clientSecretExpiresAt === "number" &&
+      register.data.clientSecretExpiresAt > 0
+        ? register.data.clientSecretExpiresAt
+        : undefined,
     deviceCode: auth.data.deviceCode,
     userCode: auth.data.userCode,
     verificationUri,
@@ -245,6 +253,7 @@ export async function pollKiroBuilderIdDeviceFlow(
       expiresAt: Math.floor(Date.now() / 1000) + expiresIn,
       clientId: session.clientId,
       clientSecret: session.clientSecret,
+      registrationExpiresAt: session.registrationExpiresAt,
       region: session.region,
     }
   }

@@ -45,12 +45,47 @@ export interface KiroUserInputMessageContext {
   toolResults?: KiroToolResult[]
 }
 
+/**
+ * Per-model request overrides surfaced by `ListAvailableModels`'s
+ * `additionalModelRequestFieldsSchema`. Empirically the Kiro backend accepts
+ * this object on `userInputMessage`, and uses it to gate extended thinking
+ * and effort on Claude 4.5+ models.
+ *
+ * Schema (from ListAvailableModels, claude-opus-4.7 entry):
+ *   - thinking.type:    "adaptive" | "disabled"
+ *   - thinking.display: "summarized" | "omitted"
+ *   - output_config.effort: "low" | "medium" | "high" | "xhigh" | "max"
+ *   - max_tokens: number
+ *
+ * The default when the field is omitted is model-specific; for Opus 4.7 it
+ * behaves as `adaptive` + `summarized`, which fires `reasoningContentEvent`
+ * frames for several seconds before any tool/assistant output. Sending
+ * `{ thinking: { type: "disabled", display: "omitted" } }` removes the
+ * pre-output thinking pass entirely (verified against the live endpoint).
+ */
+export interface KiroAdditionalModelRequestFields {
+  thinking?: {
+    type: "adaptive" | "disabled"
+    display?: "summarized" | "omitted"
+  }
+  output_config?: {
+    effort?: "low" | "medium" | "high" | "xhigh" | "max"
+  }
+  max_tokens?: number
+}
+
 export interface KiroUserInputMessage {
   content: string
   modelId?: string
   origin?: string
   images?: KiroImage[]
   userInputMessageContext?: KiroUserInputMessageContext
+  /**
+   * Per-request model behavior overrides. See
+   * `KiroAdditionalModelRequestFields` for accepted keys; placement on
+   * `userInputMessage` matches the schema exposed by `ListAvailableModels`.
+   */
+  additionalModelRequestFields?: KiroAdditionalModelRequestFields
 }
 
 export interface KiroToolUse {

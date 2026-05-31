@@ -66,6 +66,11 @@ const GOOGLE_TYPE_TO_FILE = {
   "google.protobuf.Mixin": "google/protobuf/api.proto",
   "google.protobuf.FileDescriptorProto": "google/protobuf/descriptor.proto",
   "google.protobuf.DescriptorProto": "google/protobuf/descriptor.proto",
+  "google.protobuf.SourceCodeInfo": "google/protobuf/descriptor.proto",
+  "google.protobuf.SourceCodeInfo.Location": "google/protobuf/descriptor.proto",
+  "google.protobuf.GeneratedCodeInfo": "google/protobuf/descriptor.proto",
+  "google.protobuf.GeneratedCodeInfo.Annotation":
+    "google/protobuf/descriptor.proto",
 }
 
 // Minimal WKT stubs
@@ -78,7 +83,40 @@ const GOOGLE_STUBS = {
   "google/protobuf/any.proto": `syntax = "proto3";\npackage google.protobuf;\nmessage Any {\n  string type_url = 1;\n  bytes value = 2;\n}\n`,
   "google/protobuf/field_mask.proto": `syntax = "proto3";\npackage google.protobuf;\nmessage FieldMask {\n  repeated string paths = 1;\n}\n`,
   "google/protobuf/api.proto": `syntax = "proto3";\npackage google.protobuf;\nmessage Mixin {\n  string name = 1;\n  string root = 2;\n}\n`,
-  "google/protobuf/descriptor.proto": `syntax = "proto3";\npackage google.protobuf;\nmessage FileDescriptorProto {\n  string name = 1;\n  string package = 2;\n  repeated string dependency = 3;\n  repeated int32 public_dependency = 10;\n  repeated int32 weak_dependency = 11;\n  string syntax = 12;\n  string edition = 14;\n}\nmessage DescriptorProto {\n  string name = 1;\n}\n`,
+  "google/protobuf/descriptor.proto": `syntax = "proto3";
+package google.protobuf;
+message FileDescriptorProto {
+  string name = 1;
+  string package = 2;
+  repeated string dependency = 3;
+  repeated int32 public_dependency = 10;
+  repeated int32 weak_dependency = 11;
+  string syntax = 12;
+  string edition = 14;
+}
+message DescriptorProto {
+  string name = 1;
+}
+message SourceCodeInfo {
+  message Location {
+    repeated int32 path = 1;
+    repeated int32 span = 2;
+    string leading_comments = 3;
+    string trailing_comments = 4;
+    repeated string leading_detached_comments = 6;
+  }
+  repeated Location location = 1;
+}
+message GeneratedCodeInfo {
+  message Annotation {
+    repeated int32 path = 1;
+    string source_file = 2;
+    int32 begin = 3;
+    int32 end = 4;
+  }
+  repeated Annotation annotation = 1;
+}
+`,
 }
 
 // ============================================================

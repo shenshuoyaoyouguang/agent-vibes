@@ -25,7 +25,7 @@ import * as crypto from "crypto"
 import * as fs from "fs"
 import * as os from "os"
 import * as path from "path"
-import type WebSocket from "ws"
+import WebSocket from "ws"
 import type {
   ProviderAdapter,
   ProviderWarmupHint,
@@ -76,6 +76,7 @@ import {
 } from "../shared/model-registry"
 import { CodexAuthService, type CodexTokenData } from "./codex-auth.service"
 import { CodexCacheService } from "./codex-cache.service"
+import { CodexClientIdentityService } from "./codex-client-identity.service"
 import {
   buildCodexHttpHeaders,
   type CodexForwardHeaders,
@@ -210,8 +211,8 @@ interface ConversationSlotBinding {
  *     turn, which violates the client/server contract" (client.rs:209-211)
  *
  * Cross-turn state preservation:
- *   - lastResponseId IS carried across turns (via cachedWsSessions) for incremental append
- *   - sticky routing state (turn_state) is NOT carried (future: OnceLock per turn)
+ *   - lastResponseId is carried across turns (via cachedWsSessions) for incremental append
+ *   - request signature is carried with it so the next request can send only the delta
  *
  * Lifecycle:
  *   - Turn start: getOrCreateTurnContext() takes connection from cachedWsSessions
@@ -221,6 +222,10 @@ interface ConversationSlotBinding {
 interface CodexTurnContext {
   /** Current WebSocket session ID (key in wsService.sessions) */
   wsSessionId: string
+  /** Stable Codex turn metadata key used to scope sticky routing state */
+  turnKey: string | undefined
+  /** x-codex-turn-state captured from the WebSocket upgrade response */
+  turnState: string | undefined
   /** Last completed response metadata used for incremental append */
   lastResponse: CodexLastResponse | undefined
   /** Last full request sent on this WebSocket session */
@@ -238,6 +243,10 @@ interface CodexLastResponse {
 interface CachedWsEntry {
   /** Session ID in wsService */
   wsSessionId: string
+  /** Turn metadata key that produced turnState */
+  turnKey: string | undefined
+  /** x-codex-turn-state captured for this turn only */
+  turnState: string | undefined
   /** Last completed response metadata, carried across turns */
   lastResponse: CodexLastResponse | undefined
   /** Last full request sent on this WebSocket session */
@@ -248,6 +257,26 @@ interface CachedWsEntry {
 
 interface WarmupPayloadCacheEntry {
   payload: Record<string, unknown>
+  updatedAt: number
+}
+
+/**
+ * 单一会话状态机条目。
+ *
+ * 一个 conversationId 对应一个 ConversationCodexSession，承载该会话所有 turn 间共享状态：
+ *   - active: 当前 turn 持有的 CodexTurnContext（turn 边界内非空）
+ *   - streamTail: turn 串行锁的尾 promise（保证一个 conv 同时只有 1 个 turn 在跑）
+ *   - createdAt/updatedAt: 用于 LRU + TTL 清理
+ *
+ * 不接管的：
+ *   - cachedWsSessions: cache key 含 slot+model 维度，跨 conversation 共用；保留独立
+ *   - wsService.sessions: 物理 WebSocket 连接层；通过 turnContext.wsSessionId 间接引用
+ */
+interface ConversationCodexSession {
+  conversationId: string
+  active: CodexTurnContext | null
+  streamTail: Promise<void> | null
+  createdAt: number
   updatedAt: number
 }
 
@@ -284,18 +313,25 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   private readonly cachedWsSessions = new Map<string, CachedWsEntry>()
 
   /**
-   * Currently active turn contexts, keyed by conversationId.
-   * Each turn creates a fresh context; disposed at turn end.
-   * Only one active context per conversation at a time, enforced by conversationStreamLocks.
+   * 单一会话状态机：每个 conversationId 对应一个 ConversationCodexSession。
+   *
+   * 合并了原先三套并行 Map：
+   *   - activeTurnContexts (Map<conversationId, CodexTurnContext>)
+   *   - conversationStreamLocks (Map<conversationId, Promise<void>>)
+   *   - 部分 conversation-scoped 的 cache 句柄
+   *
+   * 物理 WS 连接仍由 wsService.sessions 管理——它是 transport 层，
+   * 这里 conversationSessions 是逻辑会话层；二者通过 wsSessionId 字符串关联，
+   * 物理连接的关闭 / 失效不会反向破坏逻辑会话状态，反之亦然。
    */
-  private readonly activeTurnContexts = new Map<string, CodexTurnContext>()
-
-  /** Per-conversation stream tail promises used as an internal async mutex. */
-  private readonly conversationStreamLocks = new Map<string, Promise<void>>()
+  private readonly conversationSessions = new Map<
+    string,
+    ConversationCodexSession
+  >()
 
   /**
    * Warmup payload cache, keyed by conversationId.
-   * Previously stored in ChatSessionManager (protocol layer);
+   * Previously stored in SessionLifecycleService (protocol layer);
    * now owned by the provider adapter where it belongs.
    */
   private readonly warmupPayloadCache = new Map<
@@ -320,6 +356,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     private readonly authService: CodexAuthService,
     private readonly cacheService: CodexCacheService,
     private readonly wsService: CodexWebSocketService,
+    private readonly identity: CodexClientIdentityService,
     private readonly usageStats: UsageStatsService,
     persistence: PersistenceService
   ) {
@@ -959,12 +996,113 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       : ""
   }
 
+  private getCodexTurnKey(codexRequest: Record<string, unknown>): string {
+    const metadata = codexRequest.client_metadata
+    if (!metadata || typeof metadata !== "object") {
+      return ""
+    }
+
+    const record = metadata as Record<string, unknown>
+    const rawTurnMetadata = record["x-codex-turn-metadata"]
+    if (typeof rawTurnMetadata === "string" && rawTurnMetadata.trim()) {
+      try {
+        const parsed = JSON.parse(rawTurnMetadata) as Record<string, unknown>
+        const turnId = parsed?.turn_id
+        if (typeof turnId === "string" && turnId.trim()) {
+          return turnId.trim()
+        }
+      } catch {
+        return rawTurnMetadata.trim()
+      }
+      return rawTurnMetadata.trim()
+    }
+
+    const windowId = record["x-codex-window-id"]
+    return typeof windowId === "string" ? windowId.trim() : ""
+  }
+
+  private applyCodexTurnStateHeader(
+    headers: Record<string, string>,
+    context: CodexTurnContext | undefined
+  ): void {
+    const turnState = context?.turnState?.trim()
+    if (!turnState) {
+      return
+    }
+    headers["x-codex-turn-state"] = turnState
+  }
+
+  private captureCodexTurnStateFromConnection(
+    context: CodexTurnContext | undefined,
+    ws: WebSocket
+  ): void {
+    const turnState = this.wsService
+      .getConnectionMetadata(ws)
+      ?.turnState?.trim()
+    if (!context || !turnState || context.turnState === turnState) {
+      return
+    }
+    context.turnState = turnState
+    this.logger.debug(
+      `[Codex][TurnContext] Captured x-codex-turn-state for session=${context.wsSessionId} turn=${context.turnKey || "unknown"}`
+    )
+  }
+
   // ── CodexTurnContext lifecycle management ──────────────────────────────
   //
   // Mirrors the official Codex CLI ModelClient.new_session() / ModelClientSession.Drop.
   // All requests for a conversation (prewarm + stream) share a single CodexTurnContext.
   // When a turn ends the connection is returned to cachedWsSessions.
   // Eliminates the warm pool promotion mechanism entirely.
+
+  // ── ConversationCodexSession store ─────────────────────────────────────
+  //
+  // 唯一入口管理逻辑会话状态。所有读 / 写 active turn context 与 stream lock 都
+  // 走这里，不再直接操作裸 Map，避免 turn / lock / dispose 三处状态错位。
+
+  private getConversationSession(
+    conversationId: string
+  ): ConversationCodexSession | undefined {
+    const normalized = conversationId.trim()
+    if (!normalized) return undefined
+    return this.conversationSessions.get(normalized)
+  }
+
+  private getOrCreateConversationSession(
+    conversationId: string
+  ): ConversationCodexSession {
+    const normalized = conversationId.trim()
+    if (!normalized) {
+      throw new Error(
+        "[CodexService] empty conversationId passed to getOrCreateConversationSession"
+      )
+    }
+    const existing = this.conversationSessions.get(normalized)
+    if (existing) {
+      existing.updatedAt = Date.now()
+      return existing
+    }
+    const created: ConversationCodexSession = {
+      conversationId: normalized,
+      active: null,
+      streamTail: null,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }
+    this.conversationSessions.set(normalized, created)
+    return created
+  }
+
+  /** 仅用于"无 active turn 也无 lock 残留时"清理空 session，避免 Map 长期膨胀。 */
+  private maybePurgeConversationSession(conversationId: string): void {
+    const normalized = conversationId.trim()
+    if (!normalized) return
+    const session = this.conversationSessions.get(normalized)
+    if (!session) return
+    if (session.active === null && session.streamTail === null) {
+      this.conversationSessions.delete(normalized)
+    }
+  }
 
   /**
    * Generate the cross-turn connection cache key.
@@ -995,10 +1133,18 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   private getOrCreateTurnContext(
     conversationId: string,
     slot: CodexAccountSlot,
-    modelName: string
+    modelName: string,
+    turnKey?: string
   ): CodexTurnContext {
-    const existing = this.activeTurnContexts.get(conversationId)
-    if (existing) return existing
+    const session = this.getOrCreateConversationSession(conversationId)
+    const existing = session.active
+    if (existing) {
+      if (existing.turnKey !== turnKey) {
+        existing.turnKey = turnKey
+        existing.turnState = undefined
+      }
+      return existing
+    }
 
     this.pruneCodexRuntimeCaches()
     const cacheKey = this.getCachedWsKey(slot, modelName, conversationId)
@@ -1010,6 +1156,8 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       this.cachedWsSessions.delete(cacheKey)
       context = {
         wsSessionId: cached.wsSessionId,
+        turnKey,
+        turnState: cached.turnKey === turnKey ? cached.turnState : undefined,
         lastResponse: cached.lastResponse,
         lastRequest: cached.lastRequest,
         connectionReused: true,
@@ -1018,13 +1166,16 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       // No cached connection; use conversationId as session key (lazy connect)
       context = {
         wsSessionId: conversationId,
+        turnKey,
+        turnState: undefined,
         lastResponse: undefined,
         lastRequest: undefined,
         connectionReused: false,
       }
     }
 
-    this.activeTurnContexts.set(conversationId, context)
+    session.active = context
+    session.updatedAt = Date.now()
     return context
   }
 
@@ -1037,19 +1188,25 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     slot: CodexAccountSlot,
     modelName: string
   ): void {
-    const context = this.activeTurnContexts.get(conversationId)
+    const session = this.getConversationSession(conversationId)
+    if (!session) return
+    const context = session.active
     if (!context) return
 
     const cacheKey = this.getCachedWsKey(slot, modelName, conversationId)
     // Return connection to cache (mirrors store_cached_websocket_session)
     this.setCachedWsSession(cacheKey, {
       wsSessionId: context.wsSessionId,
+      turnKey: context.turnKey,
+      turnState: context.turnState,
       lastResponse: context.lastResponse,
       lastRequest: context.lastRequest,
       updatedAt: Date.now(),
     })
 
-    this.activeTurnContexts.delete(conversationId)
+    session.active = null
+    session.updatedAt = Date.now()
+    this.maybePurgeConversationSession(conversationId)
   }
 
   /**
@@ -1110,8 +1267,17 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       allowEmptyDelta
     )
     if (!result.ok) {
+      const detail =
+        result.reason === "static_fields_changed"
+          ? ` keys=${result.changedStaticKeys.join(",") || "unknown"}`
+          : ` baseline=${result.inputMismatch.baselineLength} request=${result.inputMismatch.requestLength}` +
+            (typeof result.inputMismatch.mismatchIndex === "number"
+              ? ` mismatch_index=${result.inputMismatch.mismatchIndex}` +
+                ` baseline_type=${result.inputMismatch.baselineType || "unknown"}` +
+                ` request_type=${result.inputMismatch.requestType || "unknown"}`
+              : "")
       this.logger.debug(
-        `[Codex][TurnContext] Incremental request unavailable: ${result.reason}`
+        `[Codex][TurnContext] Incremental request unavailable: ${result.reason}${detail}`
       )
       return undefined
     }
@@ -1176,9 +1342,11 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     itemsAdded: CodexInputItem[]
   ): void {
     if (!conversationId || !responseId) return
-    const context = this.activeTurnContexts.get(conversationId)
+    const session = this.getConversationSession(conversationId)
+    const context = session?.active
     if (!context) return
     context.lastResponse = { responseId, itemsAdded }
+    if (session) session.updatedAt = Date.now()
     this.logger.debug(
       `[Codex][TurnContext] Captured response_id=${responseId} ` +
         `for conversation=${conversationId}; items_added=${itemsAdded.length}`
@@ -1186,23 +1354,25 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   }
 
   /**
-   * Clear response state in the turn context when a connection is rebuilt.
-   * Mirrors websocket_connection() needs_new → last_request = None.
+   * Clear response state in the turn context when the transcript baseline is
+   * no longer safe for incremental append.
    */
   private resetTurnContextResponseState(
     conversationId: string,
     reason?: string
   ): void {
-    const context = this.activeTurnContexts.get(conversationId)
+    const session = this.getConversationSession(conversationId)
+    const context = session?.active
     if (context) {
       if (context.lastResponse?.responseId && reason) {
         this.logger.debug(
           `[Codex][TurnContext] ${reason} for ${conversationId}, ` +
-            `discarding stale previous_response_id=${context.lastResponse.responseId} (needs_new)`
+            `discarding stale previous_response_id=${context.lastResponse.responseId}`
         )
       }
       context.lastResponse = undefined
       context.lastRequest = undefined
+      if (session) session.updatedAt = Date.now()
     }
   }
 
@@ -1225,7 +1395,8 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     }
 
     let resetCount = 0
-    const activeContext = this.activeTurnContexts.get(normalizedConversationId)
+    const activeSession = this.getConversationSession(normalizedConversationId)
+    const activeContext = activeSession?.active
     if (activeContext) {
       this.resetTurnContextResponseState(normalizedConversationId, reason)
       this.wsService.closeSession(activeContext.wsSessionId)
@@ -1280,7 +1451,9 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       return false
     }
 
-    const activeContext = this.activeTurnContexts.get(normalizedConversationId)
+    const activeContext = this.getConversationSession(
+      normalizedConversationId
+    )?.active
     if (activeContext?.lastResponse?.responseId) {
       return true
     }
@@ -1304,14 +1477,16 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       return () => {}
     }
 
-    const previousTail = this.conversationStreamLocks.get(
+    const session = this.getOrCreateConversationSession(
       normalizedConversationId
     )
+    const previousTail = session.streamTail
     let release!: () => void
     const currentTail = new Promise<void>((resolve) => {
       release = resolve
     })
-    this.conversationStreamLocks.set(normalizedConversationId, currentTail)
+    session.streamTail = currentTail
+    session.updatedAt = Date.now()
 
     if (previousTail) {
       try {
@@ -1325,11 +1500,11 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     return () => {
       if (released) return
       released = true
-      if (
-        this.conversationStreamLocks.get(normalizedConversationId) ===
-        currentTail
-      ) {
-        this.conversationStreamLocks.delete(normalizedConversationId)
+      const current = this.getConversationSession(normalizedConversationId)
+      if (current && current.streamTail === currentTail) {
+        current.streamTail = null
+        current.updatedAt = Date.now()
+        this.maybePurgeConversationSession(normalizedConversationId)
       }
       release()
     }
@@ -1514,9 +1689,13 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     for (const [conversationId, binding] of this.conversationSlotBindings) {
       if (binding.expire <= now) {
         this.conversationSlotBindings.delete(conversationId)
-        // Also clean up expired conversation turn contexts (lightweight string fields, no connection refs).
-        // Actual WebSocket connections are cleaned up by wsService's STALE_TIMEOUT_MS.
-        this.activeTurnContexts.delete(conversationId)
+        // 同步清理 conversationSession 的 active turn 字段（仅文本元数据，无连接句柄）。
+        // 物理 WS 连接由 wsService 自己的 STALE_TIMEOUT_MS 兜底。
+        const session = this.conversationSessions.get(conversationId)
+        if (session) {
+          session.active = null
+          this.maybePurgeConversationSession(conversationId)
+        }
       }
     }
   }
@@ -2624,6 +2803,11 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       cacheHeaders,
       forwardHeaders: options?.forwardHeaders,
       omitAccountId: options?.omitAccountId,
+      identity: {
+        version: this.identity.version(),
+        userAgent: this.identity.userAgent(),
+        originator: this.identity.originator(),
+      },
     })
   }
 
@@ -4248,10 +4432,12 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       sessionId = cached?.wsSessionId || conversationId || cacheKey
 
       // Warmup 只准备可复用的 connection cache，不创建 active turn context。
-      // activeTurnContexts 只属于真实 stream turn，避免 warmup 占用或污染 turn lifecycle。
+      // ConversationCodexSession.active 只属于真实 stream turn，避免 warmup 占用或污染 turn lifecycle。
       if (!cached) {
         this.setCachedWsSession(cacheKey, {
           wsSessionId: sessionId,
+          turnKey: undefined,
+          turnState: undefined,
           lastResponse: undefined,
           lastRequest: undefined,
           updatedAt: Date.now(),
@@ -4352,15 +4538,10 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         slot.proxyUrl || undefined
       )
 
-      // A connection-only warmup can rebuild the session before the real
-      // continuation request reaches streamViaWebSocket(). In that case the
-      // previous_response_id captured on the old WebSocket is no longer valid.
-      if (conversationId && !reusedConnection) {
-        this.resetTurnContextResponseState(
-          conversationId,
-          `Warmup rebuilt WebSocket connection (reason=${warmupReason})`
-        )
-      }
+      // A connection-only warmup may rebuild the transport before the real
+      // continuation request reaches streamViaWebSocket(). Do not clear the
+      // response chain here; the next real request will validate the strict
+      // delta and the stale-response retry path will handle server rejection.
 
       // Send generate:false warmup payload to prime the server-side prompt cache (mirrors Codex CLI).
       //
@@ -4462,18 +4643,18 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   /**
    * ProviderAdapter.dispose() — release all resources for a conversation.
    * Returns WS connection to cache (via disposeTurnContext) and clears warmup cache.
-   * Called by ChatSessionManager when a session expires or is deleted.
+   * Called by SessionLifecycleService when a session expires or is deleted.
    */
   dispose(conversationId: string): void {
-    // Return WS connection to cache if there's an active turn context.
-    // We need the slot + model to compute the cache key, but since the context
-    // is being disposed (conversation ending), we just delete without caching.
-    this.activeTurnContexts.delete(conversationId)
-    this.conversationStreamLocks.delete(conversationId)
-    this.warmupPayloadCache.delete(conversationId)
-    // Also clean up any cachedWsSessions entries for this conversation.
+    const normalized = conversationId.trim()
+    if (!normalized) return
+    // 一次性清空 ConversationCodexSession（含 active turn + streamTail）。
+    // 不需要 disposeTurnContext，因为 conversation 即将销毁，cache 已无意义。
+    this.conversationSessions.delete(normalized)
+    this.warmupPayloadCache.delete(normalized)
+    // 同步清理这个 conversation 维度的 cachedWsSessions 条目。
     for (const [key, entry] of this.cachedWsSessions) {
-      if (entry.wsSessionId === conversationId) {
+      if (entry.wsSessionId === normalized) {
         this.cachedWsSessions.delete(key)
       }
     }
@@ -4530,8 +4711,9 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     // Create a fresh turn context at entry; dispose in finally.
     // This matches the official Codex CLI ModelClientSession lifecycle:
     //   client.new_session() → turn → Drop → store_cached_websocket_session
+    const turnKey = this.getCodexTurnKey(codexRequest)
     if (conversationId) {
-      this.getOrCreateTurnContext(conversationId, slot, modelName)
+      this.getOrCreateTurnContext(conversationId, slot, modelName, turnKey)
     }
 
     let emittedEvents = false
@@ -4672,6 +4854,34 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           }
         }
 
+        // 网关瞬时错误（502 / 503 / 504）：常见于 "upstream connect error" 或
+        // "reset reason: connection termination" —— 上游边缘代理把 TCP 连接掐
+        // 断，并不代表账号不可用。立即 markAccountCooldown 会让单账号场景
+        // 1 分钟内完全失活、整个 turn 直接 fail（参见 bridge 日志中
+        // delete_file -> PostToolContinuation 的 503 中断）。
+        // 策略：第一次失败时先在同一 slot 上短暂 backoff 后重试一次；
+        // 仍然失败再走原有的 cooldown + 跨账号故障转移路径。
+        const isGatewayTransient =
+          statusCode === 502 || statusCode === 503 || statusCode === 504
+        if (isGatewayTransient && !emittedEvents && attempt === 1) {
+          this.logger.warn(
+            `[Codex] ${statusCode} transient gateway error on ${this.getAccountLabel(slot)} ` +
+              `(${e.message}); retrying same slot once before cooldown`
+          )
+          if (conversationId) {
+            this.disposeTurnContext(conversationId, slot, modelName)
+          }
+          await new Promise((resolve) => setTimeout(resolve, 500))
+          yield* this.executeStreamWithCooldownRetry(
+            request,
+            forwardHeaders,
+            abortSignal,
+            attempt + 1,
+            slot
+          )
+          return
+        }
+
         markAccountCooldown(
           slot,
           statusCode,
@@ -4679,6 +4889,34 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           e.retryAfterSeconds?.toString(),
           this.getAccountLabel(slot)
         )
+
+        // 网关瞬时错误：同 slot 重试已经失败，如果还有其它可用账号就跨 slot
+        // 故障转移；只剩一个账号时就直接落到下面的 throw 让上层处理
+        if (
+          isGatewayTransient &&
+          !emittedEvents &&
+          attempt < this.accounts.length
+        ) {
+          const nextSlot = this.pickNextAvailableAccount(modelName)
+          if (nextSlot && nextSlot !== slot) {
+            this.logger.log(
+              `[Codex] ${statusCode} persisted on ${this.getAccountLabel(slot)}, ` +
+                `failing over to ${this.getAccountLabel(nextSlot)} ` +
+                `(attempt ${attempt + 1}/${this.accounts.length})`
+            )
+            if (conversationId) {
+              this.disposeTurnContext(conversationId, slot, modelName)
+            }
+            yield* this.executeStreamWithCooldownRetry(
+              request,
+              forwardHeaders,
+              abortSignal,
+              attempt + 1,
+              nextSlot
+            )
+            return
+          }
+        }
 
         // 401/403: refresh 失败后，尝试用下一个可用账号重试（跨 slot 故障转移）
         if (
@@ -4791,8 +5029,9 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     }
 
     const state = createStreamState()
-    let loggedFirstUpstreamEvent = false
-    let loggedFirstContentEvent = false
+    let firstUpstreamMs: number | undefined
+    let firstContentMs: number | undefined
+    let firstContentType: string | undefined
 
     try {
       const response = await fetch(url, fetchOptions)
@@ -4870,23 +5109,24 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
               const payload = this.parseCodexSsePayload(trimmed)
 
               if (
-                !loggedFirstUpstreamEvent &&
+                firstUpstreamMs === undefined &&
                 typeof payload?.type === "string"
               ) {
-                loggedFirstUpstreamEvent = true
+                firstUpstreamMs = Date.now() - requestStartedAt
                 this.logger.debug(
-                  `[Codex] First upstream HTTP event after ${Date.now() - requestStartedAt}ms: type=${payload.type}`
+                  `[Codex] First upstream HTTP event after ${firstUpstreamMs}ms: type=${payload.type}`
                 )
               }
               if (
-                !loggedFirstContentEvent &&
+                firstContentMs === undefined &&
                 (payload?.type === "response.output_text.delta" ||
                   payload?.type === "response.reasoning_summary_text.delta" ||
                   payload?.type === "response.function_call_arguments.delta")
               ) {
-                loggedFirstContentEvent = true
+                firstContentMs = Date.now() - requestStartedAt
+                firstContentType = String(payload.type)
                 this.logger.debug(
-                  `[Codex] First content HTTP event after ${Date.now() - requestStartedAt}ms: type=${String(payload.type)}`
+                  `[Codex] First content HTTP event after ${firstContentMs}ms: type=${firstContentType}`
                 )
               }
 
@@ -4916,21 +5156,25 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         // Process remaining buffer
         if (buffer.trim()) {
           const payload = this.parseCodexSsePayload(buffer.trim())
-          if (!loggedFirstUpstreamEvent && typeof payload?.type === "string") {
-            loggedFirstUpstreamEvent = true
+          if (
+            firstUpstreamMs === undefined &&
+            typeof payload?.type === "string"
+          ) {
+            firstUpstreamMs = Date.now() - requestStartedAt
             this.logger.debug(
-              `[Codex] First upstream HTTP event after ${Date.now() - requestStartedAt}ms: type=${payload.type}`
+              `[Codex] First upstream HTTP event after ${firstUpstreamMs}ms: type=${payload.type}`
             )
           }
           if (
-            !loggedFirstContentEvent &&
+            firstContentMs === undefined &&
             (payload?.type === "response.output_text.delta" ||
               payload?.type === "response.reasoning_summary_text.delta" ||
               payload?.type === "response.function_call_arguments.delta")
           ) {
-            loggedFirstContentEvent = true
+            firstContentMs = Date.now() - requestStartedAt
+            firstContentType = String(payload.type)
             this.logger.debug(
-              `[Codex] First content HTTP event after ${Date.now() - requestStartedAt}ms: type=${String(payload.type)}`
+              `[Codex] First content HTTP event after ${firstContentMs}ms: type=${firstContentType}`
             )
           }
           this.logCodexUsage(
@@ -4975,6 +5219,17 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     this.logger.log(
       `[Codex] Stream completed: model=${modelName}, blocks=${state.blockIndex}, hasToolCall=${state.hasToolCall}`
     )
+    const totalMs = Date.now() - requestStartedAt
+    this.logger.log(
+      `[Codex][TurnTiming] conv=${conversationId || "none"} ` +
+        `transport=http model=${modelName} ` +
+        `firstFrameMs=${firstUpstreamMs ?? -1} ` +
+        `firstContentMs=${firstContentMs ?? -1} ` +
+        `firstContentType=${firstContentType || "none"} ` +
+        `totalMs=${totalMs} completed=true ` +
+        `blocks=${state.blockIndex} hasToolCall=${state.hasToolCall} ` +
+        `slot=${this.getAccountLabel(slot)}`
+    )
   }
 
   /**
@@ -5001,6 +5256,11 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     const wsUrl = this.wsService.buildWebSocketUrl(httpUrl)
     const conversationId = this.getConversationId(request)
     const cacheHeaders = this.cacheService.buildWebSocketCacheHeaders(cacheId)
+    const turnKey = this.getCodexTurnKey(codexRequest)
+    // Use CodexTurnContext to obtain session ID (eliminates warm pool promotion)
+    const turnContext = conversationId
+      ? this.getOrCreateTurnContext(conversationId, slot, modelName, turnKey)
+      : undefined
     const wsHeaders = this.wsService.buildWebSocketHeaders(
       token,
       this.isApiKeyMode(slot),
@@ -5010,12 +5270,17 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       cacheHeaders,
       forwardHeaders
     )
-
-    // Use CodexTurnContext to obtain session ID (eliminates warm pool promotion)
-    const turnContext = conversationId
-      ? this.getOrCreateTurnContext(conversationId, slot, modelName)
-      : undefined
+    this.applyCodexTurnStateHeader(wsHeaders, turnContext)
     const sessionId = turnContext?.wsSessionId || ""
+    // P0.3 prewarm 配置：每个 turn 完成后用它在 turn 间隙异步起新连接，下个
+    // turn 进入 ensureSessionConnection 时直接命中 OPEN 连接、零握手。
+    // streamViaWebSocketConnection 内部用 (responseCompleted && sessionId)
+    // 守卫，无 sessionId 路径自然不会触发 prewarm。
+    const prewarmConfig = {
+      wsUrl,
+      wsHeaders,
+      proxyUrl: slot.proxyUrl || undefined,
+    }
 
     if (!sessionId) {
       const ws = await this.wsService.connect(
@@ -5023,6 +5288,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         wsHeaders,
         slot.proxyUrl || undefined
       )
+      this.captureCodexTurnStateFromConnection(turnContext, ws)
       yield* this.streamViaWebSocketConnection(
         ws,
         slot,
@@ -5033,7 +5299,8 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         requestStartedAt,
         "",
         abortSignal,
-        conversationId
+        conversationId,
+        prewarmConfig
       )
       return
     }
@@ -5053,15 +5320,18 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         wsHeaders,
         slot.proxyUrl || undefined
       )
+      this.captureCodexTurnStateFromConnection(turnContext, ws)
 
-      // Mirrors the official Codex CLI needs_new logic (client.rs:1054-1061):
-      // If the previous connection was closed (server closes after response.completed),
-      // ensureSessionConnection created a new one. The previous_response_id is bound to
-      // the old connection's server-side routing and is NOT valid on the new connection.
       if (!hadOpenConnection && turnContext && conversationId) {
+        const previousResponseId = turnContext.lastResponse?.responseId
         this.resetTurnContextResponseState(
           conversationId,
-          "Connection was rebuilt before stream request"
+          "WebSocket connection was rebuilt before request"
+        )
+        this.logger.debug(
+          previousResponseId
+            ? `[Codex][TurnContext] Connection was rebuilt before stream request for ${conversationId}; cleared previous_response_id=${previousResponseId}`
+            : `[Codex][TurnContext] Connection was rebuilt before stream request for ${conversationId}; no previous_response_id`
         )
       }
 
@@ -5099,7 +5369,8 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           requestStartedAt,
           sessionId,
           abortSignal,
-          conversationId
+          conversationId,
+          prewarmConfig
         )
         return
       } catch (error) {
@@ -5121,13 +5392,24 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
             "Server rejected stale previous_response_id"
           )
           codexRequest = originalCodexRequest
-          this.wsService.invalidateSessionConnection(sessionId, ws)
-          ws = await this.wsService.ensureSessionConnection(
-            sessionId,
-            wsUrl,
-            wsHeaders,
-            slot.proxyUrl || undefined
-          )
+          // 协议级错误：若 ws 仍 OPEN，streamViaSessionWebSocket 已通过
+          // preserveConnection 保留它，直接复用，跳过 invalidate+ensure 的额外 RTT。
+          const wsStillUsable = ws.readyState === WebSocket.OPEN
+          if (wsStillUsable) {
+            this.logger.debug(
+              `[Codex][TurnContext] Reusing live WebSocket session=${sessionId} after prev_resp rejection`
+            )
+          } else {
+            this.wsService.invalidateSessionConnection(sessionId, ws)
+            this.applyCodexTurnStateHeader(wsHeaders, turnContext)
+            ws = await this.wsService.ensureSessionConnection(
+              sessionId,
+              wsUrl,
+              wsHeaders,
+              slot.proxyUrl || undefined
+            )
+            this.captureCodexTurnStateFromConnection(turnContext, ws)
+          }
           yield* this.streamViaWebSocketConnection(
             ws,
             slot,
@@ -5138,7 +5420,8 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
             Date.now(),
             sessionId,
             abortSignal,
-            conversationId
+            conversationId,
+            prewarmConfig
           )
           return
         }
@@ -5151,19 +5434,27 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           `[Codex] Reconnecting stale WebSocket session ${sessionId} before streamed retry`
         )
         this.wsService.invalidateSessionConnection(sessionId, ws)
-        // Clear response state in turn context on connection rebuild
-        if (conversationId) {
+        if (conversationId && turnContext) {
+          const previousResponseId = turnContext.lastResponse?.responseId
           this.resetTurnContextResponseState(
             conversationId,
-            "Connection was rebuilt for streamed retry"
+            "WebSocket connection was rebuilt before streamed retry"
           )
+          if (previousResponseId) {
+            this.logger.debug(
+              `[Codex][TurnContext] Connection was rebuilt for streamed retry for ${conversationId}; cleared previous_response_id=${previousResponseId}`
+            )
+          }
         }
+        codexRequest = originalCodexRequest
+        this.applyCodexTurnStateHeader(wsHeaders, turnContext)
         ws = await this.wsService.ensureSessionConnection(
           sessionId,
           wsUrl,
           wsHeaders,
           slot.proxyUrl || undefined
         )
+        this.captureCodexTurnStateFromConnection(turnContext, ws)
         yield* this.streamViaWebSocketConnection(
           ws,
           slot,
@@ -5174,7 +5465,8 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           requestStartedAt,
           sessionId,
           abortSignal,
-          conversationId
+          conversationId,
+          prewarmConfig
         )
       }
     } finally {
@@ -5192,12 +5484,18 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     requestStartedAt: number,
     sessionId: string,
     abortSignal?: AbortSignal,
-    conversationId?: string
+    conversationId?: string,
+    prewarm?: {
+      wsUrl: string
+      wsHeaders: Record<string, string>
+      proxyUrl?: string
+    }
   ): AsyncGenerator<string, void, unknown> {
     const state = createStreamState()
     const itemsAdded: CodexInputItem[] = []
-    let loggedFirstUpstreamEvent = false
-    let loggedFirstContentEvent = false
+    let firstUpstreamMs: number | undefined
+    let firstContentMs: number | undefined
+    let firstContentType: string | undefined
     let responseCompleted = false
     const onAbort = () => {
       if (sessionId) {
@@ -5249,21 +5547,22 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
             }
           }
         }
-        if (!loggedFirstUpstreamEvent && msg.type) {
-          loggedFirstUpstreamEvent = true
+        if (firstUpstreamMs === undefined && msg.type) {
+          firstUpstreamMs = Date.now() - requestStartedAt
           this.logger.debug(
-            `[Codex] First upstream WebSocket event after ${Date.now() - requestStartedAt}ms: type=${msg.type}`
+            `[Codex] First upstream WebSocket event after ${firstUpstreamMs}ms: type=${msg.type}`
           )
         }
         if (
-          !loggedFirstContentEvent &&
+          firstContentMs === undefined &&
           (msg.type === "response.output_text.delta" ||
             msg.type === "response.reasoning_summary_text.delta" ||
             msg.type === "response.function_call_arguments.delta")
         ) {
-          loggedFirstContentEvent = true
+          firstContentMs = Date.now() - requestStartedAt
+          firstContentType = msg.type
           this.logger.debug(
-            `[Codex] First content WebSocket event after ${Date.now() - requestStartedAt}ms: type=${msg.type}`
+            `[Codex] First content WebSocket event after ${firstContentMs}ms: type=${msg.type}`
           )
         }
         this.logCodexUsage(
@@ -5305,8 +5604,32 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       }
     }
 
+    // P0.3 prewarm：response.completed 之后服务端通常以 code=1005 关连接，下个
+    // turn 必须重新握手（约 1s）。在 turn 结束的"间隙"异步起一条新 WS 挂回 session，
+    // 下个 turn 进入 ensureSessionConnection 时直接命中 OPEN 连接、零握手。
+    // 仅在 responseCompleted 且仍持有 sessionId / prewarm 配置时触发。
+    if (responseCompleted && sessionId && prewarm) {
+      void this.wsService.schedulePrewarmConnection(
+        sessionId,
+        prewarm.wsUrl,
+        prewarm.wsHeaders,
+        prewarm.proxyUrl,
+        ws
+      )
+    }
+
+    const totalMs = Date.now() - requestStartedAt
+    // 结构化 turn timing：grep '[Codex][TurnTiming]' 即可拉出每个 turn 的耗时分布
     this.logger.log(
-      `[Codex] WebSocket stream completed: model=${modelName}, blocks=${state.blockIndex}, hasToolCall=${state.hasToolCall}`
+      `[Codex][TurnTiming] conv=${conversationId || "none"} ` +
+        `transport=ws model=${modelName} ` +
+        `firstFrameMs=${firstUpstreamMs ?? -1} ` +
+        `firstContentMs=${firstContentMs ?? -1} ` +
+        `firstContentType=${firstContentType || "none"} ` +
+        `totalMs=${totalMs} ` +
+        `completed=${responseCompleted} ` +
+        `blocks=${state.blockIndex} hasToolCall=${state.hasToolCall} ` +
+        `slot=${this.getAccountLabel(slot)}`
     )
   }
 

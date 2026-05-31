@@ -157,7 +157,7 @@ const OFFICIAL_ANTIGRAVITY_TOOL_DECLARATIONS: OfficialAntigravityToolDeclaration
     {
       name: "grep_search",
       description:
-        "Use ripgrep to find exact pattern matches within files or directories.\nALWAYS use this tool for repository text/code search instead of run_command with grep, rg, find, or similar shell search commands, unless the USER explicitly requests shell command execution.\nResults are returned in JSON format and for each match you will receive the:\n- Filename\n- LineNumber\n- LineContent: the content of the matching line\nTotal results are capped at 50 matches. Use the Includes option to filter by file type or specific paths to refine your search.",
+        "Use ripgrep to find exact pattern matches within files or directories.\nALWAYS use this tool for repository text/code search instead of run_command with grep, rg, find, or similar shell search commands, unless the USER explicitly requests shell command execution.\nResults are returned in JSON format and for each match you will receive the:\n- Filename\n- LineNumber\n- LineContent: the content of the matching line\nResults are capped at HeadLimit matches (default 50). When the result is truncated the tool reports it; pass Offset (e.g. Offset=50 after a default page) to page through the remaining matches, raise HeadLimit, or set HeadLimit=0 for unlimited. Use the Includes option to filter by file type or specific paths to refine your search.",
       properties: {
         CaseInsensitive: {
           type: "BOOLEAN",
@@ -187,6 +187,16 @@ const OFFICIAL_ANTIGRAVITY_TOOL_DECLARATIONS: OfficialAntigravityToolDeclaration
           type: "STRING",
           description:
             "The path to search. This can be a directory or a file. This is a required parameter.",
+        },
+        HeadLimit: {
+          type: "INTEGER",
+          description:
+            "Limit the number of returned matches/files, equivalent to '| head -N'. Defaults to 50 when unspecified. Pass 0 for unlimited (use sparingly — large result sets waste context). When the result is truncated, page with Offset rather than re-running the search.",
+        },
+        Offset: {
+          type: "INTEGER",
+          description:
+            "Skip the first N matches/files before applying HeadLimit, equivalent to '| tail -n +N | head'. Use to page through results after a truncated search (e.g. Offset=50 to fetch the second page of a default 50-result search). Defaults to 0.",
         },
       },
       required: ["SearchPath", "Query"],

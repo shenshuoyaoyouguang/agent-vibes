@@ -5,6 +5,7 @@
  */
 
 import { DISCOVER_TOOL_DEFINITION } from "./discover-tool-handler"
+import { SNIP_MESSAGES_TOOL_DEFINITION } from "./snip-tool-handler"
 import { shouldDeferTool } from "./tool-defer-policy"
 
 // Tool definition in Anthropic format
@@ -114,7 +115,7 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
   CLIENT_SIDE_TOOL_V2_EDIT_FILE_V2: {
     name: "edit_file_v2",
     description:
-      "Edit a file with exact search and replace. Before editing an existing file, read the file in the current conversation. Prefer a small unique search snippet copied verbatim from read_file output. To create a new file, set search to an empty string and replace to the full file content. If read_file output includes display-only line number prefixes, do not include those prefixes in search or replace. Prefer this tool over run_terminal_command with cat heredoc, tee, echo redirection, sed, perl, python, or shell patching for normal file creation or edits — those still work for ephemeral paths or scripted setup, but edit_file_v2 keeps the diff reviewable in the IDE. The edit FAILS if `search` matches more than once in the file: either provide a larger snippet with surrounding context to make it unique, or set `replace_all: true` to change every occurrence (useful for variable renames or batch alias updates).",
+      "Edit a file with exact search and replace. Before editing an existing file, read the file in the current conversation. Prefer a small unique search snippet copied verbatim from read_file output. To create a new file, set search to an empty string and replace to the full file content. If read_file output includes display-only line number prefixes, do not include those prefixes in search or replace. Prefer this tool over run_terminal_command with cat heredoc, tee, echo redirection, sed, perl, python, or shell patching for normal file creation or edits — those still work for ephemeral paths or scripted setup, but edit_file_v2 keeps the diff reviewable in the IDE. The edit FAILS if `search` matches more than once in the file: either provide a larger snippet with surrounding context to make it unique, or set `replace_all: true` to change every occurrence (useful for variable renames or batch alias updates). Treat consecutive edits to the same file as dependent: chain them sequentially (waiting for each result before the next call) instead of emitting parallel `edit_file_v2` calls against the same path, since each edit's `search` snippet must match the post-edit state of the file. Edits to different files remain safe to run in parallel.",
     input_schema: {
       type: "object",
       properties: {
@@ -160,7 +161,7 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
   CLIENT_SIDE_TOOL_V2_RIPGREP_SEARCH: {
     name: "grep_search",
     description:
-      "Search file contents using ripgrep. ALWAYS use this tool for repository text/code search instead of run_terminal_command with grep, rg, find, or similar shell search commands, unless the user explicitly asks for shell command execution.",
+      "Search file contents using ripgrep. ALWAYS use this tool for repository text/code search instead of run_terminal_command with grep, rg, find, or similar shell search commands, unless the user explicitly asks for shell command execution. Results are capped at head_limit matches (default 50); when truncated, page with offset (e.g. offset=50 for the next page), raise head_limit, or set head_limit=0 for unlimited.",
     input_schema: {
       type: "object",
       properties: {
@@ -170,6 +171,16 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
           type: "boolean",
           description: "Case sensitive search",
         },
+        head_limit: {
+          type: "number",
+          description:
+            "Limit the number of returned matches/files (| head -N). Defaults to 50. Pass 0 for unlimited. Page with offset when the result is truncated instead of re-running the search.",
+        },
+        offset: {
+          type: "number",
+          description:
+            "Skip the first N matches/files before applying head_limit (| tail -n +N | head). Use to page through a truncated result (e.g. offset=50 for the second default page). Defaults to 0.",
+        },
       },
       required: ["query"],
     },
@@ -178,7 +189,7 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
   CLIENT_SIDE_TOOL_V2_RIPGREP_RAW_SEARCH: {
     name: "grep_search",
     description:
-      "Search file contents using ripgrep. ALWAYS use this tool for repository text/code search instead of run_terminal_command with grep, rg, find, or similar shell search commands, unless the user explicitly asks for shell command execution.",
+      "Search file contents using ripgrep. ALWAYS use this tool for repository text/code search instead of run_terminal_command with grep, rg, find, or similar shell search commands, unless the user explicitly asks for shell command execution. Results are capped at head_limit matches (default 50); when truncated, page with offset (e.g. offset=50 for the next page), raise head_limit, or set head_limit=0 for unlimited.",
     input_schema: {
       type: "object",
       properties: {
@@ -187,6 +198,16 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
         case_sensitive: {
           type: "boolean",
           description: "Case sensitive search",
+        },
+        head_limit: {
+          type: "number",
+          description:
+            "Limit the number of returned matches/files (| head -N). Defaults to 50. Pass 0 for unlimited. Page with offset when the result is truncated instead of re-running the search.",
+        },
+        offset: {
+          type: "number",
+          description:
+            "Skip the first N matches/files before applying head_limit (| tail -n +N | head). Use to page through a truncated result (e.g. offset=50 for the second default page). Defaults to 0.",
         },
       },
       required: ["query"],
@@ -514,7 +535,10 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
             "sub-agents only get inline tools (no shell, no file edits, " +
             "no run_terminal_command); they're best for parallel " +
             "research / web fetches / MCP work that doesn't need to " +
-            "block the user. Default false (foreground, blocks until " +
+            "block the user. Cannot be combined with " +
+            "`subagent_type='bash'` — the bash agent's whole tool " +
+            "surface is run_terminal_command, which is unavailable in " +
+            "background mode. Default false (foreground, blocks until " +
             "the sub-agent finishes and returns its result inline).",
         },
       },
@@ -569,7 +593,10 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
             "sub-agents only get inline tools (no shell, no file edits, " +
             "no run_terminal_command); they're best for parallel " +
             "research / web fetches / MCP work that doesn't need to " +
-            "block the user. Default false (foreground, blocks until " +
+            "block the user. Cannot be combined with " +
+            "`subagent_type='bash'` — the bash agent's whole tool " +
+            "surface is run_terminal_command, which is unavailable in " +
+            "background mode. Default false (foreground, blocks until " +
             "the sub-agent finishes and returns its result inline).",
         },
       },
@@ -1867,6 +1894,29 @@ export function getAvailableTools(): string[] {
   return Object.keys(CURSOR_TOOL_DEFINITIONS)
 }
 
+/**
+ * Return the canonical set of bridge-recognised built-in tool
+ * *user-facing* names — i.e. the `name` field on every
+ * `CURSOR_TOOL_DEFINITIONS` entry. Per Cursor `agent.v1`, this set
+ * is the authoritative "core tool surface": every name returned here
+ * is something the model can call **directly** (no `discover_tool`
+ * round-trip needed), regardless of whether the tool also has a
+ * `CLIENT_SIDE_TOOL_V2_*` proto enum value or is a bridge-defined
+ * inline tool such as `kill_agent` / `task` / `await_task`.
+ *
+ * P1-3 / smoke-regression #5: callers use this set to recognise when
+ * a `discover_tool({ tool_name })` call targets a tool that is
+ * already callable, so they can return a friendly success-shaped
+ * response instead of the misleading `Unknown deferred tool` reject.
+ */
+const CURSOR_BUILT_IN_TOOL_NAMES: ReadonlySet<string> = new Set(
+  Object.values(CURSOR_TOOL_DEFINITIONS).map((def) => def.name)
+)
+
+export function getCursorBuiltInToolNames(): ReadonlySet<string> {
+  return CURSOR_BUILT_IN_TOOL_NAMES
+}
+
 function shouldIncludeBuiltInTool(
   definitionKey: string,
   options?: CursorBuiltInToolCapabilityOptions
@@ -3116,7 +3166,16 @@ export function buildToolsForApi(
     const split = applyDeferPolicy(tools, isBuiltInByName, options.defer)
     return split.tools
   }
-  return sortToolDefinitionsForPromptCache(tools)
+  // No-defer path still needs the bridge-internal `snip_messages` tool so
+  // the model can proactively prune history when topics shift (Claude Code
+  // parity — the Snip tool is always available regardless of defer state).
+  const sorted = sortToolDefinitionsForPromptCache(tools)
+  if (
+    !sorted.some((tool) => tool.name === SNIP_MESSAGES_TOOL_DEFINITION.name)
+  ) {
+    sorted.push(SNIP_MESSAGES_TOOL_DEFINITION)
+  }
+  return sorted
 }
 
 /**
@@ -3197,6 +3256,15 @@ function applyDeferPolicy(
   // tokens on a useless tool.
   if (deferred.length > 0) {
     sortedCore.push(DISCOVER_TOOL_DEFINITION)
+  }
+
+  // Always inject the bridge-internal `snip_messages` tool so the model
+  // can proactively trim conversation history when topics shift. Mirrors
+  // Claude Code's behaviour where Snip is registered in every session.
+  if (
+    !sortedCore.some((tool) => tool.name === SNIP_MESSAGES_TOOL_DEFINITION.name)
+  ) {
+    sortedCore.push(SNIP_MESSAGES_TOOL_DEFINITION)
   }
 
   return {

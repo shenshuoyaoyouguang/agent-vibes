@@ -56,6 +56,13 @@ const EN: Record<string, string> = {
   "patches.resetFailed": "Failed to reset Cursor patches: {detail}",
   "patches.resetSummary":
     "Reset {count} Cursor file(s). Fully restart Cursor to apply.",
+  "patches.idleKillerFailed":
+    "Failed to apply Cursor idle extension host patch: {detail}",
+  "patches.idleKillerApplied":
+    "Applied Cursor idle extension host patch. Fully restart Cursor to apply.",
+  "patches.idleKillerAlreadyApplied":
+    "Cursor idle extension host patch is already applied. Fully restart Cursor to apply.",
+  "patches.checksumsAutoUpdated": "Also updated {count} Cursor checksum(s).",
 
   // ── Credential sync ──
   "sync.antigravityIde.success":
@@ -129,6 +136,16 @@ const EN: Record<string, string> = {
     "Codex CLI: this account has no refresh token and cannot be activated.",
   "dash.codex.switched": "Codex CLI: switched to {label}",
   "dash.codex.activateFailed": "Codex CLI activation failed: {message}",
+  "dash.kiro.bridgeNotRunning":
+    "Start the Agent Vibes bridge before forcing a Kiro login.",
+  "dash.kiro.forceLoginOk":
+    "Kiro IDE signed in as {label}. Restart Kiro IDE to apply.",
+  "dash.kiro.forceLoginFailed": "Kiro IDE login failed: {message}",
+  "dash.kiro.forceLoginFailedGeneric": "Kiro IDE login failed.",
+  "dash.kiro.forceCliLoginOk":
+    "Kiro CLI signed in as {label}. Restart any open Kiro CLI session to apply.",
+  "dash.kiro.forceCliLoginFailed": "Kiro CLI login failed: {message}",
+  "dash.kiro.forceCliLoginFailedGeneric": "Kiro CLI login failed.",
 
   // ── Manual context compaction ──
   "compact.bridgeNotRunning":
@@ -140,6 +157,20 @@ const EN: Record<string, string> = {
   "compact.noProgress":
     "No compaction was needed — the session is already within budget.",
   "compact.failed": "Manual compaction failed: {error}",
+
+  // ── Cache clearing ──
+  "cacheClear.bridgeNotRunning":
+    "Agent Vibes bridge is not running. Start it first to clear the cache.",
+  "cacheClear.action.startBridge": "Start Bridge",
+  "cacheClear.confirm":
+    "Clear all bridge-managed session state? This wipes every conversation transcript, tool-call ledger entry, turn audit log, file-state snapshot, todo list, and on-disk tool-result spool. In-flight conversations will be aborted.",
+  "cacheClear.action.confirm": "Clear Cache",
+  "cacheClear.cancelled": "Cache clear cancelled.",
+  "cacheClear.success":
+    "Cleared {loaded} active and {persisted} persisted session(s); removed {dirs} tool-result director(y/ies).",
+  "cacheClear.successZero": "Cache was already empty — nothing to clear.",
+  "cacheClear.failed": "Cache clear failed: {error}",
+  "cacheClear.warning": "Cache clear was refused: {warning}",
 
   // ── Status bar tooltips ──
   "status.tooltip.running": "Agent Vibes — Running (click to open dashboard)",
@@ -195,6 +226,12 @@ const ZH: Record<string, string> = {
   "patches.resetFailed": "重置 Cursor 补丁失败：{detail}",
   "patches.resetSummary":
     "已还原 {count} 个 Cursor 文件。请完整重启 Cursor 以应用。",
+  "patches.idleKillerFailed": "应用 Cursor 空闲扩展宿主补丁失败：{detail}",
+  "patches.idleKillerApplied":
+    "已应用 Cursor 空闲扩展宿主补丁。请完整重启 Cursor 以应用。",
+  "patches.idleKillerAlreadyApplied":
+    "Cursor 空闲扩展宿主补丁已生效。请完整重启 Cursor 以应用。",
+  "patches.checksumsAutoUpdated": "已同时更新 {count} 个 Cursor 校验和。",
 
   // ── Credential sync ──
   "sync.antigravityIde.success": "已同步 Antigravity IDE 凭据（{email}）",
@@ -261,6 +298,14 @@ const ZH: Record<string, string> = {
     "Codex CLI：此账号没有 refresh token，无法激活。",
   "dash.codex.switched": "Codex CLI：已切换到 {label}",
   "dash.codex.activateFailed": "Codex CLI 激活失败：{message}",
+  "dash.kiro.bridgeNotRunning": "强登 Kiro 前请先启动 Agent Vibes 桥接。",
+  "dash.kiro.forceLoginOk": "Kiro IDE 已登录为 {label}，重启 Kiro IDE 生效。",
+  "dash.kiro.forceLoginFailed": "Kiro IDE 登录失败：{message}",
+  "dash.kiro.forceLoginFailedGeneric": "Kiro IDE 登录失败。",
+  "dash.kiro.forceCliLoginOk":
+    "Kiro CLI 已登录为 {label}，重启已打开的 Kiro CLI 会话生效。",
+  "dash.kiro.forceCliLoginFailed": "Kiro CLI 登录失败：{message}",
+  "dash.kiro.forceCliLoginFailedGeneric": "Kiro CLI 登录失败。",
 
   // ── 手动上下文压缩 ──
   "compact.bridgeNotRunning": "Agent Vibes 桥接未启动，无法触发手动压缩。",
@@ -269,6 +314,20 @@ const ZH: Record<string, string> = {
   "compact.applied": "已压缩 {archived} 条历史消息，摘要 {summary} tokens。",
   "compact.noProgress": "当前会话尚未达到压缩阈值，无需压缩。",
   "compact.failed": "手动压缩失败：{error}",
+
+  // ── 缓存清理 ──
+  "cacheClear.bridgeNotRunning":
+    "Agent Vibes 桥接尚未启动，请先启动后再清除缓存。",
+  "cacheClear.action.startBridge": "启动桥接",
+  "cacheClear.confirm":
+    "确认清除所有由桥接管理的会话状态吗？将清空会话记录、工具调用账本、turn 审计日志、文件快照、todo 列表，以及磁盘上的 tool-result 缓存目录。进行中的会话会被中断。",
+  "cacheClear.action.confirm": "清除缓存",
+  "cacheClear.cancelled": "已取消清除缓存。",
+  "cacheClear.success":
+    "已清除 {loaded} 个内存会话、{persisted} 个持久化会话，并移除 {dirs} 个 tool-result 目录。",
+  "cacheClear.successZero": "缓存已是空的，没有需要清理的内容。",
+  "cacheClear.failed": "清除缓存失败：{error}",
+  "cacheClear.warning": "本次缓存清理被拒绝：{warning}",
 
   // ── Status bar tooltips ──
   "status.tooltip.running": "Agent Vibes — 运行中（点击打开控制台）",

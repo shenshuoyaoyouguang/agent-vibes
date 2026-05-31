@@ -1,9 +1,9 @@
 import {
   CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE,
-  normalizeToolProtocolMessages,
   type LooseMessageContent,
 } from "../../context"
 import { sanitizeResponsesToolCallIntegrity } from "../shared/openai-tool-call-integrity"
+import { appendLanguageDirectiveToText } from "../shared/language-directive"
 import type { ThinkingIntent } from "../shared/thinking-types"
 import { resolveCodexReasoningEffort } from "./codex-thinking"
 import { buildShortNameMap, shortenNameIfNeeded } from "./tool-name-shortener"
@@ -49,7 +49,7 @@ export interface CodexExecutionRequest {
   cacheUserId?: string
   /**
    * @deprecated previous_response_id 现在由 CodexService.streamViaWebSocket() 在 transport 层自动注入，
-   * 与 WebSocket 连接生命周期绑定。不再从外部传入。该字段不参与请求构建。
+   * 由 strict incremental delta 校验保护。不再从外部传入。该字段不参与请求构建。
    * 保留字段声明以避免现有调用方的编译错误。
    */
   previousResponseId?: string
@@ -361,17 +361,18 @@ export function buildCodexRequest(
   const toolTypeByName = buildToolTypeLookup(request.tools)
   const toolCallTypeById = new Map<string, "function" | "custom">()
   let input: CodexInputItem[] = []
-  const instructions = serializeCodexInstructions(request.system)
-
-  const protocolNormalized = normalizeToolProtocolMessages(
-    request.messages as Array<{
-      role: "user" | "assistant"
-      content: unknown
-    }>,
-    { pendingToolUseIds: request.pendingToolUseIds }
+  const instructions = appendLanguageDirectiveToText(
+    serializeCodexInstructions(request.system),
+    request.messages
   )
 
-  for (const msg of protocolNormalized.messages) {
+  // No protocol-level repair: the ToolCallLedger guarantees tool_use ↔
+  // tool_result alignment at write time, so the messages reaching here
+  // are already protocol-correct.
+  for (const msg of request.messages as Array<{
+    role: "user" | "assistant"
+    content: unknown
+  }>) {
     const role = msg.role
     const messageContent: Array<Record<string, unknown>> = []
     let hasContent = false
@@ -662,8 +663,8 @@ export function buildCodexRequest(
   }
 
   // previous_response_id 现在由 CodexService.streamViaWebSocket() 在 transport 层自动注入，
-  // 与 WebSocket 连接生命周期绑定。不再从外部传入。
-  // 对标官方 prepare_websocket_request() 设计。
+  // 由 strict incremental delta 校验保护，不再从外部传入。
+  // 采用 prepare_websocket_request() 设计。
 
   return codexRequest
 }

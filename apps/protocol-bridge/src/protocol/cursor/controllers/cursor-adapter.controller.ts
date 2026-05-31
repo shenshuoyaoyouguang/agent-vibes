@@ -6,6 +6,7 @@ import {
   GetUsableModelsRequestSchema,
   GetUsableModelsResponseSchema,
   NameAgentResponseSchema,
+  UpdateConversationMetadataResponseSchema,
   UploadConversationBlobsRequestSchema,
   UploadConversationBlobsResponseSchema,
 } from "../../../gen/agent/v1_pb"
@@ -131,7 +132,16 @@ export class CursorAdapterController {
       getCursorDisplayModels({
         includeCodex: this.isGptBackendAvailable(),
         codexModelTier: this.getCursorGptModelTier(),
-        extraModels: this.anthropicApiService.getCursorDisplayModels(),
+        // Static GEMINI_CURSOR_DISPLAY_MODELS only knows the IDs we hard-coded.
+        // Antigravity Cloud Code keeps adding new Gemini models (e.g.
+        // gemini-3.5-flash-low, gemini-pro-agent); inject whatever the worker
+        // discovered at runtime so they show up in the Cursor model picker.
+        // getCursorDisplayModels' dedup keeps the first occurrence, so curated
+        // static entries still win and dynamic ones only fill the gaps.
+        extraModels: [
+          ...this.anthropicApiService.getCursorDisplayModels(),
+          ...this.googleModelCache.getCursorDisplayModels(),
+        ],
       }),
       customModelIds
     ).filter((model) => this.isCursorModelCurrentlyRoutable(model.name))
@@ -349,6 +359,23 @@ export class CursorAdapterController {
     res
       .status(200)
       .send(Buffer.from(toBinary(NameAgentResponseSchema, response)))
+  }
+
+  @Post("agent.v1.AgentService/UpdateConversationMetadata")
+  handleUpdateConversationMetadata(@Res() res: FastifyReply): void {
+    this.logger.log(
+      ">>> AgentService/UpdateConversationMetadata request received"
+    )
+    res.header("Content-Type", "application/proto")
+    res.header("Connect-Protocol-Version", "1")
+    const response = create(UpdateConversationMetadataResponseSchema, {})
+    res
+      .status(200)
+      .send(
+        Buffer.from(
+          toBinary(UpdateConversationMetadataResponseSchema, response)
+        )
+      )
   }
 
   /**

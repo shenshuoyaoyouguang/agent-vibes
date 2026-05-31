@@ -13,6 +13,7 @@ import { CertManager } from "../services/cert-manager"
 import { CertTrustService } from "../services/cert-trust"
 import { ConfigManager } from "../services/config-manager"
 import { CursorChecksumsService } from "../services/cursor-checksums"
+import { CursorPatchService } from "../services/cursor-patch"
 import { CursorPatchManagerService } from "../services/cursor-patch-manager"
 import { ExtensionUpdateService } from "../services/extension-update"
 import { NetworkManager } from "../services/network-manager"
@@ -170,6 +171,7 @@ export function registerCommands(
   updater: ExtensionUpdateService
 ): void {
   const cursorChecksums = new CursorChecksumsService()
+  const cursorPatch = new CursorPatchService(logger)
   const cursorPatchManager = new CursorPatchManagerService()
 
   const promptReloadAfterForwardingEnabled = async (): Promise<void> => {
@@ -263,6 +265,43 @@ export function registerCommands(
         await vscode.commands.executeCommand("workbench.action.quit")
       }
     })
+  )
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      CMD.APPLY_CURSOR_IDLE_KILLER_PATCH,
+      async () => {
+        const result = cursorPatch.applyIdleExtensionHostKillerPatch()
+        if (!result.success) {
+          const detail = result.errors.join("; ") || t("checksums.unknownError")
+          void vscode.window.showErrorMessage(
+            tFmt("patches.idleKillerFailed", { detail })
+          )
+          return
+        }
+
+        let message =
+          result.applied > 0
+            ? t("patches.idleKillerApplied")
+            : t("patches.idleKillerAlreadyApplied")
+        if (result.checksumUpdated > 0) {
+          message +=
+            " " +
+            tFmt("patches.checksumsAutoUpdated", {
+              count: result.checksumUpdated,
+            })
+        }
+
+        const action = await vscode.window.showInformationMessage(
+          message,
+          t("forwarding.action.quit"),
+          t("setup.action.later")
+        )
+        if (action === t("forwarding.action.quit")) {
+          await vscode.commands.executeCommand("workbench.action.quit")
+        }
+      }
+    )
   )
 
   context.subscriptions.push(
@@ -817,6 +856,82 @@ export function registerCommands(
             `Compaction failed: ${
               err instanceof Error ? err.message : String(err)
             }`
+        )
+      }
+    })
+  )
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(CMD.CLEAR_CACHE, async () => {
+      if (!bridge.isRunning) {
+        const startLabel = t("cacheClear.action.startBridge") || "Start Bridge"
+        const choice = await vscode.window.showInformationMessage(
+          t("cacheClear.bridgeNotRunning") ||
+            "Agent Vibes bridge is not running. Start it first to clear the cache.",
+          startLabel
+        )
+        if (choice === startLabel) {
+          await vscode.commands.executeCommand(CMD.START_SERVER)
+        }
+        return
+      }
+
+      const confirmLabel = t("cacheClear.action.confirm") || "Clear Cache"
+      const confirmed = await vscode.window.showInformationMessage(
+        t("cacheClear.confirm") ||
+          "Clear all bridge-managed session state? This wipes every conversation transcript, tool-call ledger entry, turn audit log, file-state snapshot, todo list, and on-disk tool-result spool. In-flight conversations will be aborted.",
+        confirmLabel
+      )
+      if (confirmed !== confirmLabel) {
+        return
+      }
+
+      // Release the dashboard's pending-command lock now: the bridge
+      // request below can take a few seconds for repos with many
+      // conversations, but we already have the user's confirmation so
+      // the buttons should re-enable immediately.
+      DashboardPanel.currentPanel?.sendCommandFinished(CMD.CLEAR_CACHE)
+
+      try {
+        const result = await callBridgeApiHttp<{
+          ok?: boolean
+          clearedLoadedSessions?: number
+          clearedPersistedSessions?: number
+          clearedToolResultDirs?: number
+          warnings?: string[]
+        }>(config, "/maintenance/clear-cache", "POST")
+        const warnings = result?.warnings ?? []
+        if (warnings.length > 0) {
+          vscode.window.showWarningMessage(
+            tFmt("cacheClear.warning", {
+              warning: warnings.join(" "),
+            }) || warnings.join(" ")
+          )
+          return
+        }
+        const loaded = result?.clearedLoadedSessions ?? 0
+        const persisted = result?.clearedPersistedSessions ?? 0
+        const dirs = result?.clearedToolResultDirs ?? 0
+        if (loaded === 0 && persisted === 0 && dirs === 0) {
+          vscode.window.showInformationMessage(
+            t("cacheClear.successZero") ||
+              "Cache was already empty — nothing to clear."
+          )
+          return
+        }
+        vscode.window.showInformationMessage(
+          tFmt("cacheClear.success", {
+            loaded: String(loaded),
+            persisted: String(persisted),
+            dirs: String(dirs),
+          })
+        )
+      } catch (err) {
+        logger.error("Clear cache failed", err)
+        vscode.window.showErrorMessage(
+          tFmt("cacheClear.failed", {
+            error: err instanceof Error ? err.message : String(err),
+          })
         )
       }
     })

@@ -25,7 +25,7 @@
  *
  * The resolver is **stateless** — every public function takes the
  * inputs it needs and returns a value. State (the additionalRoots
- * map, IDE-pushed workspaceFolders) lives on `ChatSession` and is
+ * map, IDE-pushed workspaceFolders) lives on `SessionRecord` and is
  * passed in. This keeps the resolver trivially testable (no Nest DI,
  * no fixtures) and makes it explicit which pieces of session state
  * affect boundary decisions.

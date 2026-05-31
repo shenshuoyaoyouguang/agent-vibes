@@ -19,6 +19,57 @@ const UI_EN: Record<string, string> = {
   "page.title": "Agent Vibes Dashboard",
   "page.tagline": "Unified AI Agent Gateway - Happy vibing!",
   "tab.overview": "Overview",
+  "tab.endpoints": "API",
+  "endpoints.title": "API",
+  "endpoints.subtitle":
+    "HTTP endpoints exposed by this bridge. Copy a URL, run a connectivity test, or wire it into the matching client.",
+  "endpoints.action.copy": "Copy",
+  "endpoints.action.test": "Test",
+  "endpoints.action.applyClaude": "Apply to Claude CLI",
+  "endpoints.action.applyCursor": "Wire Cursor (hosts)",
+  "endpoints.toast.copied": "Copied",
+  "endpoints.toast.testing": "Testing…",
+  "endpoints.status.ready": "Ready",
+  "endpoints.status.online": "Online",
+  "endpoints.status.offline": "Offline",
+  "endpoints.status.checking": "Checking…",
+  "endpoints.status.connecting": "Connecting…",
+  "endpoints.status.disconnecting": "Disconnecting…",
+  "endpoints.anthropic.name": "Anthropic API",
+  "endpoints.anthropic.desc":
+    "Drop-in replacement for api.anthropic.com. Used by Claude Code CLI and any Anthropic-compatible SDK.",
+  "endpoints.cursor.name": "Cursor IDE Protocol",
+  "endpoints.cursor.desc":
+    "Cursor IDE speaks Cursor protocol; wiring rewrites /etc/hosts so api*.cursor.sh requests land on this bridge.",
+  "endpoints.health.name": "Health Check",
+  "endpoints.health.desc":
+    "Liveness probe — returns bridge runtime status as JSON.",
+  "endpoints.openai.name": "OpenAI API",
+  "endpoints.codex.desc": "OpenAI Responses API compatibility — planned.",
+  "endpoints.google.name": "Google API",
+  "endpoints.gemini.desc": "Google Gemini API compatibility — planned.",
+  "tab.clients": "Clients",
+  "clients.title": "Client integrations",
+  "clients.subtitle": "Wire your local AI clients to this bridge.",
+  "clients.status.wired": "Wired",
+  "clients.status.notWired": "Not wired",
+  "clients.status.builtin": "Built-in",
+  "clients.status.comingSoon": "Coming soon",
+  "clients.action.wire": "Wire to Bridge",
+  "clients.action.unwire": "Unwire",
+  "clients.action.copy": "Copy",
+  "clients.action.refresh": "Refresh",
+  "clients.client.claudeCode": "Claude Code CLI",
+  "clients.client.cursorIde": "Cursor IDE",
+  "clients.client.codexCli": "Codex CLI",
+  "clients.client.geminiCli": "Gemini CLI",
+  "clients.client.cursorCli": "Cursor CLI",
+  "clients.claudeCode.desc":
+    "Rewrites ~/.claude/settings.json env so the CLI calls this bridge instead of api.anthropic.com.",
+  "clients.cursorIde.desc":
+    "Wiring rewrites /etc/hosts so Cursor's api*.cursor.sh requests hit this bridge. Requires admin privileges; independent from server start/stop.",
+  "clients.cursorIde.endpoint": "Bridge endpoint",
+  "clients.comingSoon.desc": "Integration is planned but not yet implemented.",
   "tab.accounts": "Accounts",
   "tab.analytics": "Analytics",
   "tab.settings": "Settings",
@@ -27,6 +78,8 @@ const UI_EN: Record<string, string> = {
   "section.status": "Status",
   "section.actions": "Actions",
   "section.backends": "Backends",
+  "section.clients": "Clients",
+  "clients.manage": "Manage →",
   "section.accounts": "Accounts",
   "section.tokenUsage": "Token Usage",
   "section.sessionRuntime": "Session Runtime",
@@ -65,6 +118,7 @@ const UI_EN: Record<string, string> = {
   "action.restart": "Restart",
   "action.enableForwarding": "Enable forwarding",
   "action.disableForwarding": "Disable forwarding",
+  "action.clearCache": "Clear cache",
   "status.health": "Health",
   "status.ssl": "SSL",
   "status.forwarding": "Forwarding",
@@ -85,6 +139,8 @@ const UI_EN: Record<string, string> = {
   "accounts.edit": "Edit",
   "accounts.remove": "Remove",
   "accounts.cli": "CLI",
+  "accounts.kiroForceLogin": "Login IDE",
+  "accounts.kiroForceCliLogin": "Login CLI",
   "accounts.add": "+ Add",
   "accounts.pagination": "{start}–{end} of {total}",
   "accounts.prev": "← Prev",
@@ -129,6 +185,8 @@ const UI_EN: Record<string, string> = {
   "oauth.manualTab": "Manual Sync",
   "oauth.kiroBuilderIdTab": "Builder ID",
   "oauth.kiroApiKeyTab": "API Key",
+  "oauth.kiroLoginBtn": "Login Kiro IDE",
+  "oauth.kiroBuilderIdTitle": "Sign in with AWS Builder ID (opens browser)",
   "oauth.kiroApiKeyHelp":
     "Paste a Kiro API key. The bridge stores it locally with authMethod=api_key and uses it directly without OAuth refresh.",
   "oauth.googleHelp":
@@ -313,6 +371,9 @@ const UI_EN: Record<string, string> = {
   "field.placeholder.label": "e.g. claude-proxy",
   "field.placeholder.proxy": "http://127.0.0.1:7897",
   "accounts.cliTitle": "Switch Codex CLI to this account",
+  "accounts.kiroForceLoginTitle": "Sign the local Kiro IDE in as this account",
+  "accounts.kiroForceCliLoginTitle":
+    "Sign the local Kiro CLI in as this account",
   "log.copyTitle": "Click to copy log file path",
   "time.justNow": "just now",
   "time.secAgo": "{n}s ago",
@@ -346,6 +407,56 @@ const UI_ZH: Record<string, string> = {
   "page.title": "Agent Vibes 控制台",
   "page.tagline": "统一 AI 代理网关 — 祝你编码愉快！",
   "tab.overview": "概览",
+  "tab.endpoints": "API",
+  "endpoints.title": "API",
+  "endpoints.subtitle":
+    "本 Bridge 对外暴露的 HTTP 端点，可以复制 URL、测试连通性，或一键写入对应客户端的配置。",
+  "endpoints.action.copy": "复制",
+  "endpoints.action.test": "测试",
+  "endpoints.action.applyClaude": "写入 Claude CLI",
+  "endpoints.action.applyCursor": "接入 Cursor (hosts)",
+  "endpoints.toast.copied": "已复制",
+  "endpoints.toast.testing": "测试中…",
+  "endpoints.status.ready": "就绪",
+  "endpoints.status.online": "在线",
+  "endpoints.status.offline": "离线",
+  "endpoints.status.checking": "检查中…",
+  "endpoints.status.connecting": "接入中…",
+  "endpoints.status.disconnecting": "断开中…",
+  "endpoints.anthropic.name": "Anthropic API",
+  "endpoints.anthropic.desc":
+    "兼容 api.anthropic.com，可被 Claude Code CLI 及任意 Anthropic SDK 直接使用。",
+  "endpoints.cursor.name": "Cursor IDE 协议",
+  "endpoints.cursor.desc":
+    "Cursor IDE 走 Cursor 协议；接入会改写 /etc/hosts，让 api*.cursor.sh 落到本桥接。",
+  "endpoints.health.name": "健康检查",
+  "endpoints.health.desc": "返回桥接运行状态的 JSON 探针。",
+  "endpoints.openai.name": "OpenAI API",
+  "endpoints.codex.desc": "OpenAI Responses API 兼容 — 计划中。",
+  "endpoints.google.name": "Google API",
+  "endpoints.gemini.desc": "Google Gemini API 兼容 — 计划中。",
+  "tab.clients": "客户端",
+  "clients.title": "客户端接入",
+  "clients.subtitle": "将本机 AI 客户端接入到本 Bridge。",
+  "clients.status.wired": "已接入",
+  "clients.status.notWired": "未接入",
+  "clients.status.builtin": "原生支持",
+  "clients.status.comingSoon": "即将支持",
+  "clients.action.wire": "接入 Bridge",
+  "clients.action.unwire": "断开",
+  "clients.action.copy": "复制",
+  "clients.action.refresh": "刷新",
+  "clients.client.claudeCode": "Claude Code CLI",
+  "clients.client.cursorIde": "Cursor IDE",
+  "clients.client.codexCli": "Codex CLI",
+  "clients.client.geminiCli": "Gemini CLI",
+  "clients.client.cursorCli": "Cursor CLI",
+  "clients.claudeCode.desc":
+    "改写 ~/.claude/settings.json 的 env，让 CLI 把请求发到本 Bridge，而不是 api.anthropic.com。",
+  "clients.cursorIde.desc":
+    "接入会改写 /etc/hosts，把 Cursor 发往 api*.cursor.sh 的请求劫持到本 Bridge。需要管理员授权，与服务启停相互独立。",
+  "clients.cursorIde.endpoint": "Bridge 接入地址",
+  "clients.comingSoon.desc": "已规划但尚未实现该客户端的接入。",
   "tab.accounts": "账号",
   "tab.analytics": "用量分析",
   "tab.settings": "设置",
@@ -354,6 +465,8 @@ const UI_ZH: Record<string, string> = {
   "section.status": "状态",
   "section.actions": "操作",
   "section.backends": "后端",
+  "section.clients": "客户端",
+  "clients.manage": "管理 →",
   "section.accounts": "账号",
   "section.tokenUsage": "Token 用量",
   "section.sessionRuntime": "会话运行",
@@ -391,6 +504,7 @@ const UI_ZH: Record<string, string> = {
   "action.restart": "重启",
   "action.enableForwarding": "启用转发",
   "action.disableForwarding": "关闭转发",
+  "action.clearCache": "清除缓存",
   "status.health": "健康",
   "status.ssl": "SSL",
   "status.forwarding": "转发",
@@ -411,6 +525,8 @@ const UI_ZH: Record<string, string> = {
   "accounts.edit": "编辑",
   "accounts.remove": "移除",
   "accounts.cli": "CLI",
+  "accounts.kiroForceLogin": "登录 IDE",
+  "accounts.kiroForceCliLogin": "登录 CLI",
   "accounts.add": "+ 添加",
   "accounts.pagination": "{start}–{end} / 共 {total}",
   "accounts.prev": "← 上一页",
@@ -453,6 +569,8 @@ const UI_ZH: Record<string, string> = {
   "oauth.manualTab": "手动同步",
   "oauth.kiroBuilderIdTab": "Builder ID",
   "oauth.kiroApiKeyTab": "API Key",
+  "oauth.kiroLoginBtn": "登录 Kiro IDE",
+  "oauth.kiroBuilderIdTitle": "使用 AWS Builder ID 登录（将打开浏览器）",
   "oauth.kiroApiKeyHelp":
     "粘贴 Kiro API Key。桥接会以 authMethod=api_key 形式保存到本地，直接使用，无需 OAuth 续签。",
   "oauth.googleHelp":
@@ -628,6 +746,8 @@ const UI_ZH: Record<string, string> = {
   "field.placeholder.label": "例如 claude-proxy",
   "field.placeholder.proxy": "http://127.0.0.1:7897",
   "accounts.cliTitle": "将 Codex CLI 切换到此账号",
+  "accounts.kiroForceLoginTitle": "让本地 Kiro IDE 登录为此账号",
+  "accounts.kiroForceCliLoginTitle": "让本地 Kiro CLI 登录为此账号",
   "log.copyTitle": "点击复制日志文件路径",
   "time.justNow": "刚刚",
   "time.secAgo": "{n} 秒前",
@@ -864,6 +984,7 @@ type StorageSettingsItems = {
 type PatchSettingsItems = {
   cursorAppRoot: SettingsItemCopy
   cursorBuild: SettingsItemCopy
+  idleKiller: SettingsItemCopy
   resetPatches: SettingsItemCopy
   fixChecksums: SettingsItemCopy
 }
@@ -882,6 +1003,7 @@ type SettingsCopy = {
   }
   patch: {
     resetAll: string
+    applyIdleKiller: string
     fixChecksumsLabel: string
     fixChecksumsDesc: string
   }
@@ -995,6 +1117,10 @@ const SETTINGS_EN: SettingsCopy = {
           label: "Cursor Build",
           desc: "Detected Cursor build identity used to scope patch baselines across upgrades.",
         },
+        idleKiller: {
+          label: "Idle Extension Host Killer",
+          desc: "Disable Cursor's idle extension-host killer to keep long agent sessions alive.",
+        },
         resetPatches: {
           label: "Reset All Patches",
           desc: "One-click restore back to the captured original Cursor baseline.",
@@ -1008,6 +1134,7 @@ const SETTINGS_EN: SettingsCopy = {
   },
   patch: {
     resetAll: "Reset All",
+    applyIdleKiller: "Apply",
     fixChecksumsLabel: "Fix Checksums Next",
     fixChecksumsDesc:
       "Ported from the Fix VSCode Checksums Next extension for manual Cursor checksum repair.",
@@ -1123,6 +1250,10 @@ const SETTINGS_ZH: SettingsCopy = {
           label: "Cursor 构建信息",
           desc: "检测到的 Cursor 构建标识，用于跨版本补丁基线",
         },
+        idleKiller: {
+          label: "空闲扩展宿主保护",
+          desc: "禁用 Cursor 空闲扩展宿主停止逻辑，保持长会话可用。",
+        },
         resetPatches: {
           label: "重置所有补丁",
           desc: "一键还原到已捕获的原始 Cursor 基线",
@@ -1136,6 +1267,7 @@ const SETTINGS_ZH: SettingsCopy = {
   },
   patch: {
     resetAll: "全部重置",
+    applyIdleKiller: "应用",
     fixChecksumsLabel: "Fix Checksums Next",
     fixChecksumsDesc:
       "源自 Fix VSCode Checksums Next，用于手动修复 Cursor 校验和",

@@ -5,17 +5,20 @@ import * as fs from "fs"
 import { HttpProxyAgent } from "http-proxy-agent"
 import { HttpsProxyAgent } from "https-proxy-agent"
 import { SocksProxyAgent } from "socks-proxy-agent"
+import type { LooseMessageContent } from "../../context/types"
+import { PersistenceService } from "../../persistence"
 import type { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
 import type { AnthropicResponse } from "../../shared/anthropic"
-import { UsageStatsService } from "../../usage"
-import { applyPromptCachingOptimizations } from "./prompt-caching"
-import { getAccountConfigPathCandidates } from "../../shared/protocol-bridge-paths"
-import { PersistenceService } from "../../persistence"
 import {
-  type CursorDisplayModel,
-  detectModelFamily,
-  doesModelIdRequireExplicitThinkingSupport,
-} from "../shared/model-registry"
+  getAccountConfigPathCandidates,
+  resolveDefaultAccountConfigPath,
+} from "../../shared/protocol-bridge-paths"
+import { UsageStatsService } from "../../usage"
+import {
+  createAbortPromise,
+  createAbortSignalWithTimeout,
+  toUpstreamRequestAbortedError,
+} from "../shared/abort-signal"
 import {
   type CooldownableAccount,
   clearAccountDisablement,
@@ -37,14 +40,146 @@ import {
   BackendPoolEntryState,
   BackendPoolStatus,
 } from "../shared/backend-pool-status"
+import { appendLanguageDirectiveToAnthropicSystem } from "../shared/language-directive"
 import {
-  createAbortPromise,
-  createAbortSignalWithTimeout,
-  toUpstreamRequestAbortedError,
-} from "../shared/abort-signal"
+  type CursorDisplayModel,
+  detectModelFamily,
+  doesModelIdRequireExplicitThinkingSupport,
+} from "../shared/model-registry"
+import { stripSignatureBlocksFlat } from "../shared/normalize-for-api"
+import { isClaudeOAuthToken } from "./claude-code-instructions"
+import { applyClaudeDeviceProfileHeaders } from "./device-profile"
+import {
+  applyCcCliCloaking,
+  restoreOAuthToolNamesFromResponse,
+} from "./oauth-cloaking"
+import { appendOauthAccount, persistOauthRotation } from "./oauth-persistence"
+import {
+  AnthropicOAuthError,
+  type AnthropicOAuthLoginSession,
+  exchangeAuthorizationCode,
+  refreshAnthropicTokens,
+  startAnthropicLogin,
+} from "./oauth-pkce"
+import { applyPromptCachingOptimizations } from "./prompt-caching"
+import {
+  appendClaudeResponseChunk,
+  appendClaudeResponseError,
+  appendClaudeResponseMetadata,
+  startClaudeRequestLog,
+} from "./request-log"
+import { readJsonWithMagicByteSniff } from "./response-decoder"
 
 export interface AnthropicForwardHeaders {
   [key: string]: string | undefined
+}
+
+/**
+ * Identifies which downstream client is calling the Anthropic backend so the
+ * service can decide whether to apply Claude Code CLI-specific cloaking
+ * (system prompt injection, cch billing-header signing, OAuth tool-name
+ * remapping, etc.) without leaking those rewrites into the Cursor-native
+ * protocol path.
+ *
+ * - "claude-code-cli": request originates from POST /v1/messages and is
+ *   expected to mimic the real Claude Code CLI fingerprint when the
+ *   underlying account uses an Anthropic OAuth access token.
+ * - "cursor": request originates from the Cursor ConnectRPC stack. The
+ *   Cursor protocol carries its own system prompt, tool naming, and
+ *   user-agent identity and must NOT be cloaked as Claude Code CLI.
+ * - "generic": internal callers (web_search server-tool, count_tokens
+ *   probes, health checks) that have no client identity to preserve.
+ *
+ * The mode is currently propagated end-to-end as a structural seam; the
+ * actual mode-specific shaping is layered on top in subsequent steps and
+ * defaults to a no-op so existing behaviour is unchanged.
+ */
+export type ClaudeApiClientMode = "claude-code-cli" | "cursor" | "generic"
+
+export interface ClaudeApiCallOptions {
+  clientMode: ClaudeApiClientMode
+  forwardHeaders?: AnthropicForwardHeaders
+  abortSignal?: AbortSignal
+  /**
+   * Stable per-conversation key passed down so PromptCacheBreakDetection
+   * can compare turn-to-turn cache_read_input_tokens drops. Stateless
+   * forwarders (`/v1/messages` without a session) leave this unset and
+   * cache-break detection silently skips.
+   */
+  sessionId?: string
+  /** Optional sub-agent id; combined with sessionId to form the tracking key. */
+  agentId?: string
+  /**
+   * Wall-clock timestamp of the previous successful assistant response
+   * for the same session. Used to attribute cache breaks to TTL expiry
+   * when no client-side change is detected.
+   */
+  lastAssistantTimestampMs?: number
+}
+
+interface ClaudeStreamShape {
+  sawMessageStart: boolean
+  sawMessageDelta: boolean
+  upstreamErrorMessage?: string
+  upstreamErrorRaised: boolean
+}
+
+/**
+ * Merge an Anthropic SSE `usage` object into the running per-stream
+ * counters. Used by both `message_start.message.usage` and
+ * `message_delta.usage` paths so they share a single implementation.
+ *
+ * Each field is monotonic-replaced (Anthropic emits cumulative values
+ * on each event), guarded by `> 0` for cache fields so a missing-vs-0
+ * distinction in the upstream doesn't accidentally zero the counter.
+ */
+function mergeUsageInto(
+  target: {
+    inputTokens: number
+    cachedInputTokens: number
+    cacheCreationInputTokens: number
+    outputTokens: number
+    webSearchRequests: number
+  },
+  usage: Record<string, unknown>
+): void {
+  if (typeof usage.input_tokens === "number") {
+    target.inputTokens = Math.max(0, Math.round(usage.input_tokens))
+  }
+  if (
+    typeof usage.cache_read_input_tokens === "number" &&
+    usage.cache_read_input_tokens > 0
+  ) {
+    target.cachedInputTokens = Math.max(
+      0,
+      Math.round(usage.cache_read_input_tokens)
+    )
+  }
+  if (
+    typeof usage.cache_creation_input_tokens === "number" &&
+    usage.cache_creation_input_tokens > 0
+  ) {
+    target.cacheCreationInputTokens = Math.max(
+      0,
+      Math.round(usage.cache_creation_input_tokens)
+    )
+  }
+  if (typeof usage.output_tokens === "number") {
+    target.outputTokens = Math.max(0, Math.round(usage.output_tokens))
+  }
+  const serverToolUse =
+    usage.server_tool_use && typeof usage.server_tool_use === "object"
+      ? (usage.server_tool_use as Record<string, unknown>)
+      : null
+  if (
+    typeof serverToolUse?.web_search_requests === "number" &&
+    serverToolUse.web_search_requests > 0
+  ) {
+    target.webSearchRequests = Math.max(
+      0,
+      Math.round(serverToolUse.web_search_requests)
+    )
+  }
 }
 
 function stringifyUnknownForLog(value: unknown): string {
@@ -106,6 +241,87 @@ function formatUnknownError(error: unknown): string {
   return stringifyUnknownForLog(error)
 }
 
+/**
+ * Convert a fetch `Response.headers` instance to a plain string map so it
+ * can be passed to the request-log helpers without exposing the iterator
+ * surface to callers.
+ */
+function headersToRecord(headers: Headers): Record<string, string> {
+  const out: Record<string, string> = {}
+  headers.forEach((value, key) => {
+    out[key] = value
+  })
+  return out
+}
+
+/**
+ * Extract the CC CLI entrypoint name from a client User-Agent header.
+ * Real Claude Code emits `claude-cli/<version> (<user_type>, <entrypoint>)`,
+ * e.g. `(external, cli)` or `(external, vscode)`. Mirrors
+ * `parseEntrypointFromUA` in CLIProxyAPI's claude_executor.go.
+ */
+function deriveEntrypoint(
+  forwardHeaders?: AnthropicForwardHeaders
+): string | undefined {
+  const ua = forwardHeaders?.["user-agent"]?.trim()
+  if (!ua) return undefined
+  const start = ua.indexOf("(")
+  const end = ua.lastIndexOf(")")
+  if (start < 0 || end <= start) return undefined
+  const inner = ua.slice(start + 1, end)
+  const parts = inner.split(",").map((p) => p.trim())
+  if (parts.length < 2) return undefined
+  const candidate = parts[1] || ""
+  return candidate || undefined
+}
+
+/**
+ * Map a CC CLI entrypoint to the `anthropic-client-platform` value real
+ * Claude Code emits. Mirrors `function w9H()` in the v2.1.142 binary
+ * (`switch(process.env.CLAUDE_CODE_ENTRYPOINT)`).
+ *
+ * Returning `claude_code_cli` for unknown / missing entrypoints matches
+ * the upstream default branch (`case "cli": default:`), which keeps the
+ * traffic firmly inside Anthropic's first-party CC bucket.
+ */
+function deriveAnthropicClientPlatform(entrypoint?: string): string {
+  switch (entrypoint) {
+    case "claude-vscode":
+      return "claude_code_vscode"
+    case "remote":
+    case "remote_baku":
+    case "remote_desktop":
+    case "remote_mobile":
+      return "claude_code_remote"
+    case "sdk-cli":
+    case "sdk-ts":
+    case "sdk-py":
+      return "claude_code_sdk"
+    case "mcp":
+      return "claude_code_mcp"
+    case "claude-code-github-action":
+      return "claude_code_github_action"
+    case "local-agent":
+      return "claude_code_local_agent"
+    case "claude_in_slack":
+      return "claude_in_slack"
+    case "cli":
+    default:
+      return "claude_code_cli"
+  }
+}
+
+/**
+ * Extract the optional `cc_workload` value from a custom forwarded
+ * header. Mirrors `getWorkloadFromContext` in CLIProxyAPI.
+ */
+function deriveWorkload(
+  forwardHeaders?: AnthropicForwardHeaders
+): string | undefined {
+  const value = forwardHeaders?.["x-cpa-claude-workload"]?.trim()
+  return value || undefined
+}
+
 interface ClaudeApiModelMapping {
   name: string
   alias?: string
@@ -132,6 +348,7 @@ interface ClaudeApiAccount extends CooldownableAccount {
   proxyUrl?: string
   maxContextTokens?: number
   stripThinking: boolean
+  disablePromptCaching: boolean
   prefix?: string
   headers?: Record<string, string>
   models: ClaudeApiModelMapping[]
@@ -142,6 +359,19 @@ interface ClaudeApiAccount extends CooldownableAccount {
   discoveredModels: ClaudeApiDiscoveredModel[]
   discoveredModelsFetchedAt?: number
   discoveryPromise?: Promise<void>
+  /**
+   * Anthropic OAuth metadata. Present only when the account was created
+   * via the PKCE login flow rather than a static API key. The bridge
+   * silently rotates `apiKey` (= access token) before expiry using
+   * `refreshToken`.
+   */
+  oauth?: {
+    refreshToken: string
+    accessTokenExpiresAt: number
+    accountUuid?: string
+    organizationUuid?: string
+  }
+  oauthRefreshInFlight?: Promise<void>
 }
 
 interface ClaudeApiCandidate {
@@ -159,11 +389,31 @@ interface ClaudeApiAccountFileEntry {
   proxyUrl?: string
   maxContextTokens?: number
   stripThinking?: boolean
+  /**
+   * Opt-out for `cache_control` injection. Default `false` — bridge will
+   * inject cache breakpoints automatically against any Claude-compatible
+   * upstream. Set to `true` only for providers that reject the field
+   * (very rare; Anthropic itself, all major OAuth proxies, and the
+   * mainstream third-party Claude relays accept it silently when the
+   * model does not support caching).
+   */
+  disablePromptCaching?: boolean
   prefix?: string
   priority?: number
   headers?: Record<string, string>
   models?: Array<{ name?: string; alias?: string }>
   excludedModels?: string[]
+  /**
+   * Optional Anthropic OAuth metadata produced by the PKCE login flow.
+   * When present, the bridge treats `apiKey` as the access token and
+   * automatically refreshes it using `oauth.refreshToken`.
+   */
+  oauth?: {
+    refreshToken?: string
+    accessTokenExpiresAt?: number
+    accountUuid?: string
+    organizationUuid?: string
+  }
 }
 
 interface ClaudeApiConfigFile {
@@ -174,6 +424,12 @@ interface ClaudeApiConfigFile {
 const DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 const DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 export const DEFAULT_CLAUDE_API_CONTEXT_LIMIT_TOKENS = 200_000
+
+/**
+ * Anthropic-compatible upstreams reject or even crash when Claude models
+ * omit `max_tokens`. Mirrors CLIProxyAPI's `defaultModelMaxTokens` (1024).
+ */
+const DEFAULT_MODEL_MAX_TOKENS = 1024
 
 /**
  * Models that ship Anthropic's server-side `web_search_20250305` tool. We try
@@ -202,24 +458,82 @@ const DEFAULT_FORWARDED_HEADERS: Record<string, string> = {
   "anthropic-version": DEFAULT_ANTHROPIC_VERSION,
   "anthropic-dangerous-direct-browser-access": "true",
   "x-app": "cli",
-  "x-stainless-retry-count": "0",
-  "x-stainless-runtime": "node",
-  "x-stainless-lang": "js",
-  "x-stainless-timeout": "600",
-  "user-agent": "claude-cli/2.1.70 (external, cli)",
 }
 
 /**
- * Required beta features that must always be present in Anthropic-Beta header.
- * Updated to match Claude Code 2.1.70 / CLIProxyAPI latest.
+ * Required beta features that are unconditionally activated when the
+ * CLI talks to api.anthropic.com under OAuth. Tracked against the
+ * v2.1.142 binary (`/opt/homebrew/bin/claude`).
+ *
+ * The full beta surface in the binary's `getAllModelBetas` is much
+ * larger (~30+ flags including `interleaved-thinking-2025-05-14`,
+ * `context-1m-2025-08-07`, `token-efficient-tools-2025-02-19`, …) but
+ * those are activated *conditionally* on model + per-request features.
+ * We split the list so the unconditional set stays minimal:
+ *
+ *   - claude-code-20250219               (sticky: client identity)
+ *   - oauth-2025-04-20                   (sticky: OAuth token grant)
+ *   - context-management-2025-06-27      (sticky: server-side editing)
+ *   - prompt-caching-scope-2026-01-05    (cache scope hints)
+ *   - extended-cache-ttl-2025-04-11      (1h cache TTL)
+ *   - structured-outputs-2025-12-15      (output schema enforcement)
+ *   - fast-mode-2026-02-01               (Opus fast mode)
+ *   - redact-thinking-2026-02-12         (thinking redaction)
+ *   - mid-conversation-system-2026-04-07 (system-reminder injection)
+ *
+ * Conditional flags handled separately:
+ *   - `interleaved-thinking-2025-05-14`  → only when thinking enabled
+ *   - `context-1m-2025-08-07`            → only on 1M-context models
+ *   - `token-efficient-tools-2025-02-19` → not unconditionally; v2.1.142
+ *     still references it but only emits it on Sonnet 3.5/3.7 series.
  */
 const REQUIRED_BETA_FEATURES = [
   "claude-code-20250219",
   "oauth-2025-04-20",
-  "interleaved-thinking-2025-05-14",
   "context-management-2025-06-27",
   "prompt-caching-scope-2026-01-05",
+  "extended-cache-ttl-2025-04-11",
+  "structured-outputs-2025-12-15",
+  "fast-mode-2026-02-01",
+  "redact-thinking-2026-02-12",
+  "mid-conversation-system-2026-04-07",
 ] as const
+
+/** Beta flag added only when the request opts into extended thinking. */
+const INTERLEAVED_THINKING_BETA = "interleaved-thinking-2025-05-14"
+
+/** Beta flag added only when the request targets a 1M-context model. */
+const CONTEXT_1M_BETA = "context-1m-2025-08-07"
+
+/**
+ * Model name fragments that activate `context-1m-2025-08-07`. Matched
+ * case-insensitively against the resolved upstream model id. Anthropic
+ * rejects the flag for models that don't support it, so we keep the
+ * list tight rather than always-on.
+ */
+const CONTEXT_1M_MODEL_FRAGMENTS = ["claude-sonnet-4-5", "1m"] as const
+
+function modelSupports1MContext(model: string): boolean {
+  const lower = model.toLowerCase()
+  return CONTEXT_1M_MODEL_FRAGMENTS.some((fragment) => lower.includes(fragment))
+}
+
+function bodyEnablesThinking(
+  body: Record<string, unknown> | undefined
+): boolean {
+  if (!body) return false
+  const thinking = (body as { thinking?: unknown }).thinking
+  if (!thinking || typeof thinking !== "object") return false
+  return (thinking as { type?: unknown }).type === "enabled"
+}
+
+function bodyResolvedModel(
+  body: Record<string, unknown> | undefined
+): string | undefined {
+  if (!body) return undefined
+  const model = (body as { model?: unknown }).model
+  return typeof model === "string" ? model : undefined
+}
 const CACHE_EDITING_BETA_HEADER =
   process.env.ANTHROPIC_CACHE_EDITING_BETA_HEADER?.trim() ||
   process.env.CACHE_EDITING_BETA_HEADER?.trim() ||
@@ -233,6 +547,7 @@ import type {
   ProviderAdapter,
   ProviderWarmupHint,
 } from "../shared/provider-adapter.interface"
+import { PromptCacheBreakDetectionService } from "./prompt-cache-break-detection.service"
 
 @Injectable()
 export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
@@ -243,6 +558,11 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
   private forceModelPrefix = false
   private accountsConfigPath: string | null = null
   private accountStateStore: BackendAccountStateStore
+  private readonly sessionIdCache = new Map<string, string>()
+  private readonly oauthLoginSessions = new Map<
+    string,
+    AnthropicOAuthLoginSession
+  >()
 
   private normalizeMaxContextTokens(value: unknown): number | undefined {
     const parsed =
@@ -257,7 +577,8 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
   constructor(
     private readonly configService: ConfigService,
     private readonly persistence: PersistenceService,
-    private readonly usageStats: UsageStatsService
+    private readonly usageStats: UsageStatsService,
+    private readonly promptCacheBreakDetection: PromptCacheBreakDetectionService
   ) {
     this.accountStateStore = new BackendAccountStateStore(
       this.persistence,
@@ -413,6 +734,10 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
         }
         if (existing.stripThinking !== fresh.stripThinking) {
           existing.stripThinking = fresh.stripThinking
+          changed = true
+        }
+        if (existing.disablePromptCaching !== fresh.disablePromptCaching) {
+          existing.disablePromptCaching = fresh.disablePromptCaching
           changed = true
         }
         if (existing.priority !== fresh.priority) {
@@ -638,7 +963,8 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
    * or null if no account can serve this model (caller should fall back to local estimation).
    */
   async countTokensUpstream(
-    dto: Record<string, unknown>
+    dto: Record<string, unknown>,
+    options: { clientMode: ClaudeApiClientMode }
   ): Promise<{ input_tokens: number } | null> {
     const model = typeof dto.model === "string" ? dto.model : ""
     if (!model) return null
@@ -652,12 +978,16 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
 
     for (const candidate of candidates) {
       const account = candidate.account
+      if (!(await this.prepareAccountToken(account))) {
+        continue
+      }
       const request = this.buildUpstreamRequestPayload(
         dto,
         candidate.upstreamModel,
         account,
         {
           applyPromptCaching: true,
+          clientMode: options.clientMode,
         }
       )
       const url = this.buildCountTokensUrl(account.baseUrl)
@@ -665,7 +995,11 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
         account,
         false,
         {},
-        request.betas
+        request.betas,
+        {
+          model: bodyResolvedModel(request.body),
+          thinkingEnabled: bodyEnablesThinking(request.body),
+        }
       )
       const fetchOptions: RequestInit & { dispatcher?: unknown } = {
         method: "POST",
@@ -701,7 +1035,9 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
           continue
         }
 
-        const result = (await response.json()) as { input_tokens?: number }
+        const result = await readJsonWithMagicByteSniff<{
+          input_tokens?: number
+        }>(response)
         if (typeof result.input_tokens === "number") {
           this.markAccountHealthy(account, candidate.upstreamModel)
           return { input_tokens: result.input_tokens }
@@ -724,26 +1060,43 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
 
   async sendClaudeMessage(
     dto: CreateMessageDto,
-    forwardHeaders: AnthropicForwardHeaders = {}
+    options: ClaudeApiCallOptions
   ): Promise<AnthropicResponse> {
-    return this.executeWithCooldownRetry(dto, forwardHeaders, new Set())
+    return this.executeWithCooldownRetry(
+      dto,
+      options.forwardHeaders ?? {},
+      options.clientMode,
+      new Set(),
+      undefined,
+      {
+        sessionId: options.sessionId,
+        agentId: options.agentId,
+        lastAssistantTimestampMs: options.lastAssistantTimestampMs,
+      }
+    )
   }
 
   async *sendClaudeMessageStream(
     dto: CreateMessageDto,
-    forwardHeaders: AnthropicForwardHeaders = {},
-    abortSignal?: AbortSignal
+    options: ClaudeApiCallOptions
   ): AsyncGenerator<string, void, unknown> {
     yield* this.executeStreamWithCooldownRetry(
       dto,
-      forwardHeaders,
+      options.forwardHeaders ?? {},
+      options.clientMode,
       new Set(),
-      abortSignal
+      options.abortSignal,
+      undefined,
+      {
+        sessionId: options.sessionId,
+        agentId: options.agentId,
+        lastAssistantTimestampMs: options.lastAssistantTimestampMs,
+      }
     )
   }
 
   /**
-   * Execute a one-shot web search via the Anthropic Messages API server-side
+   * Execute a one-shot web search via the Anthropic API server-side
    * `web_search_20250305` tool. We synthesize a small CreateMessageDto, run it
    * through the standard candidate / cooldown machinery, and then collect any
    * `server_tool_use` / `web_search_tool_result` blocks plus the final
@@ -808,7 +1161,7 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
       stream: false,
     }
 
-    const result = await this.sendClaudeMessage(dto)
+    const result = await this.sendClaudeMessage(dto, { clientMode: "generic" })
     return this.extractWebSearchResultFromResponse(result)
   }
 
@@ -908,19 +1261,56 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
   private async executeWithCooldownRetry(
     dto: CreateMessageDto,
     forwardHeaders: AnthropicForwardHeaders,
+    clientMode: ClaudeApiClientMode,
     attemptedCandidates: Set<string>,
-    candidate: ClaudeApiCandidate = this.nextCandidate(dto.model)
+    candidate: ClaudeApiCandidate = this.nextCandidate(dto.model),
+    cacheBreakTracking?: {
+      sessionId?: string
+      agentId?: string
+      lastAssistantTimestampMs?: number
+    }
   ): Promise<AnthropicResponse> {
     const requestStartedAt = Date.now()
     attemptedCandidates.add(this.buildCandidateKey(candidate))
-    const request = this.buildRequestBody(dto, candidate)
+    if (!(await this.prepareAccountToken(candidate.account))) {
+      const nextCandidate = this.nextRetryCandidate(
+        dto.model,
+        attemptedCandidates
+      )
+      if (nextCandidate) {
+        return this.executeWithCooldownRetry(
+          dto,
+          forwardHeaders,
+          clientMode,
+          attemptedCandidates,
+          nextCandidate,
+          cacheBreakTracking
+        )
+      }
+      throw new BackendApiError(
+        "All Claude API accounts failed token refresh",
+        { backend: "claude-api", statusCode: 401 }
+      )
+    }
+    const request: {
+      body: Record<string, unknown>
+      betas: string[]
+      oauthToolReverseMap: Record<string, string>
+    } = this.buildRequestBody(dto, candidate, clientMode, forwardHeaders)
     const url = this.buildMessagesUrl(candidate.account.baseUrl)
     const headers = this.buildHeadersForAccount(
       candidate.account,
       false,
       forwardHeaders,
-      request.betas
+      request.betas,
+      {
+        model: bodyResolvedModel(request.body),
+        thinkingEnabled: bodyEnablesThinking(request.body),
+      }
     )
+
+    // Phase 1 of cache-break detection (see streaming counterpart for rationale).
+    this.recordCacheBreakPromptState(request.body, dto, cacheBreakTracking)
 
     this.logger.log(
       `[Claude API] Non-stream request: model=${dto.model} -> ${candidate.upstreamModel}, url=${url}`
@@ -938,6 +1328,15 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
       fetchOptions.dispatcher = dispatcher
     }
 
+    const requestLog = await startClaudeRequestLog({
+      url,
+      method: "POST",
+      headers,
+      body: request.body,
+      accountLabel: candidate.account.label || candidate.account.baseUrl,
+      upstreamModel: candidate.upstreamModel,
+    })
+
     try {
       let response: Response
       try {
@@ -946,6 +1345,7 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
         this.logger.error(
           `[Claude API] Non-stream fetch failed: account=${candidate.account.label || candidate.account.baseUrl}, model=${candidate.upstreamModel}, url=${url}, detail=${formatUnknownError(error)}`
         )
+        await appendClaudeResponseError(requestLog, error)
         throw this.buildTransientFailureError(
           candidate.account,
           504,
@@ -954,11 +1354,19 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
         )
       }
 
+      const responseHeaders = headersToRecord(response.headers)
+      await appendClaudeResponseMetadata(
+        requestLog,
+        response.status,
+        responseHeaders
+      )
+
       if (!response.ok) {
         const errorBody = await response.text()
         this.logger.error(
           `[Claude API] Request failed: status=${response.status}, body=${errorBody.slice(0, 500)}`
         )
+        await appendClaudeResponseChunk(requestLog, errorBody)
         throw this.buildHttpFailureError(
           candidate.account,
           response.status,
@@ -968,7 +1376,22 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
         )
       }
 
-      const result = (await response.json()) as AnthropicResponse
+      const result =
+        await readJsonWithMagicByteSniff<AnthropicResponse>(response)
+      await appendClaudeResponseChunk(
+        requestLog,
+        JSON.stringify(result, null, 2)
+      )
+      // Restore client-side tool naming for OAuth-cloaked requests so the
+      // caller never sees the upstream-canonical TitleCase variants we
+      // sent on the wire.
+      const reverseMap: Record<string, string> = request.oauthToolReverseMap
+      if (Object.keys(reverseMap).length > 0) {
+        restoreOAuthToolNamesFromResponse(
+          result as unknown as Record<string, unknown>,
+          reverseMap
+        )
+      }
       this.markAccountHealthy(candidate.account, candidate.upstreamModel)
       this.recordClaudeApiUsage(
         candidate,
@@ -976,6 +1399,21 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
         result.usage as Record<string, unknown> | null | undefined,
         requestStartedAt
       )
+      // Phase 2 of cache-break detection. See streaming counterpart for rationale.
+      const usageRec = result.usage as
+        | {
+            cache_read_input_tokens?: number
+            cache_creation_input_tokens?: number
+          }
+        | null
+        | undefined
+      this.promptCacheBreakDetection.checkResponseForCacheBreak({
+        sessionId: cacheBreakTracking?.sessionId,
+        agentId: cacheBreakTracking?.agentId,
+        cacheReadTokens: usageRec?.cache_read_input_tokens ?? 0,
+        cacheCreationTokens: usageRec?.cache_creation_input_tokens ?? 0,
+        lastAssistantTimestampMs: cacheBreakTracking?.lastAssistantTimestampMs,
+      })
       return result
     } catch (error) {
       const nextCandidate = this.shouldRetryWithNextCandidate(
@@ -992,8 +1430,10 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
         return this.executeWithCooldownRetry(
           dto,
           forwardHeaders,
+          clientMode,
           attemptedCandidates,
-          nextCandidate
+          nextCandidate,
+          cacheBreakTracking
         )
       }
       throw error
@@ -1003,20 +1443,64 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
   private async *executeStreamWithCooldownRetry(
     dto: CreateMessageDto,
     forwardHeaders: AnthropicForwardHeaders,
+    clientMode: ClaudeApiClientMode,
     attemptedCandidates: Set<string>,
     abortSignal?: AbortSignal,
-    candidate: ClaudeApiCandidate = this.nextCandidate(dto.model)
+    candidate: ClaudeApiCandidate = this.nextCandidate(dto.model),
+    cacheBreakTracking?: {
+      sessionId?: string
+      agentId?: string
+      lastAssistantTimestampMs?: number
+    }
   ): AsyncGenerator<string, void, unknown> {
     const requestStartedAt = Date.now()
     attemptedCandidates.add(this.buildCandidateKey(candidate))
-    const request = this.buildRequestBody(dto, candidate)
+    if (!(await this.prepareAccountToken(candidate.account))) {
+      const nextCandidate = this.nextRetryCandidate(
+        dto.model,
+        attemptedCandidates
+      )
+      if (nextCandidate) {
+        yield* this.executeStreamWithCooldownRetry(
+          dto,
+          forwardHeaders,
+          clientMode,
+          attemptedCandidates,
+          abortSignal,
+          nextCandidate,
+          cacheBreakTracking
+        )
+        return
+      }
+      throw new BackendApiError(
+        "All Claude API accounts failed token refresh",
+        { backend: "claude-api", statusCode: 401 }
+      )
+    }
+    const request: {
+      body: Record<string, unknown>
+      betas: string[]
+      oauthToolReverseMap: Record<string, string>
+    } = this.buildRequestBody(dto, candidate, clientMode, forwardHeaders)
+    const oauthToolReverseMap: Record<string, string> =
+      request.oauthToolReverseMap
     const url = this.buildMessagesUrl(candidate.account.baseUrl)
     const headers = this.buildHeadersForAccount(
       candidate.account,
       true,
       forwardHeaders,
-      request.betas
+      request.betas,
+      {
+        model: bodyResolvedModel(request.body),
+        thinkingEnabled: bodyEnablesThinking(request.body),
+      }
     )
+
+    // Phase 1 of cache-break detection: snapshot the outbound prompt
+    // shape so the post-call check can attribute any drop in
+    // cache_read_input_tokens to a concrete client-side change. No-op
+    // when sessionId is absent (stateless /v1/messages forwarding).
+    this.recordCacheBreakPromptState(request.body, dto, cacheBreakTracking)
 
     this.logger.log(
       `[Claude API] Stream request: model=${dto.model} -> ${candidate.upstreamModel}, url=${url}`
@@ -1032,6 +1516,15 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
     if (dispatcher) {
       fetchOptions.dispatcher = dispatcher
     }
+
+    const requestLog = await startClaudeRequestLog({
+      url,
+      method: "POST",
+      headers,
+      body: request.body,
+      accountLabel: candidate.account.label || candidate.account.baseUrl,
+      upstreamModel: candidate.upstreamModel,
+    })
 
     let emittedEvents = false
     try {
@@ -1056,6 +1549,7 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
         this.logger.error(
           `[Claude API] Stream fetch failed before headers: account=${candidate.account.label || candidate.account.baseUrl}, model=${candidate.upstreamModel}, url=${url}, detail=${formatUnknownError(error)}`
         )
+        await appendClaudeResponseError(requestLog, error)
         throw this.buildTransientFailureError(
           candidate.account,
           504,
@@ -1064,11 +1558,19 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
         )
       }
 
+      const responseHeaders = headersToRecord(response.headers)
+      await appendClaudeResponseMetadata(
+        requestLog,
+        response.status,
+        responseHeaders
+      )
+
       if (!response.ok) {
         const errorBody = await response.text()
         this.logger.error(
           `[Claude API] Stream request failed: status=${response.status}, body=${errorBody.slice(0, 500)}`
         )
+        await appendClaudeResponseChunk(requestLog, errorBody)
         throw this.buildHttpFailureError(
           candidate.account,
           response.status,
@@ -1108,6 +1610,17 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
         outputTokens: 0,
         webSearchRequests: 0,
       }
+      // Track wire-shape invariants Anthropic CC CLI relies on. We use the
+      // tracker to bail out (with a fall-back-eligible 502) BEFORE any
+      // bytes are emitted to the client when the upstream returns an
+      // explicit `event: error` or an obviously empty body. Once the
+      // client has seen bytes we only log violations.
+      const streamShape: ClaudeStreamShape = {
+        sawMessageStart: false,
+        sawMessageDelta: false,
+        upstreamErrorMessage: undefined,
+        upstreamErrorRaised: false,
+      }
 
       try {
         while (true) {
@@ -1130,18 +1643,90 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
           while (boundary !== -1) {
             const chunk = buffer.slice(0, boundary + 2)
             buffer = buffer.slice(boundary + 2)
+            // Single-pass: parse the SSE event once, then update
+            // stream-shape invariants, merge usage counters, and (when
+            // applicable) restore OAuth tool names. Returns the
+            // possibly-rewritten chunk.
+            const restored = this.processClaudeStreamChunk(
+              chunk,
+              streamShape,
+              streamUsage,
+              oauthToolReverseMap
+            )
+            // If a malformed `event: error` arrived before any client-visible
+            // bytes were emitted, surface it as a BackendApiError so the
+            // fallback chain can take over instead of leaking a partial SSE
+            // stream that the client has no way to interpret.
+            if (
+              !emittedEvents &&
+              streamShape.upstreamErrorMessage &&
+              !streamShape.upstreamErrorRaised
+            ) {
+              streamShape.upstreamErrorRaised = true
+              throw new BackendApiError(
+                `Claude API stream returned upstream error: ${streamShape.upstreamErrorMessage}`,
+                {
+                  backend: "claude-api",
+                  statusCode: 502,
+                }
+              )
+            }
             emittedEvents = true
-            this.mergeClaudeStreamUsage(streamUsage, chunk)
-            yield chunk.endsWith("\n\n") ? chunk : `${chunk}\n\n`
+            await appendClaudeResponseChunk(requestLog, restored)
+            yield restored.endsWith("\n\n") ? restored : `${restored}\n\n`
             boundary = buffer.indexOf("\n\n")
           }
         }
 
         const trailing = buffer.trim()
         if (trailing) {
+          const restored = this.processClaudeStreamChunk(
+            trailing,
+            streamShape,
+            streamUsage,
+            oauthToolReverseMap
+          )
+          if (
+            !emittedEvents &&
+            streamShape.upstreamErrorMessage &&
+            !streamShape.upstreamErrorRaised
+          ) {
+            streamShape.upstreamErrorRaised = true
+            throw new BackendApiError(
+              `Claude API stream returned upstream error: ${streamShape.upstreamErrorMessage}`,
+              {
+                backend: "claude-api",
+                statusCode: 502,
+              }
+            )
+          }
           emittedEvents = true
-          this.mergeClaudeStreamUsage(streamUsage, trailing)
-          yield trailing.endsWith("\n\n") ? trailing : `${trailing}\n\n`
+          await appendClaudeResponseChunk(requestLog, restored)
+          yield restored.endsWith("\n\n") ? restored : `${restored}\n\n`
+        }
+
+        if (!emittedEvents) {
+          throw new BackendApiError(
+            "Claude API stream returned an empty body",
+            {
+              backend: "claude-api",
+              statusCode: 502,
+            }
+          )
+        }
+
+        // Once the client has seen bytes we cannot take them back, but we
+        // still flag protocol violations to the request log so the next
+        // bug report has a hint that the upstream short-circuited.
+        if (!streamShape.sawMessageStart) {
+          this.logger.warn(
+            "[Claude API] stream completed without message_start — upstream may be malformed"
+          )
+        }
+        if (!streamShape.sawMessageDelta) {
+          this.logger.warn(
+            "[Claude API] stream completed without message_delta — upstream may be malformed"
+          )
         }
 
         this.markAccountHealthy(candidate.account, candidate.upstreamModel)
@@ -1159,6 +1744,18 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
           },
           requestStartedAt
         )
+        // Phase 2 of cache-break detection: compare cache_read tokens
+        // against the baseline captured by recordPromptState above and
+        // emit a `prompt_cache.break` telemetry event when both the
+        // ratio and absolute drop thresholds are crossed.
+        this.promptCacheBreakDetection.checkResponseForCacheBreak({
+          sessionId: cacheBreakTracking?.sessionId,
+          agentId: cacheBreakTracking?.agentId,
+          cacheReadTokens: streamUsage.cachedInputTokens,
+          cacheCreationTokens: streamUsage.cacheCreationInputTokens,
+          lastAssistantTimestampMs:
+            cacheBreakTracking?.lastAssistantTimestampMs,
+        })
         return
       } catch (error) {
         const abortedError = toUpstreamRequestAbortedError(
@@ -1169,6 +1766,7 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
         if (abortedError) {
           throw abortedError
         }
+        await appendClaudeResponseError(requestLog, error)
         this.markAccountTemporaryFailure(
           candidate.account,
           504,
@@ -1191,9 +1789,11 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
           yield* this.executeStreamWithCooldownRetry(
             dto,
             forwardHeaders,
+            clientMode,
             attemptedCandidates,
             abortSignal,
-            nextCandidate
+            nextCandidate,
+            cacheBreakTracking
           )
           return
         }
@@ -1215,6 +1815,7 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
       if (abortedError) {
         throw abortedError
       }
+      await appendClaudeResponseError(requestLog, error)
 
       const nextCandidate =
         !emittedEvents &&
@@ -1232,9 +1833,11 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
         yield* this.executeStreamWithCooldownRetry(
           dto,
           forwardHeaders,
+          clientMode,
           attemptedCandidates,
           abortSignal,
-          nextCandidate
+          nextCandidate,
+          cacheBreakTracking
         )
         return
       }
@@ -1278,6 +1881,63 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
       statusCode === 429 ||
       statusCode >= 500
     )
+  }
+
+  /**
+   * Bridges the Claude API request body shape into the input shape
+   * `PromptCacheBreakDetectionService.recordPromptState` expects. The
+   * upstream wire body has already been compiled at this point (system
+   * is an array of text blocks with cache_control applied; tools are
+   * the final schema array; betas live on the `betas` body field).
+   *
+   * Stateless callers (no sessionId) are filtered upstream — this
+   * helper still safely no-ops because the underlying service drops
+   * any input without a tracking key.
+   */
+  private recordCacheBreakPromptState(
+    body: Record<string, unknown>,
+    dto: CreateMessageDto,
+    tracking?: { sessionId?: string; agentId?: string }
+  ): void {
+    if (!tracking?.sessionId) return
+    const systemRaw = body.system
+    const system = Array.isArray(systemRaw)
+      ? (systemRaw as ReadonlyArray<Record<string, unknown>>)
+      : typeof systemRaw === "string"
+        ? [{ type: "text", text: systemRaw }]
+        : []
+    const toolsRaw = body.tools
+    const toolSchemas = Array.isArray(toolsRaw)
+      ? (toolsRaw as ReadonlyArray<Record<string, unknown>>)
+      : []
+    const betasRaw = body.betas
+    const betas = Array.isArray(betasRaw)
+      ? (betasRaw as unknown[]).filter(
+          (v): v is string => typeof v === "string"
+        )
+      : []
+    const model = typeof body.model === "string" ? body.model : dto.model
+
+    this.promptCacheBreakDetection.recordPromptState({
+      sessionId: tracking.sessionId,
+      agentId: tracking.agentId,
+      system,
+      toolSchemas,
+      model,
+      betas,
+      // extra body params: any field outside the standard set. Kept as
+      // an opaque hash dimension so toggles (thinking, max_tokens, etc.)
+      // get attributed correctly without leaking values.
+      extraBodyParams: {
+        max_tokens: body.max_tokens,
+        thinking: body.thinking,
+        metadata: body.metadata,
+        stop_sequences: body.stop_sequences,
+        top_k: body.top_k,
+        top_p: body.top_p,
+        temperature: body.temperature,
+      },
+    })
   }
 
   private recordClaudeApiUsage(
@@ -1339,129 +1999,162 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
     })
   }
 
-  private mergeClaudeStreamUsage(
-    target: {
+  /**
+   * Inspect a single SSE event chunk and update the wire-shape tracker so
+   * the caller can decide whether a stream is malformed before it commits
+   * bytes to the client.
+   *
+   * Tracks two structural invariants Claude Code CLI depends on:
+   *   - `message_start` event appears at least once
+   *   - `message_delta` event appears at least once
+   *
+   * Plus the explicit-error short circuit:
+   *   - `event: error` payloads are extracted into
+   *     `upstreamErrorMessage` so the caller can convert them into a
+   *     fall-back-eligible BackendApiError.
+   */
+  /**
+   * Single-pass per-chunk SSE handler for Anthropic streams.
+   *
+   * Replaces the historical three-pass pipeline
+   * (`observeClaudeStreamEvent` → `mergeClaudeStreamUsage` →
+   * `restoreOAuthToolNamesFromStreamChunk`) which each split the chunk
+   * by newline and ran `JSON.parse` independently. On a long stream
+   * those three parses were the dominant per-token CPU cost; merging
+   * them into a single parse roughly halves the per-chunk overhead.
+   *
+   * Side-effects (in order):
+   *   1. `state.sawMessageStart` / `state.sawMessageDelta` /
+   *      `state.upstreamErrorMessage` set when the matching event arrives.
+   *   2. `usage` token counters merged from `message_start.message.usage`
+   *      and `message_delta.usage`.
+   *   3. When `reverseMap` is non-empty and the event is a
+   *      `content_block_start` with a `tool_use` / `tool_reference`
+   *      block whose name is in the map, the block is renamed back to
+   *      the client-side spelling and the chunk is re-stringified.
+   *
+   * Returns the (possibly rewritten) chunk verbatim. Malformed JSON or
+   * missing data lines fall through with no mutation.
+   */
+  private processClaudeStreamChunk(
+    chunk: string,
+    state: ClaudeStreamShape,
+    usage: {
       inputTokens: number
       cachedInputTokens: number
       cacheCreationInputTokens: number
       outputTokens: number
       webSearchRequests: number
     },
-    chunk: string
-  ): void {
+    reverseMap: Record<string, string>
+  ): string {
     const lines = chunk.split("\n")
     let eventType = ""
+    let dataLineIdx = -1
     let dataLine = ""
 
-    for (const line of lines) {
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i] as string
       if (line.startsWith("event:")) {
         eventType = line.slice(6).trim()
       } else if (line.startsWith("data:")) {
+        dataLineIdx = i
         dataLine = line.slice(5).trim()
       }
     }
 
-    if (!dataLine) return
+    if (!dataLine || dataLine === "[DONE]") return chunk
 
+    let payload: Record<string, unknown> | null = null
     try {
-      const payload = JSON.parse(dataLine) as Record<string, unknown>
-      if (eventType === "message_start") {
+      const parsed: unknown = JSON.parse(dataLine)
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        payload = parsed as Record<string, unknown>
+      }
+    } catch {
+      return chunk
+    }
+    if (!payload) return chunk
+
+    const payloadType =
+      typeof payload.type === "string" ? payload.type : eventType
+
+    // ── 1. Stream-shape invariants ────────────────────────────────
+    if (payloadType === "message_start") {
+      state.sawMessageStart = true
+    } else if (payloadType === "message_delta") {
+      state.sawMessageDelta = true
+    } else if (payloadType === "error") {
+      const errorObj =
+        payload.error && typeof payload.error === "object"
+          ? (payload.error as Record<string, unknown>)
+          : null
+      if (errorObj) {
         const message =
-          payload.message && typeof payload.message === "object"
-            ? (payload.message as Record<string, unknown>)
-            : null
-        const usage =
-          message?.usage && typeof message.usage === "object"
-            ? (message.usage as Record<string, unknown>)
-            : null
-        if (typeof usage?.input_tokens === "number") {
-          target.inputTokens = Math.max(0, Math.round(usage.input_tokens))
-        }
-        if (
-          typeof usage?.cache_read_input_tokens === "number" &&
-          usage.cache_read_input_tokens > 0
-        ) {
-          target.cachedInputTokens = Math.max(
-            0,
-            Math.round(usage.cache_read_input_tokens)
-          )
-        }
-        if (
-          typeof usage?.cache_creation_input_tokens === "number" &&
-          usage.cache_creation_input_tokens > 0
-        ) {
-          target.cacheCreationInputTokens = Math.max(
-            0,
-            Math.round(usage.cache_creation_input_tokens)
-          )
-        }
-        if (typeof usage?.output_tokens === "number") {
-          target.outputTokens = Math.max(0, Math.round(usage.output_tokens))
-        }
-        const serverToolUse =
-          usage?.server_tool_use && typeof usage.server_tool_use === "object"
-            ? (usage.server_tool_use as Record<string, unknown>)
-            : null
-        if (
-          typeof serverToolUse?.web_search_requests === "number" &&
-          serverToolUse.web_search_requests > 0
-        ) {
-          target.webSearchRequests = Math.max(
-            0,
-            Math.round(serverToolUse.web_search_requests)
-          )
-        }
-        return
+          typeof errorObj.message === "string" ? errorObj.message.trim() : ""
+        const errType =
+          typeof errorObj.type === "string" ? errorObj.type.trim() : ""
+        state.upstreamErrorMessage = message || errType || "unknown error"
+      } else {
+        state.upstreamErrorMessage = "unknown error"
       }
+    }
 
-      if (eventType !== "message_delta") {
-        return
-      }
-
-      const usage =
+    // ── 2. Token-usage merge ──────────────────────────────────────
+    if (payloadType === "message_start") {
+      const message =
+        payload.message && typeof payload.message === "object"
+          ? (payload.message as Record<string, unknown>)
+          : null
+      const u =
+        message?.usage && typeof message.usage === "object"
+          ? (message.usage as Record<string, unknown>)
+          : null
+      if (u) mergeUsageInto(usage, u)
+    } else if (payloadType === "message_delta") {
+      const u =
         payload.usage && typeof payload.usage === "object"
           ? (payload.usage as Record<string, unknown>)
           : null
-      if (typeof usage?.input_tokens === "number") {
-        target.inputTokens = Math.max(0, Math.round(usage.input_tokens))
-      }
-      if (
-        typeof usage?.cache_read_input_tokens === "number" &&
-        usage.cache_read_input_tokens > 0
-      ) {
-        target.cachedInputTokens = Math.max(
-          0,
-          Math.round(usage.cache_read_input_tokens)
-        )
-      }
-      if (
-        typeof usage?.cache_creation_input_tokens === "number" &&
-        usage.cache_creation_input_tokens > 0
-      ) {
-        target.cacheCreationInputTokens = Math.max(
-          0,
-          Math.round(usage.cache_creation_input_tokens)
-        )
-      }
-      if (typeof usage?.output_tokens === "number") {
-        target.outputTokens = Math.max(0, Math.round(usage.output_tokens))
-      }
-      const serverToolUse =
-        usage?.server_tool_use && typeof usage.server_tool_use === "object"
-          ? (usage.server_tool_use as Record<string, unknown>)
-          : null
-      if (
-        typeof serverToolUse?.web_search_requests === "number" &&
-        serverToolUse.web_search_requests > 0
-      ) {
-        target.webSearchRequests = Math.max(
-          0,
-          Math.round(serverToolUse.web_search_requests)
-        )
-      }
-    } catch {
-      // Ignore malformed SSE fragments for analytics bookkeeping
+      if (u) mergeUsageInto(usage, u)
     }
+
+    // ── 3. OAuth tool-name restore (only when there's anything to
+    //     restore — keeps real-CC pass-through path zero-cost). ────
+    if (
+      Object.keys(reverseMap).length > 0 &&
+      payloadType === "content_block_start"
+    ) {
+      const block =
+        payload.content_block && typeof payload.content_block === "object"
+          ? (payload.content_block as Record<string, unknown>)
+          : null
+      if (block) {
+        let mutated = false
+        if (block.type === "tool_use") {
+          const name = typeof block.name === "string" ? block.name : ""
+          const restored = reverseMap[name]
+          if (restored != null && restored !== name) {
+            block.name = restored
+            mutated = true
+          }
+        } else if (block.type === "tool_reference") {
+          const toolName =
+            typeof block.tool_name === "string" ? block.tool_name : ""
+          const restored = reverseMap[toolName]
+          if (restored != null && restored !== toolName) {
+            block.tool_name = restored
+            mutated = true
+          }
+        }
+        if (mutated && dataLineIdx >= 0) {
+          lines[dataLineIdx] = `data: ${JSON.stringify(payload)}`
+          return lines.join("\n")
+        }
+      }
+    }
+
+    return chunk
   }
 
   private nextRetryCandidate(
@@ -1523,6 +2216,20 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
       .update("\0")
       .update(apiKey)
       .digest("hex")
+  }
+
+  /**
+   * Return a stable session id for an account. Real Claude Code CLI uses a
+   * single per-credential session id across requests within one process,
+   * so we lazily generate one and cache it in-memory keyed on the
+   * account's deterministic state key.
+   */
+  private getCachedSessionId(stateKey: string): string {
+    const cached = this.sessionIdCache.get(stateKey)
+    if (cached) return cached
+    const fresh = crypto.randomUUID()
+    this.sessionIdCache.set(stateKey, fresh)
+    return fresh
   }
 
   private normalizeBaseUrl(baseUrl?: string): string {
@@ -1599,12 +2306,19 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
     proxyUrl?: string
     maxContextTokens?: number
     stripThinking?: boolean
+    disablePromptCaching?: boolean
     prefix?: string
     priority?: number
     headers?: Record<string, string>
     models?: Array<{ name?: string; alias?: string }>
     excludedModels?: string[]
     source: "env" | "file"
+    oauth?: {
+      refreshToken?: string
+      accessTokenExpiresAt?: number
+      accountUuid?: string
+      organizationUuid?: string
+    }
   }): ClaudeApiAccount {
     const baseUrl = this.normalizeBaseUrl(params.baseUrl)
     const prefix = params.prefix?.trim() || undefined
@@ -1615,6 +2329,7 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
       proxyUrl: params.proxyUrl?.trim() || undefined,
       maxContextTokens: this.normalizeMaxContextTokens(params.maxContextTokens),
       stripThinking: params.stripThinking === true,
+      disablePromptCaching: params.disablePromptCaching === true,
       prefix,
       priority:
         typeof params.priority === "number" && Number.isFinite(params.priority)
@@ -1632,6 +2347,29 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
       discoveredModels: [],
       cooldownUntil: 0,
       modelStates: new Map(),
+      oauth: this.normalizeOauthMetadata(params.oauth),
+    }
+  }
+
+  private normalizeOauthMetadata(oauth?: {
+    refreshToken?: string
+    accessTokenExpiresAt?: number
+    accountUuid?: string
+    organizationUuid?: string
+  }): ClaudeApiAccount["oauth"] {
+    if (!oauth) return undefined
+    const refreshToken = (oauth.refreshToken || "").trim()
+    if (!refreshToken) return undefined
+    const expiresAt =
+      typeof oauth.accessTokenExpiresAt === "number" &&
+      Number.isFinite(oauth.accessTokenExpiresAt)
+        ? oauth.accessTokenExpiresAt
+        : 0
+    return {
+      refreshToken,
+      accessTokenExpiresAt: expiresAt,
+      accountUuid: oauth.accountUuid?.trim() || undefined,
+      organizationUuid: oauth.organizationUuid?.trim() || undefined,
     }
   }
 
@@ -1809,11 +2547,11 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
       )
     }
 
-    const payload = (await response.json()) as {
+    const payload = await readJsonWithMagicByteSniff<{
       data?: unknown[]
       has_more?: boolean
       last_id?: string
-    }
+    }>(response)
 
     return {
       models: this.parseDiscoveredModels(payload.data),
@@ -1947,11 +2685,13 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
               proxyUrl: entry.proxyUrl,
               maxContextTokens: entry.maxContextTokens,
               stripThinking: entry.stripThinking,
+              disablePromptCaching: entry.disablePromptCaching,
               prefix: entry.prefix,
               priority: entry.priority,
               headers: entry.headers,
               models: entry.models,
               excludedModels: entry.excludedModels,
+              oauth: entry.oauth,
               source: "file",
             })
           )
@@ -2286,8 +3026,297 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
     return candidates
   }
 
+  // ── Anthropic OAuth login (PKCE redirect flow) ─────────────────────────
+
+  /**
+   * Start an Anthropic OAuth + PKCE login session. The bridge spins up a
+   * one-shot HTTP listener on `127.0.0.1` with an OS-allocated ephemeral
+   * port (matching real CC's `server.listen(0)`) and returns the auth
+   * URL plus a `sessionId` the caller polls until the user finishes the
+   * redirect. Mirrors the Kiro Builder ID flow used by the dashboard.
+   */
+  startOAuthLogin(): {
+    sessionId: string
+    authUrl: string
+    expiresAt: number
+  } {
+    this.evictExpiredOAuthLoginSessions()
+    const session = startAnthropicLogin()
+    const sessionId = crypto.randomUUID()
+    this.oauthLoginSessions.set(sessionId, session)
+    this.logger.log(
+      `[Claude API] Anthropic OAuth login started (session=${sessionId.slice(
+        0,
+        8
+      )})`
+    )
+    return {
+      sessionId,
+      authUrl: session.authUrl,
+      expiresAt: session.expiresAt,
+    }
+  }
+
+  /**
+   * Poll an in-flight OAuth login session. While the user has not yet
+   * completed the browser redirect this returns `pending`. Once the
+   * local listener captures the callback we exchange the code, persist
+   * the token bundle to `claude-api-accounts.json`, reload the account
+   * pool, and return `completed` with the account count.
+   */
+  async pollOAuthLogin(sessionId: string): Promise<
+    | { status: "pending" }
+    | {
+        status: "completed"
+        accountCount: number
+        path: string
+        email?: string
+        replaced: boolean
+      }
+    | { status: "expired"; message?: string }
+    | { status: "error"; message: string }
+  > {
+    this.evictExpiredOAuthLoginSessions()
+    const session = this.oauthLoginSessions.get(sessionId)
+    if (!session) {
+      return { status: "expired", message: "session not found" }
+    }
+
+    const snapshot = session.peek()
+    if (snapshot.status === "pending") {
+      if (Date.now() > session.expiresAt) {
+        session.cancel()
+        this.oauthLoginSessions.delete(sessionId)
+        return { status: "expired", message: "callback timed out" }
+      }
+      return { status: "pending" }
+    }
+
+    if (snapshot.status === "failed") {
+      this.oauthLoginSessions.delete(sessionId)
+      return { status: "error", message: snapshot.message }
+    }
+
+    // Successful callback → exchange + persist + reload.
+    this.oauthLoginSessions.delete(sessionId)
+    try {
+      const bundle = await exchangeAuthorizationCode({
+        code: snapshot.code,
+        state: snapshot.state,
+        expectedState: session.state,
+        verifier: session.pkce.codeVerifier,
+        redirectUri: session.redirectUri,
+      })
+
+      const filePath =
+        this.accountsConfigPath ||
+        resolveDefaultAccountConfigPath("claude-api-accounts.json")
+
+      const append = await appendOauthAccount({
+        configFilePath: filePath,
+        label: bundle.account?.email,
+        baseUrl: "https://api.anthropic.com",
+        apiKey: bundle.accessToken,
+        refreshToken: bundle.refreshToken,
+        accessTokenExpiresAt: bundle.expiresAt,
+        accountUuid: bundle.account?.uuid,
+        accountEmail: bundle.account?.email,
+        organizationUuid: bundle.organization?.uuid,
+        organizationName: bundle.organization?.name,
+      })
+
+      this.accountsConfigPath = filePath
+      await this.reloadAccounts()
+
+      this.logger.log(
+        `[Claude API] OAuth login complete — wrote account to ${filePath} (replaced=${append.replaced}, total=${append.accountCount})`
+      )
+
+      return {
+        status: "completed",
+        accountCount: append.accountCount,
+        path: filePath,
+        email: bundle.account?.email,
+        replaced: append.replaced,
+      }
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "OAuth exchange failed"
+      this.logger.error(`[Claude API] OAuth exchange failed: ${message}`)
+      return { status: "error", message }
+    }
+  }
+
+  /**
+   * Cancel an in-flight OAuth login session. Idempotent.
+   */
+  cancelOAuthLogin(sessionId: string): boolean {
+    const session = this.oauthLoginSessions.get(sessionId)
+    if (!session) return false
+    session.cancel()
+    this.oauthLoginSessions.delete(sessionId)
+    return true
+  }
+
+  private evictExpiredOAuthLoginSessions(): void {
+    const now = Date.now()
+    for (const [id, session] of this.oauthLoginSessions) {
+      const typed: AnthropicOAuthLoginSession = session
+      if (typed.expiresAt <= now) {
+        typed.cancel()
+        this.oauthLoginSessions.delete(id)
+      }
+    }
+  }
+
   private nextCandidate(model: string): ClaudeApiCandidate {
     return this.selectCandidate(model, this.resolveCandidates(model))
+  }
+
+  /**
+   * Refresh an account's token and translate any failure into the
+   * account-state machine instead of letting it escape the request flow.
+   *
+   * `ensureFreshAccessToken` re-throws on a failed OAuth refresh. At the
+   * call sites this runs before the candidate-rotation try/catch, so an
+   * un-translated throw both aborts the request and — because the bridge
+   * is a detached daemon — risks surfacing as a process-level crash when
+   * the rejection reaches a non-awaited path. Marking the account and
+   * returning `false` lets the caller cool the account down and rotate to
+   * the next healthy candidate, matching how upstream HTTP failures are
+   * already handled.
+   *
+   * Returns `true` when the account is ready to use, `false` when it was
+   * just marked failed and the caller should move on.
+   */
+  private async prepareAccountToken(
+    account: ClaudeApiAccount
+  ): Promise<boolean> {
+    try {
+      await this.ensureFreshAccessToken(account)
+      return true
+    } catch (err) {
+      const status =
+        err instanceof AnthropicOAuthError && typeof err.status === "number"
+          ? err.status
+          : 401
+      const message = err instanceof Error ? err.message : String(err)
+      // refreshAccessTokenInternal already disables the account on a
+      // permanent (non-retryable) failure; for retryable failures put it
+      // on a normal cooldown so it can recover on a later request.
+      if (!isAccountDisabled(account)) {
+        this.markAccountTemporaryFailure(account, status)
+      }
+      this.logger.warn(
+        `[Claude API] Token refresh failed for ${account.label || account.baseUrl}; skipping account: ${message}`
+      )
+      return false
+    }
+  }
+
+  /**
+   * Refresh an OAuth account's access token if it is within 60 seconds
+   * of expiry, mutating `account.apiKey` so subsequent header builders
+   * pick up the new token. Concurrent callers share a single in-flight
+   * refresh so we never burn `refresh_token` rotations.
+   *
+   * Static API-key accounts (`account.oauth` is undefined) short-circuit
+   * to a no-op.
+   */
+  private async ensureFreshAccessToken(
+    account: ClaudeApiAccount
+  ): Promise<void> {
+    const oauth = account.oauth
+    if (!oauth || !oauth.refreshToken) return
+
+    const expiresAt = oauth.accessTokenExpiresAt
+    if (expiresAt > Date.now() + 60_000) {
+      return
+    }
+
+    if (account.oauthRefreshInFlight) {
+      await account.oauthRefreshInFlight
+      return
+    }
+
+    const inflight = this.refreshAccessTokenInternal(account).finally(() => {
+      account.oauthRefreshInFlight = undefined
+    })
+    account.oauthRefreshInFlight = inflight
+    await inflight
+  }
+
+  private async refreshAccessTokenInternal(
+    account: ClaudeApiAccount
+  ): Promise<void> {
+    const oauth = account.oauth
+    if (!oauth) return
+    const previousApiKey = account.apiKey
+    try {
+      const bundle = await refreshAnthropicTokens({
+        refreshToken: oauth.refreshToken,
+      })
+      account.apiKey = bundle.accessToken
+      oauth.refreshToken = bundle.refreshToken
+      oauth.accessTokenExpiresAt = bundle.expiresAt
+      this.persistAccountStates()
+      // Persist the rotated bundle back to claude-api-accounts.json so a
+      // bridge restart does not invalidate the single-rotated refresh
+      // token. Only file-sourced accounts are persisted; env-sourced
+      // accounts have no on-disk record to update.
+      if (
+        account.source === "file" &&
+        this.accountsConfigPath &&
+        previousApiKey
+      ) {
+        try {
+          await persistOauthRotation({
+            configFilePath: this.accountsConfigPath,
+            baseUrl: account.baseUrl,
+            prefix: account.prefix,
+            previousApiKey,
+            rotatedApiKey: bundle.accessToken,
+            rotatedRefreshToken: bundle.refreshToken,
+            rotatedAccessTokenExpiresAt: bundle.expiresAt,
+          })
+        } catch (persistErr) {
+          // Persistence failure does NOT roll back the in-memory
+          // rotation: subsequent requests still succeed using the new
+          // token. Surface it so operators notice that restarts will
+          // require re-running the OAuth login flow.
+          this.logger.error(
+            `[Claude API] Persisting rotated OAuth bundle failed for ${account.label || account.baseUrl}: ${
+              persistErr instanceof Error
+                ? persistErr.message
+                : String(persistErr)
+            }`
+          )
+        }
+      }
+      this.logger.log(
+        `[Claude API] Refreshed OAuth access token for ${account.label || account.baseUrl}`
+      )
+    } catch (err) {
+      const message =
+        err instanceof AnthropicOAuthError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : String(err)
+      this.logger.error(
+        `[Claude API] OAuth refresh failed for ${account.label || account.baseUrl}: ${message}`
+      )
+      const permanent =
+        err instanceof AnthropicOAuthError && err.retryable === false
+      if (permanent) {
+        this.disableAccountPermanently(
+          account,
+          err instanceof AnthropicOAuthError && err.status ? err.status : 401,
+          message
+        )
+      }
+      throw err
+    }
   }
 
   private selectCandidate(
@@ -2390,10 +3419,13 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
 
   private buildRequestBody(
     dto: CreateMessageDto,
-    candidate: ClaudeApiCandidate
+    candidate: ClaudeApiCandidate,
+    clientMode: ClaudeApiClientMode,
+    forwardHeaders: AnthropicForwardHeaders
   ): {
     body: Record<string, unknown>
     betas: string[]
+    oauthToolReverseMap: Record<string, string>
   } {
     return this.buildUpstreamRequestPayload(
       dto as unknown as Record<string, unknown>,
@@ -2401,6 +3433,8 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
       candidate.account,
       {
         applyPromptCaching: true,
+        clientMode,
+        forwardHeaders,
       }
     )
   }
@@ -2426,13 +3460,26 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
     account: ClaudeApiAccount,
     stream: boolean,
     forwardHeaders: AnthropicForwardHeaders,
-    betas: string[]
+    betas: string[],
+    requestContext?: {
+      /** Resolved upstream model id (lower-cased ok). */
+      model?: string
+      /** True iff the request opts into extended thinking. */
+      thinkingEnabled?: boolean
+    }
   ): Record<string, string> {
     const headers: Record<string, string> = {
       "content-type": "application/json",
       accept: stream ? "text/event-stream" : "application/json",
       ...DEFAULT_FORWARDED_HEADERS,
     }
+
+    // Pin the Stainless device-profile headers (User-Agent, Stainless-Os,
+    // Stainless-Arch, Stainless-Package-Version, Stainless-Runtime-Version,
+    // etc.) to the canonical CC CLI baseline. Real Claude Code emits this
+    // full set on every request; missing or non-canonical values are a
+    // fingerprinting signal Anthropic uses to bucket third-party traffic.
+    applyClaudeDeviceProfileHeaders(headers)
 
     if (stream) {
       headers["accept-encoding"] = "identity"
@@ -2468,6 +3515,18 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
       for (const required of REQUIRED_BETA_FEATURES) {
         betaSet.add(required)
       }
+      // Conditional flags — match the v2.1.142 binary's per-request
+      // gating in `getAllModelBetas`. Adding them unconditionally is a
+      // mild fingerprint (and in some cases a 400 from the upstream).
+      if (requestContext?.thinkingEnabled) {
+        betaSet.add(INTERLEAVED_THINKING_BETA)
+      }
+      if (
+        requestContext?.model &&
+        modelSupports1MContext(requestContext.model)
+      ) {
+        betaSet.add(CONTEXT_1M_BETA)
+      }
       if (CACHE_EDITING_BETA_HEADER) {
         betaSet.add(CACHE_EDITING_BETA_HEADER)
       }
@@ -2485,11 +3544,58 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
     }
 
     if (this.isOfficialAnthropicBase(account.baseUrl)) {
-      delete headers.authorization
-      headers["x-api-key"] = account.apiKey
+      // v2.1.142's `BaseAnthropic.authHeaders()` switches on credential
+      // shape, not endpoint: OAuth access tokens (`sk-ant-oat...`) ride
+      // `Authorization: Bearer`, while Console API keys (`sk-ant-api03...`)
+      // ride `X-Api-Key`. Sending an OAuth token under `x-api-key` is a
+      // direct fingerprinting mismatch — Anthropic's ingress classifies
+      // by header name, then re-validates against the token prefix.
+      if (isClaudeOAuthToken(account.apiKey)) {
+        delete headers["x-api-key"]
+        headers.authorization = `Bearer ${account.apiKey}`
+      } else {
+        delete headers.authorization
+        headers["x-api-key"] = account.apiKey
+      }
     } else {
       delete headers["x-api-key"]
       headers.authorization = `Bearer ${account.apiKey}`
+    }
+
+    // Real Claude Code CLI emits a stable per-credential session id and a
+    // per-request UUID against api.anthropic.com. Forwarding our own values
+    // makes the request shape match CC CLI's; for third-party Claude
+    // endpoints we leave them off because not every provider tolerates
+    // unknown headers.
+    if (this.isOfficialAnthropicBase(account.baseUrl)) {
+      if (!headers["x-claude-code-session-id"]) {
+        headers["x-claude-code-session-id"] = this.getCachedSessionId(
+          account.stateKey
+        )
+      }
+      if (!headers["x-client-request-id"]) {
+        headers["x-client-request-id"] = crypto.randomUUID()
+      }
+      // `anthropic-client-platform` is set by every CC-internal call in
+      // v2.1.142 (`bY()` for /v1/code/* endpoints, the messages.create
+      // path via `defaultHeaders`). Value derives from the CLI entrypoint
+      // and is the canonical signal Anthropic's ingress uses to route
+      // first-party CC traffic. Mirror the v2.1.142 `w9H()` mapping.
+      if (!headers["anthropic-client-platform"]) {
+        headers["anthropic-client-platform"] = deriveAnthropicClientPlatform(
+          deriveEntrypoint(forwardHeaders)
+        )
+      }
+    }
+
+    // The Stainless SDK injects `X-Stainless-Helper-Method: stream` for
+    // every `messages.stream(...)` call (and the matching `beta.messages`
+    // helper). Non-stream requests do NOT carry this header. Real CC
+    // hits this code path on every interactive turn, so the header is a
+    // strong fingerprinting signal — its absence on a streamed request
+    // is detectable.
+    if (stream) {
+      headers["x-stainless-helper-method"] = "stream"
     }
 
     // Re-enforce identity encoding for streams after custom headers.
@@ -2515,13 +3621,21 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
 
   private buildMessagesUrl(baseUrl: string): string {
     const normalized = baseUrl.replace(/\/+$/, "")
-    return /\/v1$/i.test(normalized)
+    const path = /\/v1$/i.test(normalized)
       ? `${normalized}/messages`
       : `${normalized}/v1/messages`
+    // Real Claude Code CLI hits `/v1/messages?beta=true` on api.anthropic.com.
+    // Third-party Claude-compatible providers may not understand the query
+    // and could 400, so it is gated on the official endpoint.
+    return this.isOfficialAnthropicBase(baseUrl) ? `${path}?beta=true` : path
   }
 
   private buildCountTokensUrl(baseUrl: string): string {
-    return `${this.buildMessagesUrl(baseUrl)}/count_tokens`
+    const normalized = baseUrl.replace(/\/+$/, "")
+    const path = /\/v1$/i.test(normalized)
+      ? `${normalized}/messages/count_tokens`
+      : `${normalized}/v1/messages/count_tokens`
+    return this.isOfficialAnthropicBase(baseUrl) ? `${path}?beta=true` : path
   }
 
   private buildModelsUrl(baseUrl: string, afterId?: string): string {
@@ -2550,12 +3664,20 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
     account: ClaudeApiAccount,
     options: {
       applyPromptCaching?: boolean
-    } = {}
+      clientMode: ClaudeApiClientMode
+      forwardHeaders?: AnthropicForwardHeaders
+    }
   ): {
     body: Record<string, unknown>
     betas: string[]
+    oauthToolReverseMap: Record<string, string>
   } {
-    const raw = JSON.parse(JSON.stringify(dto)) as Record<string, unknown>
+    // `structuredClone` is V8-native and ~3-5× faster than the
+    // historical `JSON.parse(JSON.stringify(...))` round-trip. The body
+    // we receive is plain JSON-shaped (no functions / Dates / DOM
+    // refs), so the structured clone algorithm is a strict superset of
+    // what JSON does. Repo pins Node ≥24, well above the 17.0 minimum.
+    const raw = structuredClone(dto)
     const betas = this.normalizeBetas(raw.betas)
 
     delete raw.betas
@@ -2569,6 +3691,31 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
     if (account.stripThinking) {
       delete raw.thinking
       delete raw.output_config
+      // Defensive: even though the cursor send-time pipeline should have
+      // already pruned thinking blocks for stripThinking accounts, run
+      // stripSignatureBlocks here to guarantee the wire payload never
+      // contains residual signed reasoning. Mirrors claude-code's
+      // login.tsx:37 behaviour for credential rotation.
+      const messages = raw.messages
+      if (Array.isArray(messages)) {
+        raw.messages = stripSignatureBlocksFlat(
+          messages as Array<{
+            role: "user" | "assistant"
+            content: LooseMessageContent
+          }>
+        )
+      }
+    }
+    // Anthropic-compatible upstreams may reject or even crash when Claude
+    // models omit `max_tokens`. Force a conservative default if the caller
+    // did not supply one.
+    if (
+      raw.max_tokens == null ||
+      typeof raw.max_tokens !== "number" ||
+      !Number.isFinite(raw.max_tokens) ||
+      raw.max_tokens <= 0
+    ) {
+      raw.max_tokens = DEFAULT_MODEL_MAX_TOKENS
     }
     if (!this.shouldApplyOfficialAnthropicOptimizations(account)) {
       // Provider-native context edits are part of the official Anthropic
@@ -2578,19 +3725,92 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
       delete raw.context_management
     }
 
-    if (
-      options.applyPromptCaching &&
-      this.shouldApplyOfficialAnthropicOptimizations(account)
-    ) {
-      // Keep Anthropic-only request shaping away from third-party
-      // Claude-compatible providers that only support the base messages API.
+    if (options.applyPromptCaching && !account.disablePromptCaching) {
+      // Apply Anthropic-style cache_control breakpoints to every Claude
+      // upstream by default. CLIProxyAPI gates this on the assumption that
+      // virtually every Claude-compatible provider tolerates the field
+      // (they either honour it or silently ignore). Accounts that point at
+      // a relay known to reject the field can set
+      // `disablePromptCaching: true` to opt out.
       applyPromptCachingOptimizations(raw)
     }
+
+    // Forced language directive for non-CLI traffic (Cursor / generic
+    // callers). We deliberately skip `claude-code-cli`: that mode is
+    // cloaked by applyClientModeShaping below to match real Claude Code's
+    // wire shape, and mutating its system prompt would break the
+    // cloaking fingerprint. For cursor/generic the system prompt reaches
+    // the upstream verbatim, so this is the correct exactly-once chokepoint.
+    if (options.clientMode !== "claude-code-cli") {
+      raw.system = appendLanguageDirectiveToAnthropicSystem(
+        raw.system,
+        raw.messages
+      )
+    }
+
+    // Apply client-mode-specific cloaking. For Claude Code CLI traffic on
+    // an OAuth-secured Anthropic credential this rewrites system / tool /
+    // metadata blocks so the request matches real Claude Code's wire
+    // shape, and returns a per-request reverse tool-name map that the
+    // response path uses to restore client-side naming.
+    const oauthToolReverseMap = this.applyClientModeShaping(
+      raw,
+      account,
+      options.clientMode,
+      options.forwardHeaders
+    )
 
     return {
       body: raw,
       betas,
+      oauthToolReverseMap,
     }
+  }
+
+  /**
+   * Apply mode-specific request shaping.
+   *
+   * Returns the per-request OAuth tool-name reverse map so the streaming
+   * and non-streaming response paths can restore client-side naming. The
+   * map is empty when cloaking does not apply (Cursor caller, generic
+   * caller, non-OAuth credential, or model-exempt path).
+   *
+   * The branch keeps Cursor traffic untouched: Cursor callers always pass
+   * `clientMode: "cursor"`, which short-circuits cloaking entirely so
+   * Cursor's protocol-native system prompt and tool naming reach the
+   * upstream verbatim.
+   */
+  private applyClientModeShaping(
+    body: Record<string, unknown>,
+    account: ClaudeApiAccount,
+    clientMode: ClaudeApiClientMode,
+    forwardHeaders?: AnthropicForwardHeaders
+  ): Record<string, string> {
+    if (clientMode !== "claude-code-cli") {
+      return {}
+    }
+
+    if (!isClaudeOAuthToken(account.apiKey)) {
+      return {}
+    }
+
+    const model = typeof body.model === "string" ? body.model.toLowerCase() : ""
+    const modelExempt = model.startsWith("claude-3-5-haiku")
+
+    const result = applyCcCliCloaking(body, {
+      apiKey: account.apiKey,
+      enabled: true,
+      modelExempt,
+      entrypoint: deriveEntrypoint(forwardHeaders),
+      workload: deriveWorkload(forwardHeaders),
+      forwardHeaders,
+    })
+    if (result.passThrough) {
+      this.logger.debug(
+        "CC CLI cloaking: pass-through (request already looks like real Claude Code)"
+      )
+    }
+    return result.oauthToolReverseMap
   }
 
   private normalizeClaudeTools(tools: unknown): unknown {

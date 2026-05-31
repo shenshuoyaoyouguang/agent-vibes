@@ -110,6 +110,7 @@ function resolveConfig() {
     CURSOR_PROTOCOL_TRACE_FILE:
       process.env.CURSOR_PROTOCOL_TRACE_FILE ||
       path.join(logsDir, "cursor_protocol_trace.jsonl"),
+    KIRO_WARMUP_ON_START: process.env.KIRO_WARMUP_ON_START || "0",
     NO_COLOR: "1",
     FORCE_COLOR: "0",
   }

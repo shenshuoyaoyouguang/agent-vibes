@@ -20,7 +20,7 @@
  *     concurrently and interleave their outputs as they emit, which is
  *     what the protocol allows (`is_parallel_worker = 7` exists for
  *     exactly this). Edit serialisation is preserved on a per-path
- *     basis by `ChatSessionManager.acquireOrQueueEdit`, so the bridge
+ *     basis by `SessionLifecycleService.acquireOrQueueEdit`, so the bridge
  *     never lets two writes to the same file race.
  *
  * Backpressure is intentionally NOT implemented. Buffers carry already-

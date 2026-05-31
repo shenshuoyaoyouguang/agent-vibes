@@ -18,6 +18,8 @@ const PREVIOUS_LOG_FILE = path.join(
   "agent-vibes-bridge.previous.log"
 )
 const STARTUP_HEALTH_TIMEOUT_MS = 45000
+const STOP_GRACE_TIMEOUT_MS = 5000
+const STOP_FORCE_TIMEOUT_MS = 3000
 
 /**
  * Manages the Protocol Bridge process lifecycle (start / stop / restart).
@@ -29,6 +31,7 @@ export class BridgeManager extends EventEmitter {
   private process: ChildProcess | null = null
   private _state: ServerState = "stopped"
   private healthCheckTimer: ReturnType<typeof setInterval> | null = null
+  private readonly intentionalStopPids = new Set<number>()
 
   constructor(
     private readonly config: ConfigManager,
@@ -125,6 +128,13 @@ export class BridgeManager extends EventEmitter {
         env.THINKING_BUDGET_AUTO = "true"
       }
 
+      // Stability first: Kiro warmup sends one request per account on every
+      // bridge start. On account pools this can trigger 429 cooldowns and a
+      // memory spike before the first real turn.
+      if (!env.KIRO_WARMUP_ON_START) {
+        env.KIRO_WARMUP_ON_START = "0"
+      }
+
       if (!this.config.antigravitySystemPrompt) {
         env.ANTIGRAVITY_SYSTEM_PROMPT = "false"
       }
@@ -154,18 +164,29 @@ export class BridgeManager extends EventEmitter {
       // Unref so Cursor can exit without waiting for Bridge
       this.process.unref()
 
-      this.process.on("exit", (code, signal) => {
+      const child = this.process
+      child.on("exit", (code, signal) => {
         logger.info(
           `Protocol Bridge exited (code=${code}, signal=${signal ?? "none"})`
         )
+        const expectedStop =
+          child.pid !== undefined && this.intentionalStopPids.delete(child.pid)
+        if (this.process !== child) return
+
         this.process = null
         this.cleanupPidFile()
         this.stopHealthCheck()
-        this.setState(code === 0 || signal === "SIGTERM" ? "stopped" : "error")
+        this.setState(
+          expectedStop || code === 0 || signal === "SIGTERM"
+            ? "stopped"
+            : "error"
+        )
       })
 
-      this.process.on("error", (err) => {
+      child.on("error", (err) => {
         logger.error("Failed to start Protocol Bridge", err)
+        if (this.process !== child) return
+
         this.process = null
         this.cleanupPidFile()
         this.setState("error")
@@ -199,25 +220,41 @@ export class BridgeManager extends EventEmitter {
     // If we have a direct process reference, use it
     if (this.process) {
       logger.info("Stopping Protocol Bridge (direct ref)...")
-      return new Promise<void>((resolve) => {
-        const timeout = setTimeout(() => {
-          if (this.process) {
-            logger.warn("Force killing Protocol Bridge...")
-            this.process.kill("SIGKILL")
-          }
-          resolve()
-        }, 5000)
+      const child = this.process
+      if (child.pid !== undefined) this.intentionalStopPids.add(child.pid)
 
-        this.process!.once("exit", () => {
-          clearTimeout(timeout)
-          this.process = null
-          this.cleanupPidFile()
+      return new Promise<void>((resolve) => {
+        let settled = false
+        let forceTimer: ReturnType<typeof setTimeout> | null = null
+        let fallbackTimer: ReturnType<typeof setTimeout> | null = null
+
+        const finish = () => {
+          if (settled) return
+          settled = true
+          if (forceTimer) clearTimeout(forceTimer)
+          if (fallbackTimer) clearTimeout(fallbackTimer)
+          if (this.process === child) {
+            this.process = null
+            this.cleanupPidFile()
+          }
           this.setState("stopped")
           logger.info("Protocol Bridge stopped")
           resolve()
-        })
+        }
 
-        this.process!.kill("SIGTERM")
+        forceTimer = setTimeout(() => {
+          if (settled) return
+          logger.warn("Force killing Protocol Bridge...")
+          child.kill("SIGKILL")
+        }, STOP_GRACE_TIMEOUT_MS)
+
+        fallbackTimer = setTimeout(
+          finish,
+          STOP_GRACE_TIMEOUT_MS + STOP_FORCE_TIMEOUT_MS
+        )
+
+        child.once("exit", finish)
+        child.kill("SIGTERM")
       })
     }
 
@@ -225,7 +262,15 @@ export class BridgeManager extends EventEmitter {
     const pid = this.readPid()
     if (pid && this.isProcessAlive(pid)) {
       logger.info(`Stopping Protocol Bridge (pid ${pid}) via PID file...`)
+      this.intentionalStopPids.add(pid)
       this.killPid(pid)
+      const stopped = await this.waitForProcessExit(pid, STOP_GRACE_TIMEOUT_MS)
+      if (!stopped && this.isProcessAlive(pid)) {
+        logger.warn(`Force killing Protocol Bridge (pid ${pid})...`)
+        this.killPid(pid, "SIGKILL")
+        await this.waitForProcessExit(pid, STOP_FORCE_TIMEOUT_MS)
+      }
+      this.intentionalStopPids.delete(pid)
       this.cleanupPidFile()
       this.setState("stopped")
       logger.info("Protocol Bridge stopped")
@@ -272,12 +317,26 @@ export class BridgeManager extends EventEmitter {
     }
   }
 
-  private killPid(pid: number): void {
+  private killPid(pid: number, signal: NodeJS.Signals = "SIGTERM"): void {
     try {
-      process.kill(pid, "SIGTERM")
+      process.kill(pid, signal)
     } catch {
       // already dead
     }
+  }
+
+  private async waitForProcessExit(
+    pid: number,
+    timeoutMs: number
+  ): Promise<boolean> {
+    const start = Date.now()
+
+    while (Date.now() - start < timeoutMs) {
+      if (!this.isProcessAlive(pid)) return true
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+
+    return !this.isProcessAlive(pid)
   }
 
   private cleanupPidFile(): void {
