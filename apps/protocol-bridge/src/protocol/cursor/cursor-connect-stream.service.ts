@@ -34395,11 +34395,13 @@ ${raw}
   }
 
   /**
-   * Render a "consider snipping" nudge once the conversation has accumulated
-   * enough turns that the snip_messages tool becomes worthwhile. Mirrors
-   * Claude Code's `shouldNudgeForSnips` (default threshold = 30 messages),
-   * which is the cheap, high-signal signal that the model — not just the
-   * runtime — should be evaluating when it is time to drop older context.
+   * Render a "consider snipping" nudge once the conversation has grown past
+   * a threshold. Mirrors Claude Code's `shouldNudgeForSnips` (threshold = 30
+   * messages) and its soft `SNIP_NUDGE_TEXT`: a generic "consider compressing
+   * older messages" hint, NOT a prescriptive instruction. Deliberately avoids
+   * suggesting a `keep_recent` value — the model must judge how much of the
+   * live task to retain, and an aggressive prescribed floor (e.g. 6-12) makes
+   * the model snip away its own task anchor and re-derive in a loop.
    *
    * Returns undefined below the threshold so the prompt cache stays stable
    * for short sessions.
@@ -34415,7 +34417,7 @@ ${raw}
     }
     return [
       "<context_management_hint>",
-      `The conversation now contains ${sessionMessageCount} messages. If the user has switched topics or earlier exploration is no longer relevant, call \`snip_messages({ keep_recent: <N>, reason: "<short reason>" })\` to drop the obsolete history. Snipping is reversible only by starting a new conversation, so be conservative: keep enough recent messages (typically 6–12) to preserve the current task's anchor turns.`,
+      "The conversation history is getting long. Consider using the `snip_messages` tool to compress older messages that are no longer relevant, freeing context window space for continued work. Keep the messages that anchor your current task.",
       "</context_management_hint>",
     ].join("\n")
   }

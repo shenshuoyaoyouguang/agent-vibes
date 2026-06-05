@@ -246,8 +246,8 @@ export class ContextCompactRunnerService {
       .join("\n\n")
 
     return [
-      "Your task is to create a detailed summary of the conversation segment below, paying close attention to the user's explicit requests and the assistant's previous actions.",
-      "This summary must capture technical details, code patterns, and architectural decisions thoroughly enough that work can continue without the original messages.",
+      "You are summarizing the EARLIER portion of an ongoing conversation. The MOST RECENT messages are preserved verbatim immediately AFTER this summary and remain the authoritative record of the current task — this summary only supplies the earlier context they build on.",
+      "Capture the earlier technical details, code patterns, and architectural decisions thoroughly. Do NOT treat the end of this segment as the current state of the work: the preserved recent messages that follow, not this summary, define what is happening now and what comes next.",
       "",
       "Before writing the summary, wrap your reasoning in <analysis> tags. In your analysis:",
       "1. Walk every message chronologically. For each section identify the user's explicit requests, the assistant's approach, key decisions, technical concepts and code patterns, file names, full code snippets, function signatures, file edits, errors and how they were fixed, and any user feedback that redirected the work.",
@@ -261,8 +261,8 @@ export class ContextCompactRunnerService {
       "5. Problem Solving: Problems solved and ongoing troubleshooting threads.",
       "6. All User Messages: List every user message that is not a tool result, in order. These anchor the user's evolving intent and must not be summarized away.",
       "7. Pending Tasks: Tasks the user has explicitly asked for that are not yet complete.",
-      "8. Current Work: Describe in detail what was being worked on immediately before this summary, including file names, code snippets, and quotes from the most recent user/assistant messages.",
-      '9. Optional Next Step: The single next step that is DIRECTLY in line with the user\'s most recent explicit request and the task in progress at the cut-off. Include a verbatim quote from the most recent user message that establishes that task. CRITICAL: do not propose work on tangential requests, on older tasks that were already completed, or on topics that the user moved on from earlier in the conversation. If the most recent task was concluded and the user has not yet asked for something new, write "No outstanding next step — wait for the user."',
+      "8. Current Work (historical): What was being worked on at the END of THIS EARLIER segment, with file names and code snippets. Treat this as historical context — it may already be completed or superseded by the preserved recent messages that follow. Do NOT present it as the current task.",
+      '9. Next Step: Do NOT infer or propose a next step from this earlier segment. The preserved recent messages that follow this summary are authoritative for the current task and the next step. Write exactly: "Current task and next step: defer to the preserved recent messages below — do not resume a task from this earlier summary unless the recent messages explicitly continue it."',
       "",
       "Output format:",
       "<analysis>",
@@ -272,7 +272,7 @@ export class ContextCompactRunnerService {
       "<summary>",
       "1. Primary Request and Intent:",
       "...",
-      "9. Optional Next Step:",
+      "9. Next Step:",
       "...",
       "</summary>",
       "",
